@@ -508,37 +508,97 @@ export class BLELivemapPanel extends LitElement {
     const lang = this._lang.startsWith("sv") ? "sv" : "en";
     return panelStrings[lang]?.[key] || panelStrings["en"]?.[key] || key;
   }
-
-  // ─── Smart Entity Discovery ───────────────────────────────
-
   /**
-   * Extract unique BLE proxy/scanner identifiers from Bermuda's
-   * "distance_to_*" sensors. These are the actual BLE scanners.
+   * Discover BLE proxies from multiple sources:
+   * 1. Device registry — all devices under the "Bluetooth" integration (Shelly, ESPHome etc.)
+   * 2. Bermuda distance sensors — sensor.bermuda_*_distance_to_PROXYNAME
+   * 3. State entities — any entity with bluetooth_proxy or ble_proxy in the name
    */
-  private _discoverBermudaProxies(): Map<string, { id: string; friendly_name: string; entity_ids: string[] }> {
-    if (!this.hass?.states) return new Map();
+  private _discoverBLEProxies(): Map<string, { id: string; friendly_name: string; area: string; mac: string; entity_ids: string[] }> {
+    const proxyMap = new Map<string, { id: string; friendly_name: string; area: string; mac: string; entity_ids: string[] }>();
 
-    const proxyMap = new Map<string, { id: string; friendly_name: string; entity_ids: string[] }>();
+    // Source 1: Device registry — Bluetooth integration devices
+    if (this._deviceRegistryCache) {
+      for (const device of this._deviceRegistryCache) {
+        // Check if device has Bluetooth as one of its config entries
+        const identifiers = device.identifiers || [];
+        const connections = device.connections || [];
+        const configEntries = device.config_entries || [];
 
-    for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
-      const eid = entityId.toLowerCase();
+        // Check if this device belongs to a Bluetooth-related integration
+        // Device registry entries have identifiers like [["bluetooth", "AA:BB:CC:DD:EE:FF"]]
+        const isBluetoothDevice = identifiers.some((id: any[]) =>
+          id[0] === "bluetooth" || id[0] === "esphome" || id[0] === "shelly"
+        );
 
-      // Match sensor.bermuda_*_distance_to_PROXYNAME
-      // The proxy identifier is the part after "distance_to_"
-      if (eid.startsWith("sensor.bermuda_") && eid.includes("_distance_to_")) {
-        const parts = eid.split("_distance_to_");
-        if (parts.length >= 2) {
-          const proxyId = parts[parts.length - 1]; // e.g. "shelly_koksbord", "bluetooth_proxy"
-          if (!proxyMap.has(proxyId)) {
-            // Create a friendly name from the proxy ID
-            const friendlyName = proxyId.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-            proxyMap.set(proxyId, {
-              id: proxyId,
-              friendly_name: friendlyName,
-              entity_ids: [entityId],
-            });
-          } else {
-            proxyMap.get(proxyId)!.entity_ids.push(entityId);
+        // Also check connections for bluetooth MAC
+        const hasBtConnection = connections.some((c: any[]) =>
+          c[0] === "bluetooth" || c[0] === "mac"
+        );
+
+        if (!isBluetoothDevice && !hasBtConnection) continue;
+
+        // Get MAC address from identifiers or connections
+        let mac = "";
+        for (const id of identifiers) {
+          if (id[0] === "bluetooth" && id[1]) {
+            mac = id[1];
+            break;
+          }
+        }
+        if (!mac) {
+          for (const c of connections) {
+            if ((c[0] === "bluetooth" || c[0] === "mac") && c[1]) {
+              mac = c[1];
+              break;
+            }
+          }
+        }
+
+        const deviceName = device.name_by_user || device.name || "Unknown";
+        const deviceId = device.id || mac;
+
+        // Get area name
+        let area = "";
+        if (device.area_id && this._areaRegistryCache) {
+          area = this._areaRegistryCache.get(device.area_id) || "";
+        }
+
+        // Create a slug from the device name for matching with Bermuda sensors
+        const slug = deviceName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+        if (!proxyMap.has(slug)) {
+          proxyMap.set(slug, {
+            id: slug,
+            friendly_name: deviceName,
+            area: area,
+            mac: mac,
+            entity_ids: [],
+          });
+        }
+      }
+    }
+
+    // Source 2: Bermuda distance sensors (enriches with entity tracking info)
+    if (this.hass?.states) {
+      for (const [entityId] of Object.entries(this.hass.states)) {
+        const eid = entityId.toLowerCase();
+        if (eid.startsWith("sensor.bermuda_") && eid.includes("_distance_to_")) {
+          const parts = eid.split("_distance_to_");
+          if (parts.length >= 2) {
+            const proxyId = parts[parts.length - 1];
+            if (proxyMap.has(proxyId)) {
+              proxyMap.get(proxyId)!.entity_ids.push(entityId);
+            } else {
+              const friendlyName = proxyId.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+              proxyMap.set(proxyId, {
+                id: proxyId,
+                friendly_name: friendlyName,
+                area: "",
+                mac: "",
+                entity_ids: [entityId],
+              });
+            }
           }
         }
       }
@@ -606,28 +666,33 @@ export class BLELivemapPanel extends LitElement {
   }
 
   private _getSmartProxyList(): DiscoveredEntity[] {
-    const bermudaProxies = this._discoverBermudaProxies();
+    const bleProxies = this._discoverBLEProxies();
     const addedProxies = new Set((this._config.proxies || []).map((p) => p.entity_id));
 
     const entities: DiscoveredEntity[] = [];
 
-    for (const [proxyId, proxyInfo] of bermudaProxies) {
-      // Use the proxy_id as the entity_id for config purposes
-      // The actual entity_id used is a synthetic one based on the proxy identifier
-      const syntheticEntityId = `bermuda_proxy_${proxyId}`;
+    for (const [proxyId, proxyInfo] of bleProxies) {
+      // Use the proxy slug as entity_id for config purposes
+      const syntheticEntityId = `ble_proxy_${proxyId}`;
       const added = addedProxies.has(syntheticEntityId) ||
         addedProxies.has(proxyId) ||
-        // Check if any existing proxy matches by name
+        addedProxies.has(`bermuda_proxy_${proxyId}`) ||
+        // Check if any existing proxy matches by name or slug
         (this._config.proxies || []).some((p) =>
           p.entity_id.includes(proxyId) ||
-          (p.name || "").toLowerCase().replace(/\s+/g, "_").includes(proxyId)
+          (p.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").includes(proxyId)
         );
+
+      const trackedCount = proxyInfo.entity_ids.length;
+      const stateText = trackedCount > 0
+        ? `${trackedCount} devices tracked`
+        : proxyInfo.mac || "BLE Proxy";
 
       const entity: DiscoveredEntity = {
         entity_id: syntheticEntityId,
         friendly_name: proxyInfo.friendly_name,
-        area: "",
-        state: `${proxyInfo.entity_ids.length} devices tracked`,
+        area: proxyInfo.area,
+        state: stateText,
         type: "proxy",
         added,
         proxy_id: proxyId,
@@ -637,7 +702,8 @@ export class BLELivemapPanel extends LitElement {
       if (this._sidebarFilter) {
         const search = this._sidebarFilter.toLowerCase();
         if (!proxyId.includes(search) &&
-            !proxyInfo.friendly_name.toLowerCase().includes(search)) {
+            !proxyInfo.friendly_name.toLowerCase().includes(search) &&
+            !proxyInfo.area.toLowerCase().includes(search)) {
           continue;
         }
       }

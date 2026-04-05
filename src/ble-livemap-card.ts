@@ -743,10 +743,16 @@ export class BLELivemapCard extends LitElement {
     // Strategy 1: Individual distance sensors per proxy
     if (prefix) {
       for (const proxy of proxies) {
-        const proxyName = proxy.entity_id.replace(/^.*\./, "").replace(/_proxy$/, "");
+        // Strip synthetic prefixes (ble_proxy_, bermuda_proxy_) to get the raw proxy slug
+        const proxyName = proxy.entity_id
+          .replace(/^ble_proxy_/, "")
+          .replace(/^bermuda_proxy_/, "")
+          .replace(/^.*\./, "")
+          .replace(/_proxy$/, "");
         const possibleEntities = [
           `${prefix}_${proxyName}_distance`,
           `${prefix}_distance_${proxyName}`,
+          `sensor.bermuda_${prefix.replace(/^.*\.bermuda_/, "").replace(/^sensor\.bermuda_/, "")}_distance_to_${proxyName}`,
         ];
 
         for (const entityId of possibleEntities) {
@@ -786,8 +792,12 @@ export class BLELivemapCard extends LitElement {
         const attrs = mainState.attributes || {};
         if (attrs.scanners) {
           for (const [scannerId, scannerData] of Object.entries(attrs.scanners as Record<string, any>)) {
+            const scannerSlug = scannerId.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
             const matchingProxy = proxies.find(
-              (p) => p.entity_id === scannerId || p.name === scannerData?.name
+              (p) => {
+                const pSlug = p.entity_id.replace(/^ble_proxy_/, "").replace(/^bermuda_proxy_/, "");
+                return p.entity_id === scannerId || pSlug === scannerSlug || p.name === scannerData?.name;
+              }
             );
             if (matchingProxy && scannerData?.distance) {
               distances.push({
@@ -808,7 +818,11 @@ export class BLELivemapCard extends LitElement {
       const dtState = this.hass.states[dtEntity];
       if (dtState?.attributes?.scanners) {
         for (const [scannerId, scannerData] of Object.entries(dtState.attributes.scanners as Record<string, any>)) {
-          const matchingProxy = proxies.find((p) => p.entity_id === scannerId);
+          const scannerSlug = scannerId.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+          const matchingProxy = proxies.find((p) => {
+            const pSlug = p.entity_id.replace(/^ble_proxy_/, "").replace(/^bermuda_proxy_/, "");
+            return p.entity_id === scannerId || pSlug === scannerSlug || p.name === scannerData?.name;
+          });
           if (matchingProxy && scannerData?.distance) {
             distances.push({
               proxy_entity_id: matchingProxy.entity_id,
