@@ -7,7 +7,7 @@
  * gradient accuracy circles, history trails, zones, and proxy indicators.
  */
 
-import { DeviceState, ProxyConfig, ZoneConfig, BLELivemapConfig } from "./types";
+import { DeviceState, ProxyConfig, ZoneConfig, DoorConfig, BLELivemapConfig } from "./types";
 
 interface RenderContext {
   ctx: CanvasRenderingContext2D;
@@ -29,6 +29,7 @@ export function render(
   devices: DeviceState[],
   proxies: ProxyConfig[],
   zones: ZoneConfig[],
+  doors: DoorConfig[],
   config: BLELivemapConfig,
   activeFloor: string | null
 ): void {
@@ -44,6 +45,14 @@ export function render(
     for (const zone of zones) {
       if (activeFloor && zone.floor_id && zone.floor_id !== activeFloor) continue;
       drawZone(rc, zone, config.show_zone_labels !== false);
+    }
+  }
+
+  // Draw doors (between zones and proxies)
+  if (config.show_doors !== false && doors.length > 0) {
+    for (const door of doors) {
+      if (activeFloor && door.floor_id && door.floor_id !== activeFloor) continue;
+      drawDoor(rc, door);
     }
   }
 
@@ -255,6 +264,100 @@ function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
     ctx.fillText(fullLabel, x, y + (isGateway ? 13 : radius + 6));
+  }
+}
+
+/**
+ * Draw a door/opening/portal marker on the map.
+ */
+function drawDoor(rc: RenderContext, door: DoorConfig): void {
+  const { ctx, width, height, isDark } = rc;
+  const x = (door.x / 100) * width;
+  const y = (door.y / 100) * height;
+
+  const isPortal = door.type === "portal";
+  const isDoor = door.type === "door";
+  const size = isPortal ? 10 : 8;
+
+  // Color based on type
+  const color = isPortal ? "#E040FB" : isDoor ? "#FF9800" : "#78909C";
+  const rgb = hexToRgb(color);
+
+  if (isPortal) {
+    // Portal: diamond shape with glow
+    const pulsePhase = (Date.now() % 3000) / 3000;
+    const pulseAlpha = 0.1 + Math.sin(pulsePhase * Math.PI * 2) * 0.08;
+
+    // Glow
+    ctx.beginPath();
+    ctx.arc(x, y, size + 5, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${pulseAlpha})`;
+    ctx.fill();
+
+    // Diamond shape
+    ctx.beginPath();
+    ctx.moveTo(x, y - size);
+    ctx.lineTo(x + size, y);
+    ctx.lineTo(x, y + size);
+    ctx.lineTo(x - size, y);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Portal icon
+    ctx.fillStyle = "#fff";
+    ctx.font = `bold ${size}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("\u2195", x, y); // ↕ up-down arrow
+  } else if (isDoor) {
+    // Door: rounded rectangle
+    const w = size * 2;
+    const h = size * 1.5;
+    roundRect(ctx, x - w / 2, y - h / 2, w, h, 3);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Door icon
+    ctx.fillStyle = "#fff";
+    ctx.font = `bold ${size - 1}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("D", x, y);
+  } else {
+    // Opening: simple gap indicator (two short lines)
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.lineCap = "round";
+
+    // Left bracket
+    ctx.beginPath();
+    ctx.moveTo(x - size, y - size * 0.6);
+    ctx.lineTo(x - size, y + size * 0.6);
+    ctx.stroke();
+
+    // Right bracket
+    ctx.beginPath();
+    ctx.moveTo(x + size, y - size * 0.6);
+    ctx.lineTo(x + size, y + size * 0.6);
+    ctx.stroke();
+
+    ctx.lineCap = "butt";
+  }
+
+  // Label
+  if (door.name) {
+    ctx.font = `9px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.fillStyle = isDark ? "rgba(255,255,255,0.5)" : "rgba(0,0,0,0.4)";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(door.name, x, y + size + 4);
   }
 }
 

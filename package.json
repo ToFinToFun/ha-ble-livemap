@@ -1,6 +1,6 @@
 {
   "name": "ha-ble-livemap",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Real-time BLE device position tracking on your floor plan for Home Assistant",
   "author": "Jerry Paasovaara",
   "license": "MIT",

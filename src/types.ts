@@ -11,6 +11,7 @@ export interface BLELivemapConfig {
   tracked_devices?: TrackedDeviceConfig[];
   proxies?: ProxyConfig[];
   zones?: ZoneConfig[];
+  doors?: DoorConfig[];
   update_interval?: number;
   history_enabled?: boolean;
   history_retention?: number; // minutes
@@ -18,6 +19,7 @@ export interface BLELivemapConfig {
   show_proxies?: boolean;
   show_zones?: boolean;
   show_zone_labels?: boolean;
+  show_doors?: boolean;
   show_signal_overlay?: boolean;
   show_accuracy_indicator?: boolean;
   theme_mode?: "auto" | "dark" | "light";
@@ -31,6 +33,7 @@ export interface BLELivemapConfig {
   gateway_timeout?: number; // seconds a gateway detection remains valid (default: 30)
   floor_override_timeout?: number; // seconds before soft floor override without gateway (default: 60)
   floor_override_min_proxies?: number; // min proxies on new floor before soft override (default: 2)
+  zone_override_timeout?: number; // seconds before soft zone override without door passage (default: 45)
 }
 
 export interface FloorConfig {
@@ -79,6 +82,23 @@ export interface ZoneConfig {
   opacity?: number; // fill opacity 0-1
   show_label?: boolean;
   floor_id?: string;
+}
+
+/** Door/portal connecting two zones or floors */
+export type DoorType = "door" | "opening" | "portal";
+
+export interface DoorConfig {
+  id: string;
+  x: number; // % position on map
+  y: number; // % position on map
+  zone_a: string; // zone_id of first room
+  zone_b: string; // zone_id of second room (empty for portals connecting to other floor)
+  floor_id: string; // which floor this door is on
+  type: DoorType; // door = closed door, opening = open passage, portal = floor/building transition
+  portal_target_floor?: string; // for portals: which floor it connects to
+  portal_target_x?: number; // for portals: x position on target floor (%)
+  portal_target_y?: number; // for portals: y position on target floor (%)
+  name?: string; // optional label (e.g. "Front door", "Stairway")
 }
 
 export interface TrackedDeviceConfig {
@@ -176,6 +196,7 @@ export const DEFAULT_CONFIG: Partial<BLELivemapConfig> = {
   show_proxies: true,
   show_zones: true,
   show_zone_labels: true,
+  show_doors: true,
   show_signal_overlay: false,
   show_accuracy_indicator: true,
   theme_mode: "auto",
@@ -185,7 +206,15 @@ export const DEFAULT_CONFIG: Partial<BLELivemapConfig> = {
   gateway_timeout: 30,
   floor_override_timeout: 60,
   floor_override_min_proxies: 2,
+  zone_override_timeout: 45,
 };
+
+// Door type labels and icons
+export const DOOR_TYPES: { value: DoorType; label: string; icon: string }[] = [
+  { value: "door", label: "Door", icon: "🛏" },
+  { value: "opening", label: "Opening", icon: "▯" },
+  { value: "portal", label: "Portal (floor/building)", icon: "🕳️" },
+];
 
 // Gateway type labels and icons
 export const GATEWAY_TYPES: { value: GatewayType; label: string; icon: string }[] = [

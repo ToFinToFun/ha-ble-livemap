@@ -15,6 +15,7 @@ import {
   DeviceState,
   ProxyConfig,
   ZoneConfig,
+  DoorConfig,
   ProxyDistance,
   DevicePosition,
   FloorConfig,
@@ -60,6 +61,17 @@ interface DeviceFloorState {
   override_candidate_floor: string | null; // floor being considered for soft override
 }
 
+/** Per-device zone tracking state for room connectivity */
+interface DeviceZoneState {
+  current_zone_id: string | null;
+  last_door_passage: number; // timestamp of last door approach detection
+  last_door_target_zone: string | null; // zone the door connects to
+  override_start: number; // timestamp when soft zone override started
+  override_candidate_zone: string | null; // zone being considered for soft override
+  approaching_door: string | null; // door_id being approached
+  prev_distance_to_door: number | null; // previous distance to the approaching door's nearest proxy
+}
+
 @customElement(CARD_NAME)
 export class BLELivemapCard extends LitElement {
   @property({ attribute: false }) public hass!: HomeAssistant;
@@ -86,6 +98,10 @@ export class BLELivemapCard extends LitElement {
 
   // Gateway transition state per device
   private _deviceFloorState: Map<string, DeviceFloorState> = new Map();
+
+  // Zone connectivity state per device
+  private _deviceZoneState: Map<string, DeviceZoneState> = new Map();
+  @state() private _runtimeShowDoors: boolean | null = null;
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -275,6 +291,234 @@ export class BLELivemapCard extends LitElement {
     return floorState.current_floor_id;
   }
 
+  // ─── Zone Connectivity Logic ─────────────────────────────
+
+  /**
+   * Check if a point (in % coords) is inside a zone polygon.
+   */
+  private _pointInZone(px: number, py: number, zone: ZoneConfig): boolean {
+    const pts = zone.points;
+    if (!pts || pts.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i].x, yi = pts[i].y;
+      const xj = pts[j].x, yj = pts[j].y;
+      if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  /**
+   * Find which zone a position falls into.
+   */
+  private _findZoneForPosition(x: number, y: number, floorId: string | null): string | null {
+    const zones = this._config.zones || [];
+    for (const zone of zones) {
+      if (floorId && zone.floor_id && zone.floor_id !== floorId) continue;
+      if (this._pointInZone(x, y, zone)) return zone.id;
+    }
+    return null;
+  }
+
+  /**
+   * Get all doors that connect to a given zone.
+   */
+  private _getDoorsForZone(zoneId: string): DoorConfig[] {
+    return (this._config.doors || []).filter(
+      (d) => d.zone_a === zoneId || d.zone_b === zoneId
+    );
+  }
+
+  /**
+   * Check if two zones are directly connected by a door.
+   */
+  private _zonesConnected(zoneA: string, zoneB: string): DoorConfig | null {
+    return (this._config.doors || []).find(
+      (d) =>
+        (d.zone_a === zoneA && d.zone_b === zoneB) ||
+        (d.zone_a === zoneB && d.zone_b === zoneA)
+    ) || null;
+  }
+
+  /**
+   * BFS to check if there's any path from zoneA to zoneB through doors.
+   * Returns the path length (number of doors to traverse), or -1 if unreachable.
+   */
+  private _findZonePath(zoneA: string, zoneB: string): number {
+    if (zoneA === zoneB) return 0;
+    const doors = this._config.doors || [];
+    if (doors.length === 0) return -1;
+
+    // Build adjacency list
+    const adj: Map<string, Set<string>> = new Map();
+    for (const door of doors) {
+      if (!door.zone_a || !door.zone_b) continue;
+      if (!adj.has(door.zone_a)) adj.set(door.zone_a, new Set());
+      if (!adj.has(door.zone_b)) adj.set(door.zone_b, new Set());
+      adj.get(door.zone_a)!.add(door.zone_b);
+      adj.get(door.zone_b)!.add(door.zone_a);
+    }
+
+    // BFS
+    const visited = new Set<string>([zoneA]);
+    const queue: { zone: string; dist: number }[] = [{ zone: zoneA, dist: 0 }];
+    while (queue.length > 0) {
+      const { zone, dist } = queue.shift()!;
+      const neighbors = adj.get(zone);
+      if (!neighbors) continue;
+      for (const next of neighbors) {
+        if (next === zoneB) return dist + 1;
+        if (!visited.has(next)) {
+          visited.add(next);
+          queue.push({ zone: next, dist: dist + 1 });
+        }
+      }
+    }
+    return -1; // unreachable
+  }
+
+  /**
+   * Resolve which zone a device should be in, respecting door connectivity.
+   *
+   * Rules:
+   * 1. If the device's trilateral position is in a zone directly connected
+   *    to the current zone via a door → allow transition
+   * 2. If the position is in a non-adjacent zone, block the transition
+   *    unless the soft override timeout has elapsed
+   * 3. If no doors are configured, fall back to simple zone detection
+   */
+  private _resolveDeviceZone(
+    deviceId: string,
+    position: { x: number; y: number },
+    floorId: string | null
+  ): string | null {
+    const zones = this._config.zones || [];
+    const doors = this._config.doors || [];
+    if (zones.length === 0) return null;
+
+    // If no doors configured, just return the zone the position is in
+    if (doors.length === 0) {
+      return this._findZoneForPosition(position.x, position.y, floorId);
+    }
+
+    const now = Date.now();
+    const overrideTimeout = (this._config.zone_override_timeout || 45) * 1000;
+
+    // Get or create zone state
+    let zoneState = this._deviceZoneState.get(deviceId);
+    if (!zoneState) {
+      // Initialize: find current zone from position
+      const initialZone = this._findZoneForPosition(position.x, position.y, floorId);
+      zoneState = {
+        current_zone_id: initialZone,
+        last_door_passage: 0,
+        last_door_target_zone: null,
+        override_start: 0,
+        override_candidate_zone: null,
+        approaching_door: null,
+        prev_distance_to_door: null,
+      };
+      this._deviceZoneState.set(deviceId, zoneState);
+      return initialZone;
+    }
+
+    // Find which zone the trilateral position is in
+    const positionZone = this._findZoneForPosition(position.x, position.y, floorId);
+
+    // If position is in the current zone, no transition needed
+    if (!positionZone || positionZone === zoneState.current_zone_id) {
+      zoneState.override_start = 0;
+      zoneState.override_candidate_zone = null;
+      return zoneState.current_zone_id;
+    }
+
+    // Position is in a different zone — check if transition is allowed
+    const currentZone = zoneState.current_zone_id;
+
+    if (!currentZone) {
+      // No current zone — just accept the new one
+      zoneState.current_zone_id = positionZone;
+      return positionZone;
+    }
+
+    // Check if the zones are directly connected by a door
+    const connectingDoor = this._zonesConnected(currentZone, positionZone);
+
+    if (connectingDoor) {
+      // Direct connection exists — allow transition
+      // Check if device is near the door (within reasonable distance)
+      const doorDist = Math.sqrt(
+        Math.pow(position.x - connectingDoor.x, 2) +
+        Math.pow(position.y - connectingDoor.y, 2)
+      );
+
+      // If device is within 15% of map size from the door, or has been
+      // consistently in the new zone, allow transition
+      if (doorDist < 15 || (now - (zoneState.override_start || now)) > 5000) {
+        zoneState.current_zone_id = positionZone;
+        zoneState.override_start = 0;
+        zoneState.override_candidate_zone = null;
+        zoneState.approaching_door = null;
+        return positionZone;
+      }
+
+      // Start approach timer
+      if (zoneState.override_candidate_zone !== positionZone) {
+        zoneState.override_candidate_zone = positionZone;
+        zoneState.override_start = now;
+      }
+      return zoneState.current_zone_id;
+    }
+
+    // Zones are NOT directly connected — check for path
+    const pathLen = this._findZonePath(currentZone, positionZone);
+
+    if (pathLen > 0 && pathLen <= 3) {
+      // Reachable through a short path — use longer timeout
+      // (device might be passing through intermediate rooms quickly)
+      if (zoneState.override_candidate_zone === positionZone) {
+        if ((now - zoneState.override_start) >= overrideTimeout * 0.5) {
+          // Allow after half the timeout for short paths
+          zoneState.current_zone_id = positionZone;
+          zoneState.override_start = 0;
+          zoneState.override_candidate_zone = null;
+          return positionZone;
+        }
+      } else {
+        zoneState.override_candidate_zone = positionZone;
+        zoneState.override_start = now;
+      }
+    } else {
+      // Not connected or very long path — use full timeout (wall blocking)
+      if (zoneState.override_candidate_zone === positionZone) {
+        if ((now - zoneState.override_start) >= overrideTimeout) {
+          // Soft override: allow after full timeout
+          zoneState.current_zone_id = positionZone;
+          zoneState.override_start = 0;
+          zoneState.override_candidate_zone = null;
+          return positionZone;
+        }
+      } else {
+        zoneState.override_candidate_zone = positionZone;
+        zoneState.override_start = now;
+      }
+    }
+
+    // Block transition — stay in current zone
+    return zoneState.current_zone_id;
+  }
+
+  /**
+   * Get doors for a specific floor.
+   */
+  private _getDoorsForFloor(floorId: string): DoorConfig[] {
+    return (this._config.doors || []).filter(
+      (d) => !d.floor_id || d.floor_id === floorId
+    );
+  }
+
   // ─── Data Update ───────────────────────────────────────────
 
   private _startUpdateLoop(): void {
@@ -302,11 +546,12 @@ export class BLELivemapCard extends LitElement {
       const distances = this._getDeviceDistances(deviceConfig, proxies);
       let position: DevicePosition | null = null;
 
+      const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
+
       if (distances.length >= 1) {
         const proxyMap = new Map<string, { x: number; y: number }>();
 
         // Resolve which floor this device should be on
-        const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
         let resolvedFloorId: string | null = null;
 
         if (hasMultipleFloors) {
@@ -367,6 +612,31 @@ export class BLELivemapCard extends LitElement {
         }
       }
 
+      // Resolve zone using door connectivity
+      if (position && (this._config.doors?.length || 0) > 0) {
+        const resolvedZone = this._resolveDeviceZone(
+          deviceId,
+          { x: position.x, y: position.y },
+          position.floor_id || null
+        );
+        // If zone connectivity blocks the move, constrain position
+        // to the nearest point inside the allowed zone
+        if (resolvedZone) {
+          const posZone = this._findZoneForPosition(
+            position.x, position.y, position.floor_id || null
+          );
+          if (posZone && posZone !== resolvedZone) {
+            // Position is in a blocked zone - keep the previous position
+            const prevKey = deviceConfig.entity_prefix || "";
+            const prevPos = this._previousPositions.get(prevKey);
+            if (prevPos) {
+              position = { ...position, x: prevPos.x, y: prevPos.y };
+              this._previousPositions.set(prevKey, position);
+            }
+          }
+        }
+      }
+
       // Find nearest proxy
       let nearestProxy: string | null = null;
       if (distances.length > 0) {
@@ -376,7 +646,6 @@ export class BLELivemapCard extends LitElement {
       }
 
       // Get history
-      const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
       let history = this._historyStore?.getTrail(deviceId) || [];
       if (position && this._historyStore) {
         this._historyStore.addPoint(deviceId, {
@@ -662,6 +931,7 @@ export class BLELivemapCard extends LitElement {
       show_proxies: this._runtimeShowProxies ?? this._config.show_proxies,
       show_zones: this._runtimeShowZones ?? this._config.show_zones,
       show_zone_labels: this._runtimeShowZoneLabels ?? this._config.show_zone_labels,
+      show_doors: this._runtimeShowDoors ?? this._config.show_doors,
     };
 
     if (this._isStackedMode()) {
@@ -693,12 +963,14 @@ export class BLELivemapCard extends LitElement {
 
     const proxies = this._getProxiesForFloor(floorId);
     const zones = this._getZonesForFloor(floorId);
+    const doors = this._getDoorsForFloor(floorId);
 
     renderCanvas(
       { ctx, width, height, dpr, isDark },
       this._devices,
       proxies,
       zones,
+      doors,
       config,
       floorId
     );
@@ -761,6 +1033,11 @@ export class BLELivemapCard extends LitElement {
   private _toggleZoneLabels(): void {
     const current = this._runtimeShowZoneLabels ?? this._config.show_zone_labels ?? true;
     this._runtimeShowZoneLabels = !current;
+  }
+
+  private _toggleDoors(): void {
+    const current = this._runtimeShowDoors ?? this._config.show_doors ?? true;
+    this._runtimeShowDoors = !current;
   }
 
   private _openSetupDialog(): void {
@@ -1216,6 +1493,20 @@ export class BLELivemapCard extends LitElement {
                   >
                     <svg viewBox="0 0 24 24" fill="currentColor">
                       <path d="M12 7V3H2v18h20V7H12zM6 19H4v-2h2v2zm0-4H4v-2h2v2zm0-4H4V9h2v2zm0-4H4V5h2v2zm4 12H8v-2h2v2zm0-4H8v-2h2v2zm0-4H8V9h2v2zm0-4H8V5h2v2zm10 12h-8v-2h2v-2h-2v-2h2v-2h-2V9h8v10zm-2-8h-2v2h2v-2zm0 4h-2v2h2v-2z"/>
+                    </svg>
+                  </button>
+                `
+              : nothing}
+            <!-- Toggle doors -->
+            ${(this._config.doors?.length || 0) > 0
+              ? html`
+                  <button
+                    class="header-btn ${(this._runtimeShowDoors ?? this._config.show_doors ?? true) ? '' : 'off'}"
+                    @click=${this._toggleDoors}
+                    title="Doors"
+                  >
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M19 19V5c0-1.1-.9-2-2-2H7c-1.1 0-2 .9-2 2v14H3v2h18v-2h-2zm-2 0H7V5h10v14zm-4-8c.55 0 1-.45 1-1s-.45-1-1-1-1 .45-1 1 .45 1 1 1z"/>
                     </svg>
                   </button>
                 `

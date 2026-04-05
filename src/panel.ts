@@ -17,6 +17,8 @@ import {
   TrackedDeviceConfig,
   FloorConfig,
   ZoneConfig,
+  DoorConfig,
+  DoorType,
   DEFAULT_CONFIG,
   DEVICE_COLORS,
   DEVICE_ICONS,
@@ -24,6 +26,7 @@ import {
   GATEWAY_TYPES,
   GatewayType,
   ProxyCalibration,
+  DOOR_TYPES,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
 import { localize } from "./localize/localize";
@@ -73,6 +76,11 @@ export class BLELivemapPanel extends LitElement {
   @state() private _draggingProxy: number | null = null;
   @state() private _mapImageLoaded = false;
   @state() private _editingZoneIdx: number | null = null;
+
+  // Door placement state
+  @state() private _placingDoor = false;
+  @state() private _placingDoorType: DoorType = "door";
+  @state() private _editingDoorIdx: number | null = null;
 
   // RSSI Calibration wizard state
   @state() private _calibWizardActive = false;
@@ -346,6 +354,25 @@ export class BLELivemapPanel extends LitElement {
         "panel.floor_override_timeout": "Soft floor override timeout (s)",
         "panel.floor_override_min_proxies": "Min proxies for floor override",
         "panel.area": "Area",
+        "panel.tab_doors": "Doors",
+        "panel.add_door": "Add door",
+        "panel.remove_door": "Remove",
+        "panel.door_name": "Door name",
+        "panel.door_type": "Type",
+        "panel.door_type_door": "Door",
+        "panel.door_type_opening": "Opening",
+        "panel.door_type_portal": "Portal (floor/building)",
+        "panel.door_zone_a": "Room A",
+        "panel.door_zone_b": "Room B",
+        "panel.door_portal_target": "Target floor",
+        "panel.door_click_to_place": "Click on the map to place the door",
+        "panel.door_auto_detect": "Zones auto-detected from position",
+        "panel.show_doors": "Show doors",
+        "panel.zone_override_timeout": "Zone transition timeout (s)",
+        "panel.door_count": "doors configured",
+        "panel.door_edit": "Edit",
+        "panel.door_done_editing": "Done",
+        "panel.door_connects": "Connects",
       },
       sv: {
         "panel.title": "BLE LiveMap Inställningar",
@@ -456,6 +483,25 @@ export class BLELivemapPanel extends LitElement {
         "panel.floor_override_timeout": "Mjuk våningsövergångs-timeout (s)",
         "panel.floor_override_min_proxies": "Min proxies för våningsövergång",
         "panel.area": "Område",
+        "panel.tab_doors": "Dörrar",
+        "panel.add_door": "Lägg till dörr",
+        "panel.remove_door": "Ta bort",
+        "panel.door_name": "Dörrnamn",
+        "panel.door_type": "Typ",
+        "panel.door_type_door": "Dörr",
+        "panel.door_type_opening": "Öppning",
+        "panel.door_type_portal": "Portal (våning/byggnad)",
+        "panel.door_zone_a": "Rum A",
+        "panel.door_zone_b": "Rum B",
+        "panel.door_portal_target": "Målvåning",
+        "panel.door_click_to_place": "Klicka på kartan för att placera dörren",
+        "panel.door_auto_detect": "Zoner auto-detekterade från position",
+        "panel.show_doors": "Visa dörrar",
+        "panel.zone_override_timeout": "Zonövergångs-timeout (s)",
+        "panel.door_count": "dörrar konfigurerade",
+        "panel.door_edit": "Redigera",
+        "panel.door_done_editing": "Klar",
+        "panel.door_connects": "Förbinder",
       },
     };
 
@@ -871,6 +917,12 @@ export class BLELivemapPanel extends LitElement {
       return;
     }
 
+    // Door placement mode
+    if (this._placingDoor) {
+      this._placeDoor(x, y);
+      return;
+    }
+
     // Placing proxy mode
     if (this._placingMode === "proxy" && this._placingEntity) {
       const proxies = [...(this._config.proxies || [])];
@@ -881,6 +933,23 @@ export class BLELivemapPanel extends LitElement {
       }
       this._placingEntity = null;
       this._placingMode = null;
+      return;
+    }
+
+    // Check if clicking on a door (for editing) in doors tab
+    if (this._activeTab === "doors" && !this._placingDoor) {
+      const doors = this._config.doors || [];
+      for (let i = doors.length - 1; i >= 0; i--) {
+        const dx = x - doors[i].x;
+        const dy = y - doors[i].y;
+        if (Math.sqrt(dx * dx + dy * dy) < 4) {
+          this._editingDoorIdx = i;
+          this.requestUpdate();
+          return;
+        }
+      }
+      this._editingDoorIdx = null;
+      this.requestUpdate();
       return;
     }
 
@@ -998,6 +1067,88 @@ export class BLELivemapPanel extends LitElement {
 
     // Auto-select the new zone for editing
     this._editingZoneIdx = zones.length - 1;
+  }
+
+  // ─── Door Placement ──────────────────────────────────────
+
+  private _startPlacingDoor(type: DoorType = "door"): void {
+    this._placingDoor = true;
+    this._placingDoorType = type;
+  }
+
+  private _cancelPlacingDoor(): void {
+    this._placingDoor = false;
+  }
+
+  private _placeDoor(x: number, y: number): void {
+    const doors = [...(this._config.doors || [])];
+    const floor = this._getActiveFloor();
+    const floorId = floor?.id || "floor_0";
+
+    // Auto-detect which zones this door connects
+    const zones = this._config.zones || [];
+    let zoneA: string | null = null;
+    let zoneB: string | null = null;
+
+    // Find the two closest zones to this point
+    const zoneDists: { id: string; dist: number }[] = [];
+    for (const zone of zones) {
+      if (zone.floor_id && zone.floor_id !== floorId) continue;
+      // Calculate distance from door to zone center
+      const pts = zone.points || [];
+      if (pts.length < 3) continue;
+      const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+      const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+      const dist = Math.sqrt(Math.pow(x - cx, 2) + Math.pow(y - cy, 2));
+      zoneDists.push({ id: zone.id, dist });
+    }
+
+    // Sort by distance and pick the two closest
+    zoneDists.sort((a, b) => a.dist - b.dist);
+    if (zoneDists.length >= 2) {
+      zoneA = zoneDists[0].id;
+      zoneB = zoneDists[1].id;
+    } else if (zoneDists.length === 1) {
+      zoneA = zoneDists[0].id;
+    }
+
+    const newDoor: DoorConfig = {
+      id: `door_${Date.now()}`,
+      type: this._placingDoorType,
+      x,
+      y,
+      zone_a: zoneA || "",
+      zone_b: zoneB || "",
+      floor_id: floorId,
+      name: "",
+    };
+
+    // If it's a portal type, set default target
+    if (this._placingDoorType === "portal") {
+      const floors = this._config.floors || [];
+      const otherFloor = floors.find((f) => f.id !== floorId);
+      if (otherFloor) {
+        newDoor.portal_target_floor = otherFloor.id;
+      }
+    }
+
+    doors.push(newDoor);
+    this._updateConfig("doors", doors);
+    this._placingDoor = false;
+    this._editingDoorIdx = doors.length - 1;
+  }
+
+  private _removeDoor(idx: number): void {
+    const doors = [...(this._config.doors || [])];
+    doors.splice(idx, 1);
+    this._updateConfig("doors", doors);
+    if (this._editingDoorIdx === idx) this._editingDoorIdx = null;
+  }
+
+  private _updateDoor(idx: number, key: keyof DoorConfig, value: any): void {
+    const doors = [...(this._config.doors || [])];
+    doors[idx] = { ...doors[idx], [key]: value };
+    this._updateConfig("doors", doors);
   }
 
   // ─── Calibration ───────────────────────────────────────────
@@ -1675,6 +1826,50 @@ export class BLELivemapPanel extends LitElement {
         font-weight: 500;
       }
 
+      /* Door markers */
+      .door-marker {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        width: 28px;
+        height: 28px;
+        border-radius: 6px;
+        background: var(--door-color, #FF9800);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: all;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        transition: transform 0.15s, box-shadow 0.15s;
+        z-index: 9;
+        cursor: pointer;
+      }
+
+      .door-marker .door-icon {
+        font-size: 16px;
+        line-height: 1;
+      }
+
+      .door-marker.clickable:hover {
+        transform: translate(-50%, -50%) scale(1.15);
+        box-shadow: 0 3px 10px rgba(0,0,0,0.4);
+      }
+
+      .door-marker.editing {
+        transform: translate(-50%, -50%) scale(1.2);
+        box-shadow: 0 0 0 3px white, 0 0 0 5px var(--door-color, #FF9800);
+      }
+
+      .door-label {
+        position: absolute;
+        transform: translate(-50%, 0);
+        font-size: 9px;
+        color: var(--text-primary);
+        text-shadow: 0 0 3px var(--card-bg), 0 0 3px var(--card-bg);
+        white-space: nowrap;
+        pointer-events: none;
+        font-weight: 600;
+      }
+
       /* Drawing points */
       .draw-point {
         position: absolute;
@@ -2096,6 +2291,7 @@ export class BLELivemapPanel extends LitElement {
       { id: "proxies", label: this._t("panel.tab_proxies") },
       { id: "devices", label: this._t("panel.tab_devices") },
       { id: "zones", label: this._t("panel.tab_zones") },
+      { id: "doors", label: this._t("panel.tab_doors") },
       { id: "settings", label: this._t("panel.tab_settings") },
     ];
 
@@ -2247,9 +2443,13 @@ export class BLELivemapPanel extends LitElement {
         ${this._activeTab === "map" ? this._renderMapToolbar() : nothing}
         ${this._activeTab === "zones" ? this._renderZoneToolbar() : nothing}
         ${this._activeTab === "proxies" ? this._renderProxyToolbar() : nothing}
+        ${this._activeTab === "doors" ? this._renderDoorToolbar() : nothing}
 
         <!-- Zone edit panel -->
         ${this._editingZoneIdx !== null && this._activeTab === "zones" ? this._renderZoneEditPanel() : nothing}
+
+        <!-- Door edit panel -->
+        ${this._editingDoorIdx !== null && this._activeTab === "doors" ? this._renderDoorEditPanel() : nothing}
 
         <!-- Map -->
         ${hasImage ? html`
@@ -2268,6 +2468,7 @@ export class BLELivemapPanel extends LitElement {
               ${this._mapImageLoaded ? html`
                 <div class="map-overlay">
                   ${this._renderZoneOverlays()}
+                  ${this._renderDoorMarkers()}
                   ${this._renderProxyMarkers()}
                   ${this._renderDrawingPoints()}
                   ${this._renderRectPreview()}
@@ -2517,6 +2718,149 @@ export class BLELivemapPanel extends LitElement {
     `;
   }
 
+  private _renderDoorToolbar() {
+    const doors = this._config.doors || [];
+    return html`
+      <div class="map-toolbar">
+        ${this._placingDoor ? html`
+          <span style="font-size:12px;color:var(--accent);font-weight:600;">
+            ${this._t("panel.door_click_to_place")}
+          </span>
+          <button class="btn btn-small btn-secondary" @click=${this._cancelPlacingDoor}>
+            ${this._t("panel.cancel_placement")}
+          </button>
+        ` : html`
+          <button class="btn btn-small btn-primary" @click=${() => this._startPlacingDoor("door")}>
+            + ${this._t("panel.door_type_door")}
+          </button>
+          <button class="btn btn-small btn-secondary" @click=${() => this._startPlacingDoor("opening")}>
+            + ${this._t("panel.door_type_opening")}
+          </button>
+          <button class="btn btn-small btn-secondary" @click=${() => this._startPlacingDoor("portal")}>
+            + ${this._t("panel.door_type_portal")}
+          </button>
+          <span style="flex:1;"></span>
+          <span style="font-size:11px;color:var(--text-secondary);">
+            ${doors.length} ${this._t("panel.door_count")}
+          </span>
+        `}
+      </div>
+    `;
+  }
+
+  private _renderDoorEditPanel() {
+    const doors = this._config.doors || [];
+    const door = doors[this._editingDoorIdx!];
+    if (!door) return nothing;
+    const idx = this._editingDoorIdx!;
+    const zones = this._config.zones || [];
+    const floors = this._getFloors();
+
+    // Get zone names for display
+    const zoneA = zones.find((z) => z.id === door.zone_a);
+    const zoneB = zones.find((z) => z.id === door.zone_b);
+
+    return html`
+      <div class="zone-edit-panel">
+        <h4 style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:18px;">${door.type === "door" ? "\uD83D\uDEAA" : door.type === "portal" ? "\uD83D\uDD73\uFE0F" : "\u25AF"}</span>
+          ${this._t("panel.door_edit")}: ${door.name || `Door ${idx + 1}`}
+        </h4>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.door_name")}</label>
+          <input type="text" .value=${door.name || ""} @change=${(e: Event) => {
+            this._updateDoor(idx, "name", (e.target as HTMLInputElement).value);
+          }} />
+        </div>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.door_type")}</label>
+          <select @change=${(e: Event) => {
+            this._updateDoor(idx, "type", (e.target as HTMLSelectElement).value as DoorType);
+          }}>
+            <option value="door" ?selected=${door.type === "door"}>${this._t("panel.door_type_door")}</option>
+            <option value="opening" ?selected=${door.type === "opening"}>${this._t("panel.door_type_opening")}</option>
+            <option value="portal" ?selected=${door.type === "portal"}>${this._t("panel.door_type_portal")}</option>
+          </select>
+        </div>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.door_zone_a")}</label>
+          <select @change=${(e: Event) => {
+            this._updateDoor(idx, "zone_a", (e.target as HTMLSelectElement).value);
+          }}>
+            <option value="">-- Select --</option>
+            ${zones.map((z) => html`
+              <option value=${z.id} ?selected=${door.zone_a === z.id}>${z.name || z.id}</option>
+            `)}
+          </select>
+        </div>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.door_zone_b")}</label>
+          <select @change=${(e: Event) => {
+            this._updateDoor(idx, "zone_b", (e.target as HTMLSelectElement).value);
+          }}>
+            <option value="">-- Select --</option>
+            ${zones.map((z) => html`
+              <option value=${z.id} ?selected=${door.zone_b === z.id}>${z.name || z.id}</option>
+            `)}
+          </select>
+        </div>
+        ${door.type === "portal" ? html`
+          <div class="zone-edit-row">
+            <label>${this._t("panel.door_portal_target")}</label>
+            <select @change=${(e: Event) => {
+              this._updateDoor(idx, "portal_target_floor", (e.target as HTMLSelectElement).value);
+            }}>
+              <option value="">-- Select --</option>
+              ${floors.map((f) => html`
+                <option value=${f.id} ?selected=${door.portal_target_floor === f.id}>${f.name || f.id}</option>
+              `)}
+            </select>
+          </div>
+        ` : nothing}
+        <div style="font-size:11px;color:var(--text-secondary);margin:4px 0;">
+          ${this._t("panel.door_connects")}: ${zoneA?.name || door.zone_a || "?"} \u2194 ${zoneB?.name || door.zone_b || "?"}
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <button class="btn btn-small btn-primary" @click=${() => { this._editingDoorIdx = null; }}>
+            ${this._t("panel.door_done_editing")}
+          </button>
+          <button class="btn btn-small btn-danger" @click=${() => this._removeDoor(idx)}>
+            ${this._t("panel.remove_door")}
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  private _renderDoorMarkers() {
+    const doors = this._config.doors || [];
+    const floor = this._getActiveFloor();
+    const isDoorTab = this._activeTab === "doors";
+
+    return doors.map((door, idx) => {
+      if (floor && door.floor_id && door.floor_id !== floor.id) return nothing;
+
+      const isEditing = this._editingDoorIdx === idx;
+      const icon = door.type === "door" ? "\uD83D\uDEAA" : door.type === "portal" ? "\uD83D\uDD73\uFE0F" : "\u25AF";
+      const color = door.type === "portal" ? "#E040FB" : door.type === "door" ? "#FF9800" : "#78909C";
+
+      return html`
+        <div
+          class="door-marker ${isEditing ? 'editing' : ''} ${isDoorTab ? 'clickable' : ''}"
+          style="left: ${door.x}%; top: ${door.y}%; --door-color: ${color};"
+          title="${door.name || `Door ${idx + 1}`}\n${door.type}"
+        >
+          <span class="door-icon">${icon}</span>
+        </div>
+        ${door.name ? html`
+          <div class="door-label" style="left: ${door.x}%; top: ${door.y + 2}%;">
+            ${door.name}
+          </div>
+        ` : nothing}
+      `;
+    });
+  }
+
   private _renderProxyMarkers() {
     const proxies = this._config.proxies || [];
     const floor = this._getActiveFloor();
@@ -2679,6 +3023,10 @@ export class BLELivemapPanel extends LitElement {
             <label>${this._t("panel.show_zone_labels")}</label>
             <input type="checkbox" ?checked=${this._config.show_zone_labels !== false} @change=${(e: Event) => this._updateConfig("show_zone_labels", (e.target as HTMLInputElement).checked)} />
           </div>
+          <div class="config-row">
+            <label>${this._t("panel.show_doors")}</label>
+            <input type="checkbox" ?checked=${this._config.show_doors !== false} @change=${(e: Event) => this._updateConfig("show_doors", (e.target as HTMLInputElement).checked)} />
+          </div>
         </div>
 
         <!-- Gateway & Floor Override Settings -->
@@ -2695,6 +3043,10 @@ export class BLELivemapPanel extends LitElement {
           <div class="config-row">
             <label>${this._t("panel.floor_override_min_proxies")}</label>
             <input type="number" min="1" max="10" .value=${String(this._config.floor_override_min_proxies || 2)} @change=${(e: Event) => this._updateConfig("floor_override_min_proxies", parseInt((e.target as HTMLInputElement).value))} />
+          </div>
+          <div class="config-row">
+            <label>${this._t("panel.zone_override_timeout")}</label>
+            <input type="number" min="10" max="300" .value=${String(this._config.zone_override_timeout || 45)} @change=${(e: Event) => this._updateConfig("zone_override_timeout", parseInt((e.target as HTMLInputElement).value))} />
           </div>
         </div>
 
