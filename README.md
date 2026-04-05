@@ -64,6 +64,35 @@ Track phones, watches, tags, and any Bluetooth device on an interactive floor pl
 
 ---
 
+## Sidebar Panel (New in v1.4.0)
+
+You can configure BLE LiveMap from a dedicated full-page panel in your Home Assistant sidebar. This gives you a large interactive map, entity search, drag-and-drop placement, and auto-placement features.
+
+### How to enable the panel:
+
+1. Open your `configuration.yaml` file
+2. Add the following configuration:
+
+```yaml
+panel_custom:
+  - name: ble-livemap-panel
+    sidebar_title: BLE LiveMap
+    sidebar_icon: mdi:map-marker-radius
+    url_path: ble-livemap
+    # If installed via HACS, use this path:
+    module_url: /local/community/ha-ble-livemap/ble-livemap-card.js
+    # If installed manually, use this path instead:
+    # module_url: /local/ble-livemap-card.js
+    
+    # Optional: If you access HA via a proxy (like Cloudflare) and the panel fails to load, uncomment this:
+    # trust_external_script: true
+```
+
+3. Restart Home Assistant
+4. You will now see **BLE LiveMap** in your sidebar!
+
+---
+
 ## Quick Start
 
 ### 1. Prepare your floor plan
