@@ -29,6 +29,9 @@ export class BLELivemapCardEditor extends LitElement {
   @state() private _placingProxy: number | null = null;
   @state() private _drawingZone: number | null = null;
   @state() private _drawingPoints: { x: number; y: number }[] = [];
+  @state() private _calibrating = false;
+  @state() private _calibrationPoints: { x: number; y: number }[] = [];
+  @state() private _calibrationMeters = 0;
 
   private _lang = "en";
 
@@ -59,6 +62,8 @@ export class BLELivemapCardEditor extends LitElement {
   private _renderFloorplanSection() {
     const floors = this._config.floors || [];
     const useSingleFloor = floors.length === 0;
+    const floorplanImage = this._getFloorplanImage();
+    const hasCalibration = this._calibrationPoints.length === 2 && this._calibrationMeters > 0;
 
     return html`
       <div class="section">
@@ -80,6 +85,121 @@ export class BLELivemapCardEditor extends LitElement {
             `
           : nothing}
 
+        <!-- Calibration Tool -->
+        ${floorplanImage
+          ? html`
+              <div class="subsection">
+                <div class="subsection-header">
+                  <span>${this._t("editor.calibration")}</span>
+                </div>
+                <p class="help">${this._t("editor.calibration_help")}</p>
+
+                <div class="map-preview calibration-map" @click=${this._handleCalibrationMapClick}>
+                  <img src=${floorplanImage} alt="Floor plan" />
+                  <!-- SVG overlay for calibration line -->
+                  <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="none">
+                    ${this._calibrationPoints.length >= 1
+                      ? html`
+                          <circle
+                            cx="${this._calibrationPoints[0].x}"
+                            cy="${this._calibrationPoints[0].y}"
+                            r="0.7"
+                            fill="#FF5722"
+                            stroke="white"
+                            stroke-width="0.2"
+                          />
+                        `
+                      : nothing}
+                    ${this._calibrationPoints.length === 2
+                      ? html`
+                          <line
+                            x1="${this._calibrationPoints[0].x}"
+                            y1="${this._calibrationPoints[0].y}"
+                            x2="${this._calibrationPoints[1].x}"
+                            y2="${this._calibrationPoints[1].y}"
+                            stroke="#FF5722"
+                            stroke-width="0.3"
+                            stroke-dasharray="1,0.5"
+                          />
+                          <circle
+                            cx="${this._calibrationPoints[1].x}"
+                            cy="${this._calibrationPoints[1].y}"
+                            r="0.7"
+                            fill="#FF5722"
+                            stroke="white"
+                            stroke-width="0.2"
+                          />
+                        `
+                      : nothing}
+                  </svg>
+                  ${this._calibrating
+                    ? html`<div class="placing-hint">
+                        ${this._calibrationPoints.length === 0
+                          ? this._t("editor.calibration_click_start")
+                          : this._t("editor.calibration_click_end")}
+                      </div>`
+                    : nothing}
+                </div>
+
+                <div class="field-row" style="margin-bottom: 8px;">
+                  <button
+                    class="place-btn ${this._calibrating ? 'active' : ''}"
+                    @click=${this._toggleCalibration}
+                  >
+                    ${this._calibrating
+                      ? this._t("editor.calibration_cancel")
+                      : this._t("editor.calibration_start")}
+                  </button>
+                  ${this._calibrationPoints.length === 2
+                    ? html`
+                        <button class="place-btn" @click=${this._resetCalibration}>
+                          ${this._t("editor.calibration_reset")}
+                        </button>
+                      `
+                    : nothing}
+                </div>
+
+                ${this._calibrationPoints.length === 2
+                  ? html`
+                      <div class="field">
+                        <label>${this._t("editor.calibration_distance")}</label>
+                        <div class="field-row">
+                          <input
+                            type="number"
+                            .value=${String(this._calibrationMeters || "")}
+                            @input=${this._handleCalibrationDistanceInput}
+                            placeholder="${this._t("editor.calibration_distance_placeholder")}"
+                            min="0.1"
+                            step="0.1"
+                          />
+                          <span class="unit">m</span>
+                          ${this._calibrationMeters > 0
+                            ? html`
+                                <button class="place-btn" @click=${this._applyCalibration}>
+                                  ${this._t("editor.calibration_apply")}
+                                </button>
+                              `
+                            : nothing}
+                        </div>
+                      </div>
+                      ${hasCalibration
+                        ? html`
+                            <div class="calibration-result">
+                              <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                              </svg>
+                              ${this._t("editor.calibration_result")}: 
+                              <strong>${this._getCalibrationResult()}</strong>
+                            </div>
+                          `
+                        : nothing}
+                    `
+                  : nothing}
+              </div>
+            `
+          : nothing}
+
+        <!-- Manual dimensions (always visible as fallback / result) -->
         <div class="field">
           <label>${this._t("editor.real_dimensions")}</label>
           <div class="field-row">
@@ -103,8 +223,10 @@ export class BLELivemapCardEditor extends LitElement {
             />
             <span class="unit">m</span>
           </div>
+          <span class="help">${this._t("editor.dimensions_help")}</span>
         </div>
 
+        <!-- Multi-floor management -->
         <div class="subsection">
           <div class="subsection-header">
             <span>${this._t("editor.floors")}</span>
@@ -719,6 +841,142 @@ export class BLELivemapCardEditor extends LitElement {
     return { x: cx / points.length, y: cy / points.length };
   }
 
+  // ─── Calibration ────────────────────────────────────
+
+  private _toggleCalibration(): void {
+    if (this._calibrating) {
+      // Cancel
+      this._calibrating = false;
+      this._calibrationPoints = [];
+    } else {
+      // Start
+      this._calibrating = true;
+      this._calibrationPoints = [];
+      this._calibrationMeters = 0;
+      this._placingProxy = null;
+      this._drawingZone = null;
+    }
+  }
+
+  private _resetCalibration(): void {
+    this._calibrating = false;
+    this._calibrationPoints = [];
+    this._calibrationMeters = 0;
+  }
+
+  private _handleCalibrationMapClick(e: MouseEvent): void {
+    if (!this._calibrating) return;
+    if (this._calibrationPoints.length >= 2) return;
+
+    const img = (e.currentTarget as HTMLElement).querySelector("img");
+    if (!img) return;
+
+    const rect = img.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 100;
+    const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+    const point = { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };
+    this._calibrationPoints = [...this._calibrationPoints, point];
+
+    if (this._calibrationPoints.length === 2) {
+      this._calibrating = false; // Done clicking
+    }
+
+    this.requestUpdate();
+  }
+
+  private _handleCalibrationDistanceInput(e: Event): void {
+    this._calibrationMeters = parseFloat((e.target as HTMLInputElement).value) || 0;
+  }
+
+  private _applyCalibration(): void {
+    if (this._calibrationPoints.length !== 2 || this._calibrationMeters <= 0) return;
+
+    const p1 = this._calibrationPoints[0];
+    const p2 = this._calibrationPoints[1];
+
+    // Calculate pixel distance in percentage units
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const distPercent = Math.sqrt(dx * dx + dy * dy);
+
+    if (distPercent < 0.5) return; // Too short to calibrate
+
+    // We need to account for image aspect ratio.
+    // The % coords are relative to image dimensions.
+    // We need the image's natural aspect ratio to convert % to real proportions.
+    const img = this.shadowRoot?.querySelector(".calibration-map img") as HTMLImageElement;
+    if (!img || !img.naturalWidth || !img.naturalHeight) return;
+
+    const aspectRatio = img.naturalWidth / img.naturalHeight;
+
+    // Convert % to proportional units (accounting for aspect ratio)
+    // dx% of width = dx/100 * realWidth
+    // dy% of height = dy/100 * realHeight
+    // realWidth / realHeight = aspectRatio
+    // So: realHeight = realWidth / aspectRatio
+    //
+    // pixelDist = sqrt((dx/100 * W)^2 + (dy/100 * H)^2) = knownMeters
+    // W = H * aspectRatio
+    // pixelDist = sqrt((dx/100 * H * ar)^2 + (dy/100 * H)^2) = knownMeters
+    // H * sqrt((dx/100 * ar)^2 + (dy/100)^2) = knownMeters
+    // H = knownMeters / sqrt((dx/100 * ar)^2 + (dy/100)^2)
+
+    const dxNorm = dx / 100 * aspectRatio;
+    const dyNorm = dy / 100;
+    const normDist = Math.sqrt(dxNorm * dxNorm + dyNorm * dyNorm);
+
+    const realHeight = this._calibrationMeters / normDist;
+    const realWidth = realHeight * aspectRatio;
+
+    // Round to 1 decimal
+    const roundedWidth = Math.round(realWidth * 10) / 10;
+    const roundedHeight = Math.round(realHeight * 10) / 10;
+
+    // Apply to config
+    const floors = [...(this._config.floors || [])];
+    if (floors.length > 0) {
+      floors[0] = { ...floors[0], image_width: roundedWidth, image_height: roundedHeight };
+      this._updateConfig("floors", floors);
+    } else {
+      // For single-floor mode, store in a temporary floor or directly
+      // We need to create a floor to store dimensions
+      this._config = {
+        ...this._config,
+        floors: [{
+          id: "floor_main",
+          name: "Main",
+          image: this._config.floorplan_image || "",
+          image_width: roundedWidth,
+          image_height: roundedHeight,
+        }],
+      };
+      this._fireConfigChanged();
+    }
+  }
+
+  private _getCalibrationResult(): string {
+    if (this._calibrationPoints.length !== 2 || this._calibrationMeters <= 0) return "";
+
+    const img = this.shadowRoot?.querySelector(".calibration-map img") as HTMLImageElement;
+    if (!img || !img.naturalWidth || !img.naturalHeight) return "";
+
+    const p1 = this._calibrationPoints[0];
+    const p2 = this._calibrationPoints[1];
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const aspectRatio = img.naturalWidth / img.naturalHeight;
+
+    const dxNorm = dx / 100 * aspectRatio;
+    const dyNorm = dy / 100;
+    const normDist = Math.sqrt(dxNorm * dxNorm + dyNorm * dyNorm);
+
+    const realHeight = this._calibrationMeters / normDist;
+    const realWidth = realHeight * aspectRatio;
+
+    return `${Math.round(realWidth * 10) / 10}m x ${Math.round(realHeight * 10) / 10}m`;
+  }
+
   // ─── Map Click Handlers ───────────────────────────────────
 
   private _handleProxyMapClick(e: MouseEvent): void {
@@ -1091,6 +1349,32 @@ export class BLELivemapCardEditor extends LitElement {
         border-radius: 4px;
         cursor: pointer;
         background: transparent;
+      }
+
+      .calibration-result {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+        background: rgba(76, 175, 80, 0.08);
+        border: 1px solid rgba(76, 175, 80, 0.25);
+        border-radius: 8px;
+        font-size: 12px;
+        color: #4CAF50;
+        margin-top: 4px;
+      }
+
+      .calibration-result strong {
+        color: var(--editor-text);
+      }
+
+      .calibration-map {
+        border: 2px solid transparent;
+        transition: border-color 0.2s;
+      }
+
+      .calibration-map:has(.placing-hint) {
+        border-color: #FF5722;
       }
     `;
   }
