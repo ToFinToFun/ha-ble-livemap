@@ -10,11 +10,14 @@ export interface BLELivemapConfig {
   floors?: FloorConfig[];
   tracked_devices?: TrackedDeviceConfig[];
   proxies?: ProxyConfig[];
+  zones?: ZoneConfig[];
   update_interval?: number;
   history_enabled?: boolean;
   history_retention?: number; // minutes
   history_trail_length?: number;
   show_proxies?: boolean;
+  show_zones?: boolean;
+  show_zone_labels?: boolean;
   show_signal_overlay?: boolean;
   show_accuracy_indicator?: boolean;
   theme_mode?: "auto" | "dark" | "light";
@@ -40,6 +43,17 @@ export interface ProxyConfig {
   floor_id?: string;
   icon?: string;
   color?: string;
+}
+
+export interface ZoneConfig {
+  id: string;
+  name: string;
+  points: { x: number; y: number }[]; // polygon vertices in % coords
+  color?: string; // fill color (hex)
+  border_color?: string; // border color (hex)
+  opacity?: number; // fill opacity 0-1
+  show_label?: boolean;
+  floor_id?: string;
 }
 
 export interface TrackedDeviceConfig {
@@ -134,11 +148,25 @@ export const DEFAULT_CONFIG: Partial<BLELivemapConfig> = {
   history_retention: 60,
   history_trail_length: 50,
   show_proxies: true,
+  show_zones: true,
+  show_zone_labels: true,
   show_signal_overlay: false,
   show_accuracy_indicator: true,
   theme_mode: "auto",
   fullscreen_enabled: true,
 };
+
+// Default zone colors
+export const ZONE_COLORS = [
+  "#4FC3F7", // Light Blue
+  "#81C784", // Green
+  "#FFB74D", // Orange
+  "#BA68C8", // Purple
+  "#4DB6AC", // Teal
+  "#FFD54F", // Yellow
+  "#F06292", // Pink
+  "#E57373", // Red
+];
 
 // Default device colors
 export const DEVICE_COLORS = [

@@ -28,6 +28,19 @@
     "add_proxy": "Lägg till proxy",
     "remove_proxy": "Ta bort proxy",
     "place_on_map": "Klicka på kartan för att placera",
+    "zones": "Zoner",
+    "zones_help": "Rita zoner på kartan för att definiera rum och områden. Klicka för att lägga till hörn, klicka nära första punkten för att stänga polygonen.",
+    "zone_name": "Zonnamn",
+    "zone_color": "Fyllnadsfärg",
+    "zone_border_color": "Kantfärg",
+    "zone_opacity": "Opacitet",
+    "zone_show_label": "Visa etikett",
+    "zone_points": "punkter",
+    "zone_redraw": "Rita om",
+    "zone_draw_hint": "Klicka på kartan för att rita zonens hörn. Klicka nära första punkten för att stänga.",
+    "zone_finish": "Slutför zon",
+    "add_zone": "Lägg till zon",
+    "remove_zone": "Ta bort zon",
     "devices": "Spårade enheter",
     "device_entity": "Bermuda-enhets entity prefix",
     "device_name": "Visningsnamn",
@@ -40,6 +53,8 @@
     "appearance": "Utseende",
     "card_title": "Korttitel",
     "show_proxies": "Visa proxy-indikatorer",
+    "show_zones": "Visa zoner",
+    "show_zone_labels": "Visa zonetiketter",
     "show_signal_overlay": "Visa signaltäckning",
     "show_accuracy": "Visa noggrannhetsindikator",
     "theme_mode": "Temaläge",
@@ -65,6 +80,8 @@
     "area": "Område",
     "devices_tracked": "enheter spåras",
     "proxies_active": "proxies aktiva",
-    "clear_history": "Rensa historik"
+    "clear_history": "Rensa historik",
+    "toggle_proxies": "Visa/dölj proxies",
+    "toggle_zones": "Visa/dölj zoner"
   }
 }

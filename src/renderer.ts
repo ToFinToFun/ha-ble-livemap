@@ -4,10 +4,10 @@
  * License: MIT
  *
  * High-performance Canvas2D renderer for device positions,
- * gradient accuracy circles, history trails, and proxy indicators.
+ * gradient accuracy circles, history trails, zones, and proxy indicators.
  */
 
-import { DeviceState, ProxyConfig, BLELivemapConfig } from "./types";
+import { DeviceState, ProxyConfig, ZoneConfig, BLELivemapConfig } from "./types";
 
 interface RenderContext {
   ctx: CanvasRenderingContext2D;
@@ -28,6 +28,7 @@ export function render(
   rc: RenderContext,
   devices: DeviceState[],
   proxies: ProxyConfig[],
+  zones: ZoneConfig[],
   config: BLELivemapConfig,
   activeFloor: string | null
 ): void {
@@ -37,6 +38,14 @@ export function render(
   ctx.clearRect(0, 0, width * dpr, height * dpr);
   ctx.save();
   ctx.scale(dpr, dpr);
+
+  // Draw zones (below everything else)
+  if (config.show_zones !== false && zones.length > 0) {
+    for (const zone of zones) {
+      if (activeFloor && zone.floor_id && zone.floor_id !== activeFloor) continue;
+      drawZone(rc, zone, config.show_zone_labels !== false);
+    }
+  }
 
   // Draw signal coverage overlay
   if (config.show_signal_overlay) {
@@ -74,6 +83,79 @@ export function render(
 }
 
 /**
+ * Draw a zone polygon on the map.
+ */
+function drawZone(rc: RenderContext, zone: ZoneConfig, showLabel: boolean): void {
+  const { ctx, width, height, isDark } = rc;
+  const points = zone.points;
+
+  if (!points || points.length < 3) return;
+
+  const fillColor = zone.color || "#4FC3F7";
+  const borderColor = zone.border_color || fillColor;
+  const opacity = zone.opacity ?? 0.12;
+  const rgb = hexToRgb(fillColor);
+  const borderRgb = hexToRgb(borderColor);
+
+  // Draw filled polygon
+  ctx.beginPath();
+  ctx.moveTo((points[0].x / 100) * width, (points[0].y / 100) * height);
+  for (let i = 1; i < points.length; i++) {
+    ctx.lineTo((points[i].x / 100) * width, (points[i].y / 100) * height);
+  }
+  ctx.closePath();
+
+  ctx.fillStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${opacity})`;
+  ctx.fill();
+
+  // Draw border
+  ctx.strokeStyle = `rgba(${borderRgb.r},${borderRgb.g},${borderRgb.b},${Math.min(opacity * 3, 0.6)})`;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Draw label at centroid
+  if (showLabel && zone.show_label !== false && zone.name) {
+    const centroid = getPolygonCentroid(points);
+    const cx = (centroid.x / 100) * width;
+    const cy = (centroid.y / 100) * height;
+
+    ctx.font = `500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    // Label background
+    const metrics = ctx.measureText(zone.name);
+    const padding = 5;
+    const bgX = cx - metrics.width / 2 - padding;
+    const bgY = cy - 8;
+    const bgW = metrics.width + padding * 2;
+    const bgH = 16;
+
+    ctx.fillStyle = isDark ? `rgba(0,0,0,0.55)` : `rgba(255,255,255,0.75)`;
+    roundRect(ctx, bgX, bgY, bgW, bgH, 4);
+    ctx.fill();
+
+    ctx.fillStyle = `rgba(${borderRgb.r},${borderRgb.g},${borderRgb.b},0.8)`;
+    ctx.fillText(zone.name, cx, cy);
+  }
+}
+
+/**
+ * Calculate centroid of a polygon.
+ */
+function getPolygonCentroid(points: { x: number; y: number }[]): { x: number; y: number } {
+  let cx = 0;
+  let cy = 0;
+  for (const p of points) {
+    cx += p.x;
+    cy += p.y;
+  }
+  return { x: cx / points.length, y: cy / points.length };
+}
+
+/**
  * Draw a BLE proxy indicator on the map.
  */
 function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
@@ -96,7 +178,7 @@ function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
   ctx.fill();
 
   // Bluetooth icon (simplified)
-  ctx.fillStyle = isDark ? "#fff" : "#fff";
+  ctx.fillStyle = "#fff";
   ctx.font = `bold ${radius}px sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -208,14 +290,13 @@ function drawDevice(
     const padding = 4;
 
     ctx.fillStyle = isDark ? "rgba(0,0,0,0.7)" : "rgba(255,255,255,0.85)";
-    const bgRadius = 4;
     roundRect(
       ctx,
       labelX - metrics.width / 2 - padding,
       labelY - 1,
       metrics.width + padding * 2,
       14,
-      bgRadius
+      4
     );
     ctx.fill();
 

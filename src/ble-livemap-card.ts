@@ -14,6 +14,7 @@ import {
   HomeAssistant,
   DeviceState,
   ProxyConfig,
+  ZoneConfig,
   ProxyDistance,
   DevicePosition,
   DEFAULT_CONFIG,
@@ -51,6 +52,9 @@ export class BLELivemapCard extends LitElement {
   @state() private _imageLoaded = false;
   @state() private _imageError = false;
   @state() private _showDevicePanel = false;
+  @state() private _runtimeShowProxies: boolean | null = null;
+  @state() private _runtimeShowZones: boolean | null = null;
+  @state() private _runtimeShowZoneLabels: boolean | null = null;
 
   @query("#livemap-canvas") private _canvas!: HTMLCanvasElement;
   @query("#floorplan-img") private _image!: HTMLImageElement;
@@ -414,11 +418,22 @@ export class BLELivemapCard extends LitElement {
 
     const isDark = this._isDarkMode();
 
+    // Build effective config with runtime overrides
+    const effectiveConfig = {
+      ...this._config,
+      show_proxies: this._runtimeShowProxies ?? this._config.show_proxies,
+      show_zones: this._runtimeShowZones ?? this._config.show_zones,
+      show_zone_labels: this._runtimeShowZoneLabels ?? this._config.show_zone_labels,
+    };
+
+    const zones = this._config.zones || [];
+
     renderCanvas(
       { ctx, width, height, dpr, isDark },
       this._devices,
       this._getAllProxies(),
-      this._config,
+      zones,
+      effectiveConfig,
       this._activeFloor
     );
   }
@@ -457,6 +472,21 @@ export class BLELivemapCard extends LitElement {
 
   private _toggleDevicePanel(): void {
     this._showDevicePanel = !this._showDevicePanel;
+  }
+
+  private _toggleProxies(): void {
+    const current = this._runtimeShowProxies ?? this._config.show_proxies ?? true;
+    this._runtimeShowProxies = !current;
+  }
+
+  private _toggleZones(): void {
+    const current = this._runtimeShowZones ?? this._config.show_zones ?? true;
+    this._runtimeShowZones = !current;
+  }
+
+  private _toggleZoneLabels(): void {
+    const current = this._runtimeShowZoneLabels ?? this._config.show_zone_labels ?? true;
+    this._runtimeShowZoneLabels = !current;
   }
 
   // ─── Rendering ─────────────────────────────────────────────
@@ -528,6 +558,14 @@ export class BLELivemapCard extends LitElement {
       .header-btn:hover {
         background: var(--divider-color, rgba(0,0,0,0.05));
         color: var(--text-primary);
+      }
+
+      .header-btn.off {
+        opacity: 0.35;
+      }
+
+      .header-btn.off:hover {
+        opacity: 0.6;
       }
 
       .header-btn svg {
@@ -708,6 +746,30 @@ export class BLELivemapCard extends LitElement {
                       `
                     )}
                   </select>
+                `
+              : nothing}
+            <!-- Toggle proxies -->
+            <button
+              class="header-btn ${(this._runtimeShowProxies ?? this._config.show_proxies ?? true) ? '' : 'off'}"
+              @click=${this._toggleProxies}
+              title="${t('card.toggle_proxies')}"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/>
+              </svg>
+            </button>
+            <!-- Toggle zones -->
+            ${(this._config.zones?.length || 0) > 0
+              ? html`
+                  <button
+                    class="header-btn ${(this._runtimeShowZones ?? this._config.show_zones ?? true) ? '' : 'off'}"
+                    @click=${this._toggleZones}
+                    title="${t('card.toggle_zones')}"
+                  >
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 7V3H2v18h20V7H12zM6 19H4v-2h2v2zm0-4H4v-2h2v2zm0-4H4V9h2v2zm0-4H4V5h2v2zm4 12H8v-2h2v2zm0-4H8v-2h2v2zm0-4H8V9h2v2zm0-4H8V5h2v2zm10 12h-8v-2h2v-2h-2v-2h2v-2h-2V9h8v10zm-2-8h-2v2h2v-2zm0 4h-2v2h2v-2z"/>
+                    </svg>
+                  </button>
                 `
               : nothing}
             <button class="header-btn" @click=${this._toggleDevicePanel} title="Devices">

@@ -12,9 +12,11 @@ import {
   ProxyConfig,
   TrackedDeviceConfig,
   FloorConfig,
+  ZoneConfig,
   DEFAULT_CONFIG,
   DEVICE_COLORS,
   DEVICE_ICONS,
+  ZONE_COLORS,
 } from "./types";
 import { CARD_EDITOR_NAME } from "./const";
 import { localize } from "./localize/localize";
@@ -25,6 +27,8 @@ export class BLELivemapCardEditor extends LitElement {
   @state() private _config!: BLELivemapConfig;
   @state() private _activeSection = "floorplan";
   @state() private _placingProxy: number | null = null;
+  @state() private _drawingZone: number | null = null;
+  @state() private _drawingPoints: { x: number; y: number }[] = [];
 
   private _lang = "en";
 
@@ -50,7 +54,7 @@ export class BLELivemapCardEditor extends LitElement {
     this._fireConfigChanged();
   }
 
-  // ─── Section Renderers ─────────────────────────────────────
+  // ─── Section: Floor Plan ───────────────────────────────────
 
   private _renderFloorplanSection() {
     const floors = this._config.floors || [];
@@ -101,7 +105,6 @@ export class BLELivemapCardEditor extends LitElement {
           </div>
         </div>
 
-        <!-- Multi-floor management -->
         <div class="subsection">
           <div class="subsection-header">
             <span>${this._t("editor.floors")}</span>
@@ -137,6 +140,8 @@ export class BLELivemapCardEditor extends LitElement {
     `;
   }
 
+  // ─── Section: Proxies ──────────────────────────────────────
+
   private _renderProxiesSection() {
     const proxies = this._config.proxies || [];
     const floorplanImage = this._getFloorplanImage();
@@ -147,7 +152,7 @@ export class BLELivemapCardEditor extends LitElement {
 
         ${floorplanImage
           ? html`
-              <div class="map-preview" @click=${this._handleMapClick}>
+              <div class="map-preview" @click=${this._handleProxyMapClick}>
                 <img src=${floorplanImage} alt="Floor plan" />
                 ${proxies.map(
                   (p, idx) => html`
@@ -207,6 +212,146 @@ export class BLELivemapCardEditor extends LitElement {
       </div>
     `;
   }
+
+  // ─── Section: Zones ────────────────────────────────────────
+
+  private _renderZonesSection() {
+    const zones = this._config.zones || [];
+    const floorplanImage = this._getFloorplanImage();
+
+    return html`
+      <div class="section">
+        <div class="section-title">${this._t("editor.zones")}</div>
+        <p class="help">${this._t("editor.zones_help")}</p>
+
+        ${floorplanImage
+          ? html`
+              <div class="map-preview zone-drawing" @click=${this._handleZoneMapClick}>
+                <img src=${floorplanImage} alt="Floor plan" />
+                <!-- Render existing zones as SVG overlay -->
+                <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="none">
+                  ${zones.map(
+                    (z, idx) => html`
+                      <polygon
+                        points="${z.points.map((p) => `${p.x},${p.y}`).join(" ")}"
+                        fill="${z.color || ZONE_COLORS[idx % ZONE_COLORS.length]}"
+                        fill-opacity="${z.opacity ?? 0.15}"
+                        stroke="${z.border_color || z.color || ZONE_COLORS[idx % ZONE_COLORS.length]}"
+                        stroke-width="0.3"
+                        stroke-dasharray="1,0.5"
+                      />
+                    `
+                  )}
+                  <!-- Drawing in progress -->
+                  ${this._drawingZone !== null && this._drawingPoints.length > 0
+                    ? html`
+                        <polyline
+                          points="${this._drawingPoints.map((p) => `${p.x},${p.y}`).join(" ")}"
+                          fill="none"
+                          stroke="#E57373"
+                          stroke-width="0.3"
+                          stroke-dasharray="0.5,0.3"
+                        />
+                        ${this._drawingPoints.map(
+                          (p) => html`
+                            <circle cx="${p.x}" cy="${p.y}" r="0.6" fill="#E57373" />
+                          `
+                        )}
+                      `
+                    : nothing}
+                </svg>
+                <!-- Zone labels -->
+                ${zones.map(
+                  (z, idx) => {
+                    const c = this._getZoneCentroid(z.points);
+                    return html`
+                      <div class="zone-label" style="left: ${c.x}%; top: ${c.y}%">
+                        ${z.name || `Zone ${idx + 1}`}
+                      </div>
+                    `;
+                  }
+                )}
+                ${this._drawingZone !== null
+                  ? html`<div class="placing-hint">${this._t("editor.zone_draw_hint")}</div>`
+                  : nothing}
+              </div>
+            `
+          : nothing}
+
+        ${zones.map(
+          (zone, idx) => html`
+            <div class="list-item">
+              <div class="zone-color-dot" style="background: ${zone.color || ZONE_COLORS[idx % ZONE_COLORS.length]}"></div>
+              <div class="list-item-content">
+                <input
+                  type="text"
+                  .value=${zone.name || ""}
+                  @input=${(e: Event) => this._updateZone(idx, "name", (e.target as HTMLInputElement).value)}
+                  placeholder="${this._t("editor.zone_name")}"
+                />
+                <div class="field-row">
+                  <input
+                    type="color"
+                    .value=${zone.color || ZONE_COLORS[idx % ZONE_COLORS.length]}
+                    @input=${(e: Event) => this._updateZone(idx, "color", (e.target as HTMLInputElement).value)}
+                    title="${this._t("editor.zone_color")}"
+                  />
+                  <input
+                    type="color"
+                    .value=${zone.border_color || zone.color || ZONE_COLORS[idx % ZONE_COLORS.length]}
+                    @input=${(e: Event) => this._updateZone(idx, "border_color", (e.target as HTMLInputElement).value)}
+                    title="${this._t("editor.zone_border_color")}"
+                  />
+                  <label class="checkbox">
+                    <input
+                      type="checkbox"
+                      .checked=${zone.show_label !== false}
+                      @change=${(e: Event) => this._updateZone(idx, "show_label", (e.target as HTMLInputElement).checked)}
+                    />
+                    ${this._t("editor.zone_show_label")}
+                  </label>
+                  <span class="label-sm">${zone.points.length} ${this._t("editor.zone_points")}</span>
+                </div>
+                <div class="field">
+                  <label>${this._t("editor.zone_opacity")}</label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="0.5"
+                    step="0.02"
+                    .value=${String(zone.opacity ?? 0.12)}
+                    @input=${(e: Event) => this._updateZone(idx, "opacity", parseFloat((e.target as HTMLInputElement).value))}
+                  />
+                </div>
+                <div class="field-row">
+                  <button
+                    class="place-btn ${this._drawingZone === idx ? "active" : ""}"
+                    @click=${() => this._startDrawingZone(idx)}
+                  >
+                    ${this._t("editor.zone_redraw")}
+                  </button>
+                </div>
+              </div>
+              <button class="remove-btn" @click=${() => this._removeZone(idx)}>
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                  <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                </svg>
+              </button>
+            </div>
+          `
+        )}
+
+        <div class="field-row" style="gap: 8px; margin-top: 4px;">
+          <button class="add-btn full" @click=${this._addZone}>+ ${this._t("editor.add_zone")}</button>
+          ${this._drawingZone !== null
+            ? html`<button class="place-btn active" @click=${this._finishDrawingZone}>${this._t("editor.zone_finish")}</button>`
+            : nothing}
+        </div>
+      </div>
+    `;
+  }
+
+  // ─── Section: Devices ──────────────────────────────────────
 
   private _renderDevicesSection() {
     const devices = this._config.tracked_devices || [];
@@ -280,6 +425,8 @@ export class BLELivemapCardEditor extends LitElement {
     `;
   }
 
+  // ─── Section: Appearance ───────────────────────────────────
+
   private _renderAppearanceSection() {
     return html`
       <div class="section">
@@ -330,6 +477,24 @@ export class BLELivemapCardEditor extends LitElement {
         <label class="checkbox">
           <input
             type="checkbox"
+            .checked=${this._config.show_zones !== false}
+            @change=${(e: Event) => this._updateConfig("show_zones", (e.target as HTMLInputElement).checked)}
+          />
+          ${this._t("editor.show_zones")}
+        </label>
+
+        <label class="checkbox">
+          <input
+            type="checkbox"
+            .checked=${this._config.show_zone_labels !== false}
+            @change=${(e: Event) => this._updateConfig("show_zone_labels", (e.target as HTMLInputElement).checked)}
+          />
+          ${this._t("editor.show_zone_labels")}
+        </label>
+
+        <label class="checkbox">
+          <input
+            type="checkbox"
             .checked=${this._config.show_signal_overlay || false}
             @change=${(e: Event) => this._updateConfig("show_signal_overlay", (e.target as HTMLInputElement).checked)}
           />
@@ -356,6 +521,8 @@ export class BLELivemapCardEditor extends LitElement {
       </div>
     `;
   }
+
+  // ─── Section: History ──────────────────────────────────────
 
   private _renderHistorySection() {
     return html`
@@ -488,7 +655,73 @@ export class BLELivemapCardEditor extends LitElement {
     this._updateConfig("tracked_devices", devices);
   }
 
-  private _handleMapClick(e: MouseEvent): void {
+  // ─── Zone manipulation ────────────────────────────────────
+
+  private _addZone(): void {
+    const zones = [...(this._config.zones || [])];
+    const idx = zones.length;
+    zones.push({
+      id: `zone_${Date.now()}`,
+      name: "",
+      points: [],
+      color: ZONE_COLORS[idx % ZONE_COLORS.length],
+      border_color: ZONE_COLORS[idx % ZONE_COLORS.length],
+      opacity: 0.12,
+      show_label: true,
+    });
+    this._updateConfig("zones", zones);
+    this._startDrawingZone(idx);
+  }
+
+  private _removeZone(idx: number): void {
+    const zones = [...(this._config.zones || [])];
+    zones.splice(idx, 1);
+    this._updateConfig("zones", zones);
+    if (this._drawingZone === idx) {
+      this._drawingZone = null;
+      this._drawingPoints = [];
+    }
+  }
+
+  private _updateZone(idx: number, field: string, value: any): void {
+    const zones = [...(this._config.zones || [])];
+    zones[idx] = { ...zones[idx], [field]: value };
+    this._updateConfig("zones", zones);
+  }
+
+  private _startDrawingZone(idx: number): void {
+    this._drawingZone = idx;
+    this._drawingPoints = [];
+    this._placingProxy = null; // cancel any proxy placement
+  }
+
+  private _finishDrawingZone(): void {
+    if (this._drawingZone === null || this._drawingPoints.length < 3) return;
+
+    const zones = [...(this._config.zones || [])];
+    zones[this._drawingZone] = {
+      ...zones[this._drawingZone],
+      points: [...this._drawingPoints],
+    };
+    this._updateConfig("zones", zones);
+    this._drawingZone = null;
+    this._drawingPoints = [];
+  }
+
+  private _getZoneCentroid(points: { x: number; y: number }[]): { x: number; y: number } {
+    if (points.length === 0) return { x: 50, y: 50 };
+    let cx = 0;
+    let cy = 0;
+    for (const p of points) {
+      cx += p.x;
+      cy += p.y;
+    }
+    return { x: cx / points.length, y: cy / points.length };
+  }
+
+  // ─── Map Click Handlers ───────────────────────────────────
+
+  private _handleProxyMapClick(e: MouseEvent): void {
     if (this._placingProxy === null) return;
 
     const img = (e.currentTarget as HTMLElement).querySelector("img");
@@ -501,6 +734,34 @@ export class BLELivemapCardEditor extends LitElement {
     this._updateProxy(this._placingProxy, "x", Math.round(x * 10) / 10);
     this._updateProxy(this._placingProxy, "y", Math.round(y * 10) / 10);
     this._placingProxy = null;
+  }
+
+  private _handleZoneMapClick(e: MouseEvent): void {
+    if (this._drawingZone === null) return;
+
+    const img = (e.currentTarget as HTMLElement).querySelector("img");
+    if (!img) return;
+
+    const rect = img.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 100;
+    const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+    const point = { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };
+    this._drawingPoints = [...this._drawingPoints, point];
+
+    // Auto-close polygon if clicking near the first point (within 3%)
+    if (this._drawingPoints.length >= 3) {
+      const first = this._drawingPoints[0];
+      const dist = Math.sqrt(Math.pow(point.x - first.x, 2) + Math.pow(point.y - first.y, 2));
+      if (dist < 3) {
+        // Remove the last point (too close to first) and finish
+        this._drawingPoints = this._drawingPoints.slice(0, -1);
+        this._finishDrawingZone();
+        return;
+      }
+    }
+
+    this.requestUpdate();
   }
 
   // ─── Styles ────────────────────────────────────────────────
@@ -584,20 +845,22 @@ export class BLELivemapCardEditor extends LitElement {
         border-color: var(--editor-accent);
       }
 
-      .field .help {
+      .field .help, p.help {
         display: block;
         font-size: 11px;
         color: var(--editor-text-secondary);
         margin-top: 4px;
+        margin-bottom: 8px;
       }
 
       .field-row {
         display: flex;
         gap: 8px;
         align-items: center;
+        flex-wrap: wrap;
       }
 
-      .field-row input {
+      .field-row input[type="number"] {
         flex: 1;
         min-width: 0;
       }
@@ -656,12 +919,22 @@ export class BLELivemapCardEditor extends LitElement {
         outline: none;
       }
 
-      .device-color-dot {
+      .list-item-content input[type="range"] {
+        padding: 0;
+        border: none;
+        accent-color: var(--editor-accent);
+      }
+
+      .device-color-dot, .zone-color-dot {
         width: 12px;
         height: 12px;
         border-radius: 50%;
         margin-top: 12px;
         flex-shrink: 0;
+      }
+
+      .zone-color-dot {
+        border-radius: 3px;
       }
 
       .label-sm {
@@ -753,6 +1026,28 @@ export class BLELivemapCardEditor extends LitElement {
         display: block;
       }
 
+      .zone-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+
+      .zone-label {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        font-size: 10px;
+        font-weight: 500;
+        color: var(--editor-text);
+        background: rgba(255,255,255,0.7);
+        padding: 1px 6px;
+        border-radius: 4px;
+        pointer-events: none;
+        white-space: nowrap;
+      }
+
       .proxy-marker {
         position: absolute;
         width: 16px;
@@ -785,6 +1080,7 @@ export class BLELivemapCardEditor extends LitElement {
         padding: 4px 12px;
         border-radius: 12px;
         font-size: 12px;
+        z-index: 10;
       }
 
       input[type="color"] {
@@ -809,6 +1105,7 @@ export class BLELivemapCardEditor extends LitElement {
     const sections = [
       { id: "floorplan", label: this._t("editor.floorplan") },
       { id: "proxies", label: this._t("editor.proxies") },
+      { id: "zones", label: this._t("editor.zones") },
       { id: "devices", label: this._t("editor.devices") },
       { id: "appearance", label: this._t("editor.appearance") },
       { id: "history", label: this._t("editor.history") },
@@ -830,6 +1127,7 @@ export class BLELivemapCardEditor extends LitElement {
 
       ${this._activeSection === "floorplan" ? this._renderFloorplanSection() : nothing}
       ${this._activeSection === "proxies" ? this._renderProxiesSection() : nothing}
+      ${this._activeSection === "zones" ? this._renderZonesSection() : nothing}
       ${this._activeSection === "devices" ? this._renderDevicesSection() : nothing}
       ${this._activeSection === "appearance" ? this._renderAppearanceSection() : nothing}
       ${this._activeSection === "history" ? this._renderHistorySection() : nothing}
