@@ -283,8 +283,7 @@ function drawDoor(rc: RenderContext, door: DoorConfig): void {
   const color = isPortal ? "#E040FB" : isDoor ? "#FF9800" : "#78909C";
   const rgb = hexToRgb(color);
 
-  if (isPortal) {
-    // Portal: diamond shape with glow
+  if (isPortal) {    // Portal: stairway icon with glow
     const pulsePhase = (Date.now() % 3000) / 3000;
     const pulseAlpha = 0.1 + Math.sin(pulsePhase * Math.PI * 2) * 0.08;
 
@@ -294,25 +293,35 @@ function drawDoor(rc: RenderContext, door: DoorConfig): void {
     ctx.fillStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${pulseAlpha})`;
     ctx.fill();
 
-    // Diamond shape
-    ctx.beginPath();
-    ctx.moveTo(x, y - size);
-    ctx.lineTo(x + size, y);
-    ctx.lineTo(x, y + size);
-    ctx.lineTo(x - size, y);
-    ctx.closePath();
+    // Rounded square background
+    const bgSize = size * 1.8;
+    roundRect(ctx, x - bgSize / 2, y - bgSize / 2, bgSize, bgSize, 4);
     ctx.fillStyle = color;
     ctx.fill();
     ctx.strokeStyle = "#fff";
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Portal icon
-    ctx.fillStyle = "#fff";
-    ctx.font = `bold ${size}px sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText("\u2195", x, y); // ↕ up-down arrow
+    // Draw stairway steps icon
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
+    ctx.lineCap = "round";
+    const stepW = size * 0.35;
+    const stepH = size * 0.3;
+    const startX = x - size * 0.45;
+    const startY = y + size * 0.45;
+    ctx.beginPath();
+    // Step 1 (bottom)
+    ctx.moveTo(startX, startY);
+    ctx.lineTo(startX + stepW, startY);
+    ctx.lineTo(startX + stepW, startY - stepH);
+    // Step 2 (middle)
+    ctx.lineTo(startX + stepW * 2, startY - stepH);
+    ctx.lineTo(startX + stepW * 2, startY - stepH * 2);
+    // Step 3 (top)
+    ctx.lineTo(startX + stepW * 3, startY - stepH * 2);
+    ctx.stroke();
+    ctx.lineCap = "butt";
   } else if (isDoor) {
     // Door: rounded rectangle
     const w = size * 2;

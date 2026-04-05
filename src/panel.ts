@@ -2763,7 +2763,7 @@ export class BLELivemapPanel extends LitElement {
     return html`
       <div class="zone-edit-panel">
         <h4 style="display:flex;align-items:center;gap:8px;">
-          <span style="font-size:18px;">${door.type === "door" ? "\uD83D\uDEAA" : door.type === "portal" ? "\uD83D\uDD73\uFE0F" : "\u25AF"}</span>
+          <span style="font-size:18px;">${door.type === "door" ? "\uD83D\uDEAA" : door.type === "portal" ? "\uD83E\uDE9C" : "\u25AF"}</span>
           ${this._t("panel.door_edit")}: ${door.name || `Door ${idx + 1}`}
         </h4>
         <div class="zone-edit-row">
@@ -2841,7 +2841,7 @@ export class BLELivemapPanel extends LitElement {
       if (floor && door.floor_id && door.floor_id !== floor.id) return nothing;
 
       const isEditing = this._editingDoorIdx === idx;
-      const icon = door.type === "door" ? "\uD83D\uDEAA" : door.type === "portal" ? "\uD83D\uDD73\uFE0F" : "\u25AF";
+      const icon = door.type === "door" ? "\uD83D\uDEAA" : door.type === "portal" ? "\uD83E\uDE9C" : "\u25AF";
       const color = door.type === "portal" ? "#E040FB" : door.type === "door" ? "#FF9800" : "#78909C";
 
       return html`
