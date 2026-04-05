@@ -44,11 +44,67 @@ console.info(
   "color: #4FC3F7; background: #263238; font-weight: bold; padding: 2px 6px; border-radius: 0 4px 4px 0;"
 );
 
-// Cache-busting: detect version changes
+// ─── Cache-busting: clear Service Worker cache on version change ─────────
 const CACHE_VERSION_KEY = "ble-livemap-version";
+const CACHE_BUST_KEY = "ble-livemap-cache-busted";
 const storedVersion = localStorage.getItem(CACHE_VERSION_KEY);
+
+/**
+ * Robust cache invalidation for Home Assistant.
+ * HA uses a Service Worker with Cache Storage ("file-cache") that
+ * aggressively caches JS files. Ctrl+Shift+R does NOT clear this.
+ * We must programmatically delete our cached entries.
+ */
+async function bustCache(): Promise<void> {
+  const bustKey = `${CACHE_VERSION_KEY}-${CARD_VERSION}`;
+  if (localStorage.getItem(CACHE_BUST_KEY) === bustKey) return; // Already busted for this version
+
+  try {
+    // 1. Clear from Service Worker Cache Storage
+    if ("caches" in window) {
+      const cacheNames = await caches.keys();
+      for (const name of cacheNames) {
+        const cache = await caches.open(name);
+        const requests = await cache.keys();
+        for (const request of requests) {
+          if (request.url.includes("ble-livemap")) {
+            await cache.delete(request);
+            console.info(`[BLE LiveMap] Cleared cache entry: ${request.url} from ${name}`);
+          }
+        }
+      }
+    }
+
+    // 2. Unregister and re-register service workers to force refresh
+    if ("serviceWorker" in navigator) {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      for (const reg of registrations) {
+        // Tell the SW to update - this will pick up new cached files
+        await reg.update();
+      }
+    }
+
+    localStorage.setItem(CACHE_BUST_KEY, bustKey);
+    console.info(`[BLE LiveMap] Cache busted for v${CARD_VERSION}`);
+  } catch (err) {
+    console.warn("[BLE LiveMap] Cache busting failed:", err);
+  }
+}
+
 if (storedVersion && storedVersion !== CARD_VERSION) {
-  console.info(`[BLE LiveMap] Version changed: ${storedVersion} -> ${CARD_VERSION}`);
+  console.info(`[BLE LiveMap] Version changed: ${storedVersion} -> ${CARD_VERSION}, clearing caches...`);
+  bustCache().then(() => {
+    // After cache bust, reload the page once to pick up new code
+    const reloadKey = `ble-livemap-reloaded-${CARD_VERSION}`;
+    if (!sessionStorage.getItem(reloadKey)) {
+      sessionStorage.setItem(reloadKey, "1");
+      console.info("[BLE LiveMap] Reloading page to apply update...");
+      window.location.reload();
+    }
+  });
+} else if (!storedVersion) {
+  // First install - just bust cache silently
+  bustCache();
 }
 localStorage.setItem(CACHE_VERSION_KEY, CARD_VERSION);
 
