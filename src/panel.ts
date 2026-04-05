@@ -26,10 +26,13 @@ import {
   GATEWAY_TYPES,
   GatewayType,
   ProxyCalibration,
+  ProxyDistance,
+  TrilaterationResult,
   DOOR_TYPES,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
 import { localize } from "./localize/localize";
+import { trilaterate, smoothPosition } from "./trilateration";
 
 import "./editor";
 
@@ -99,11 +102,17 @@ export class BLELivemapPanel extends LitElement {
   private _registryCacheStamp = 0;
   private _registryLoadPromise: Promise<void> | null = null;
 
+  // Live device tracking in editor
+  @state() private _liveDevicePositions: Map<string, { x: number; y: number; color: string; name: string; accuracy: number; confidence: number }> = new Map();
+  private _liveTrackingTimer: number | null = null;
+  private _previousPositions: Map<string, TrilaterationResult> = new Map();
+
   // ─── Lifecycle ──────────────────────────────────────────────
 
   connectedCallback(): void {
     super.connectedCallback();
     this._loadConfig();
+    this._startLiveTracking();
   }
 
   disconnectedCallback(): void {
@@ -112,6 +121,7 @@ export class BLELivemapPanel extends LitElement {
       clearInterval(this._calibWizardTimer);
       this._calibWizardTimer = null;
     }
+    this._stopLiveTracking();
   }
 
   protected updated(changedProperties: PropertyValues): void {
@@ -270,7 +280,7 @@ export class BLELivemapPanel extends LitElement {
       if (totalUpdated > 0) {
         this._saveMessage = this._t("panel.saved");
       } else {
-        this._saveMessage = this._t("panel.no_cards_found");
+        this._saveMessage = this._t("panel.saved_local");
       }
     } catch (e) {
       this._saveMessage = this._t("panel.save_error");
@@ -308,6 +318,7 @@ export class BLELivemapPanel extends LitElement {
         "panel.saved": "Saved & cards updated!",
         "panel.save_error": "Error saving to Lovelace",
         "panel.no_cards_found": "No BLE LiveMap cards found on dashboards",
+        "panel.saved_local": "Settings saved locally! Add a BLE LiveMap card to a dashboard to sync.",
         "panel.yaml_copied": "YAML copied to clipboard!",
         "panel.copy_yaml": "Copy YAML",
         "panel.tab_map": "Floor Plan",
@@ -437,6 +448,7 @@ export class BLELivemapPanel extends LitElement {
         "panel.saved": "Sparat & kort uppdaterade!",
         "panel.save_error": "Fel vid sparning till Lovelace",
         "panel.no_cards_found": "Inga BLE LiveMap-kort hittades på dashboards",
+        "panel.saved_local": "Inställningar sparade lokalt! Lägg till ett BLE LiveMap-kort på en dashboard för att synka.",
         "panel.yaml_copied": "YAML kopierad till urklipp!",
         "panel.copy_yaml": "Kopiera YAML",
         "panel.tab_map": "Planritning",
@@ -1129,6 +1141,145 @@ export class BLELivemapPanel extends LitElement {
     if (this._draggingDoor !== null) {
       this._draggingDoor = null;
     }
+  }
+
+  // ─── Live Device Tracking ─────────────────────────────────
+
+  private _startLiveTracking(): void {
+    if (this._liveTrackingTimer) return;
+    this._liveTrackingTimer = window.setInterval(() => this._updateLiveDevices(), 2000);
+  }
+
+  private _stopLiveTracking(): void {
+    if (this._liveTrackingTimer) {
+      clearInterval(this._liveTrackingTimer);
+      this._liveTrackingTimer = null;
+    }
+  }
+
+  /**
+   * Get device distances from Bermuda sensors — mirrors the card's _getDeviceDistances logic.
+   */
+  private _getDeviceDistancesForPanel(deviceConfig: TrackedDeviceConfig, proxies: ProxyConfig[]): ProxyDistance[] {
+    if (!this.hass?.states) return [];
+
+    const prefix = deviceConfig.entity_prefix;
+    const distances: ProxyDistance[] = [];
+
+    if (!prefix) return distances;
+
+    // Strategy 1: Individual distance sensors per proxy
+    for (const proxy of proxies) {
+      const proxyName = proxy.entity_id
+        .replace(/^ble_proxy_/, "")
+        .replace(/^bermuda_proxy_/, "")
+        .replace(/^.*\./, "")
+        .replace(/_proxy$/, "");
+
+      const possibleEntities = [
+        `${prefix}_${proxyName}_distance`,
+        `${prefix}_distance_${proxyName}`,
+        `sensor.bermuda_${prefix.replace(/^.*\.bermuda_/, "").replace(/^sensor\.bermuda_/, "")}_distance_to_${proxyName}`,
+      ];
+
+      for (const entityId of possibleEntities) {
+        const state = this.hass.states[entityId];
+        if (state && !isNaN(parseFloat(state.state))) {
+          const dist = parseFloat(state.state);
+          const attrs = state.attributes || {};
+          distances.push({
+            proxy_entity_id: proxy.entity_id,
+            distance: dist,
+            rssi: attrs.rssi || -80,
+            timestamp: new Date(state.last_updated).getTime(),
+          });
+          break;
+        }
+      }
+    }
+
+    // Strategy 2: Device tracker attributes
+    if (distances.length === 0) {
+      const dtEntity = prefix.replace("sensor.bermuda_", "device_tracker.bermuda_");
+      const dtState = this.hass.states[dtEntity];
+      if (dtState?.attributes?.scanners) {
+        for (const [scannerId, scannerData] of Object.entries(dtState.attributes.scanners as Record<string, any>)) {
+          const scannerSlug = scannerId.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+          const matchingProxy = proxies.find((p) => {
+            const pSlug = p.entity_id.replace(/^ble_proxy_/, "").replace(/^bermuda_proxy_/, "");
+            return p.entity_id === scannerId || pSlug === scannerSlug || p.name === (scannerData as any)?.name;
+          });
+          if (matchingProxy && (scannerData as any)?.distance) {
+            distances.push({
+              proxy_entity_id: matchingProxy.entity_id,
+              distance: (scannerData as any).distance,
+              rssi: (scannerData as any).rssi || -80,
+              timestamp: Date.now(),
+            });
+          }
+        }
+      }
+    }
+
+    return distances;
+  }
+
+  /**
+   * Update live device positions using trilateration.
+   * Runs every 2 seconds to show real-time device positions in the editor.
+   */
+  private _updateLiveDevices(): void {
+    if (!this.hass?.states) return;
+    const devices = this._config.tracked_devices || [];
+    const proxies = (this._config.proxies || []).filter((p) => p.x > 0 || p.y > 0);
+    if (devices.length === 0 || proxies.length === 0) return;
+
+    const floor = this._getActiveFloor();
+    if (!floor) return;
+
+    const imageWidth = floor.image_width || 20;
+    const imageHeight = floor.image_height || 15;
+    const newPositions = new Map<string, { x: number; y: number; color: string; name: string; accuracy: number; confidence: number }>();
+
+    for (const deviceConfig of devices) {
+      const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
+      if (!deviceId) continue;
+
+      // Only use proxies on the active floor
+      const floorProxies = proxies.filter((p) => !p.floor_id || p.floor_id === floor.id);
+      const distances = this._getDeviceDistancesForPanel(deviceConfig, floorProxies);
+
+      if (distances.length >= 1) {
+        const proxyMap = new Map<string, { x: number; y: number }>();
+        for (const d of distances) {
+          const proxy = floorProxies.find((p) => p.entity_id === d.proxy_entity_id);
+          if (proxy) {
+            proxyMap.set(d.proxy_entity_id, { x: proxy.x, y: proxy.y });
+          }
+        }
+
+        if (proxyMap.size >= 1) {
+          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight);
+          if (result) {
+            const prevResult = this._previousPositions.get(deviceId) || null;
+            const smoothed = smoothPosition(result, prevResult, 0.3);
+            if (smoothed) {
+              this._previousPositions.set(deviceId, smoothed);
+              newPositions.set(deviceId, {
+                x: smoothed.x,
+                y: smoothed.y,
+                color: deviceConfig.color || DEVICE_COLORS[0],
+                name: deviceConfig.name || deviceId,
+                accuracy: smoothed.accuracy,
+                confidence: smoothed.confidence,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    this._liveDevicePositions = newPositions;
   }
 
   // ─── Zone Helpers ─────────────────────────────────────────
@@ -1964,6 +2115,62 @@ export class BLELivemapPanel extends LitElement {
         font-weight: 500;
       }
 
+      /* Live device markers */
+      .live-device-marker {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        width: 36px;
+        height: 36px;
+        pointer-events: none;
+        z-index: 15;
+      }
+
+      .live-device-dot {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: var(--device-color, #1E88E5);
+        border: 2px solid white;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+      }
+
+      .live-device-pulse {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        background: var(--device-color, #1E88E5);
+        opacity: 0.3;
+        animation: device-pulse 2s ease-out infinite;
+      }
+
+      @keyframes device-pulse {
+        0% { transform: translate(-50%, -50%) scale(0.5); opacity: 0.4; }
+        100% { transform: translate(-50%, -50%) scale(1.5); opacity: 0; }
+      }
+
+      .live-device-label {
+        position: absolute;
+        transform: translate(-50%, 0);
+        font-size: 11px;
+        font-weight: 700;
+        color: #1a1a1a;
+        background: rgba(255, 255, 255, 0.85);
+        padding: 1px 6px;
+        border-radius: 3px;
+        white-space: nowrap;
+        pointer-events: none;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        z-index: 15;
+      }
+
       /* Door markers */
       .door-marker {
         position: absolute;
@@ -2611,6 +2818,7 @@ export class BLELivemapPanel extends LitElement {
                   ${this._renderZoneOverlays()}
                   ${this._renderDoorMarkers()}
                   ${this._renderProxyMarkers()}
+                  ${this._renderLiveDeviceMarkers()}
                   ${this._renderDrawingPoints()}
                   ${this._renderRectPreview()}
                   ${this._renderCalibrationOverlay()}
@@ -3024,6 +3232,28 @@ export class BLELivemapPanel extends LitElement {
         </div>
       `;
     });
+  }
+
+  private _renderLiveDeviceMarkers() {
+    if (this._liveDevicePositions.size === 0) return nothing;
+
+    const markers: any[] = [];
+    this._liveDevicePositions.forEach((pos, deviceId) => {
+      markers.push(html`
+        <div
+          class="live-device-marker"
+          style="left: ${pos.x}%; top: ${pos.y}%; --device-color: ${pos.color};"
+          title="${pos.name}\nConfidence: ${(pos.confidence * 100).toFixed(0)}%\nAccuracy: ${pos.accuracy.toFixed(1)}m"
+        >
+          <div class="live-device-pulse"></div>
+          <div class="live-device-dot"></div>
+        </div>
+        <div class="live-device-label" style="left: ${pos.x}%; top: ${pos.y + 2.5}%;">
+          ${pos.name}
+        </div>
+      `);
+    });
+    return markers;
   }
 
   private _renderZoneOverlays() {
