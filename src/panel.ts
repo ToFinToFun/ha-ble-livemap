@@ -104,6 +104,8 @@ export class BLELivemapPanel extends LitElement {
 
   // Live device tracking in editor
   @state() private _liveDevicePositions: Map<string, { x: number; y: number; color: string; name: string; accuracy: number; confidence: number }> = new Map();
+  @state() private _liveDebugInfo: Array<{ proxyName: string; proxyId: string; distance: number | null; sensorId: string; placed: boolean }> = [];
+  @state() private _showDebugPanel: boolean = false;
   private _liveTrackingTimer: number | null = null;
   private _previousPositions: Map<string, TrilaterationResult> = new Map();
 
@@ -1243,8 +1245,9 @@ export class BLELivemapPanel extends LitElement {
   private _updateLiveDevices(): void {
     if (!this.hass?.states) return;
     const devices = this._config.tracked_devices || [];
-    const proxies = (this._config.proxies || []).filter((p) => p.x > 0 || p.y > 0);
-    if (devices.length === 0 || proxies.length === 0) return;
+    const allProxies = this._config.proxies || [];
+    const placedProxies = allProxies.filter((p) => p.x > 0 || p.y > 0);
+    if (devices.length === 0 || placedProxies.length === 0) return;
 
     const floor = this._getActiveFloor();
     if (!floor) return;
@@ -1252,13 +1255,42 @@ export class BLELivemapPanel extends LitElement {
     const imageWidth = floor.image_width || 20;
     const imageHeight = floor.image_height || 15;
     const newPositions = new Map<string, { x: number; y: number; color: string; name: string; accuracy: number; confidence: number }>();
+    const debugInfo: Array<{ proxyName: string; proxyId: string; distance: number | null; sensorId: string; placed: boolean }> = [];
 
     for (const deviceConfig of devices) {
       const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
       if (!deviceId) continue;
 
+      // Extract raw slug for sensor matching
+      const rawSlug = deviceId
+        .replace(/^device_tracker\.bermuda_/, "")
+        .replace(/^sensor\.bermuda_/, "")
+        .replace(/^bermuda_/, "")
+        .replace(/_bermuda_tracker$/, "")
+        .replace(/_distance$/, "");
+
+      // Collect debug info for ALL proxies (placed and unplaced)
+      for (const proxy of allProxies) {
+        const proxyName = proxy.entity_id
+          .replace(/^ble_proxy_/, "")
+          .replace(/^bermuda_proxy_/, "")
+          .replace(/^.*\./, "")
+          .replace(/_proxy$/, "");
+        const sensorId = `sensor.bermuda_${rawSlug}_distance_to_${proxyName}`;
+        const state = this.hass!.states[sensorId];
+        const dist = state && !isNaN(parseFloat(state.state)) ? parseFloat(state.state) : null;
+        const isPlaced = (proxy.x > 0 || proxy.y > 0) && (!proxy.floor_id || proxy.floor_id === floor.id);
+        debugInfo.push({
+          proxyName: proxy.name || proxyName,
+          proxyId: proxyName,
+          distance: dist,
+          sensorId,
+          placed: isPlaced,
+        });
+      }
+
       // Only use proxies on the active floor
-      const floorProxies = proxies.filter((p) => !p.floor_id || p.floor_id === floor.id);
+      const floorProxies = placedProxies.filter((p) => !p.floor_id || p.floor_id === floor.id);
       const distances = this._getDeviceDistancesForPanel(deviceConfig, floorProxies);
 
       if (distances.length >= 1) {
@@ -1292,6 +1324,7 @@ export class BLELivemapPanel extends LitElement {
     }
 
     this._liveDevicePositions = newPositions;
+    this._liveDebugInfo = debugInfo;
   }
 
   // ─── Zone Helpers ─────────────────────────────────────────
@@ -2182,6 +2215,55 @@ export class BLELivemapPanel extends LitElement {
         z-index: 15;
       }
 
+      /* Debug panel */
+      .debug-panel {
+        background: var(--card-bg, #1e1e1e);
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 8px;
+        padding: 12px;
+        margin-top: 4px;
+        max-height: 250px;
+        overflow-y: auto;
+        font-size: 12px;
+      }
+
+      .debug-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 11px;
+      }
+
+      .debug-table th {
+        text-align: left;
+        padding: 4px 8px;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.15));
+        color: var(--text-secondary);
+        font-weight: 600;
+      }
+
+      .debug-table td {
+        padding: 3px 8px;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.05));
+      }
+
+      .debug-active {
+        color: #4CAF50;
+        font-weight: 500;
+      }
+
+      .debug-inactive {
+        color: var(--text-secondary);
+        opacity: 0.6;
+      }
+
+      .debug-summary {
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+
       /* Door markers */
       .door-marker {
         position: absolute;
@@ -2837,6 +2919,40 @@ export class BLELivemapPanel extends LitElement {
               ` : nothing}
             </div>
           </div>
+          <!-- Debug toggle -->
+          ${this._liveDebugInfo.length > 0 ? html`
+            <button class="btn btn-small" style="margin-top:8px; font-size:11px;" @click=${() => { this._showDebugPanel = !this._showDebugPanel; }}>
+              ${this._showDebugPanel ? '▲ Hide' : '▼ Show'} Sensor Debug
+            </button>
+          ` : nothing}
+          ${this._showDebugPanel && this._liveDebugInfo.length > 0 ? html`
+            <div class="debug-panel">
+              <table class="debug-table">
+                <thead>
+                  <tr>
+                    <th>Proxy</th>
+                    <th>Distance</th>
+                    <th>Placed</th>
+                    <th>Used</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${this._liveDebugInfo.map((d) => html`
+                    <tr class="${d.distance !== null ? 'debug-active' : 'debug-inactive'}">
+                      <td title="${d.sensorId}">${d.proxyName}</td>
+                      <td>${d.distance !== null ? d.distance.toFixed(2) + 'm' : 'unknown'}</td>
+                      <td>${d.placed ? '✓' : '✗'}</td>
+                      <td>${d.distance !== null && d.placed ? '✅ YES' : d.distance !== null && !d.placed ? '⚠ NOT PLACED' : '❌'}</td>
+                    </tr>
+                  `)}
+                </tbody>
+              </table>
+              <div class="debug-summary">
+                Active: ${this._liveDebugInfo.filter(d => d.distance !== null).length} / ${this._liveDebugInfo.length} |
+                Used for trilateration: ${this._liveDebugInfo.filter(d => d.distance !== null && d.placed).length}
+              </div>
+            </div>
+          ` : nothing}
         ` : html`
           <div class="empty-map">
             <svg viewBox="0 0 24 24" fill="currentColor">
