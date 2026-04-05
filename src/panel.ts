@@ -525,18 +525,29 @@ export class BLELivemapPanel extends LitElement {
         const connections = device.connections || [];
         const configEntries = device.config_entries || [];
 
-        // Check if this device belongs to a Bluetooth-related integration
-        // Device registry entries have identifiers like [["bluetooth", "AA:BB:CC:DD:EE:FF"]]
-        const isBluetoothDevice = identifiers.some((id: any[]) =>
-          id[0] === "bluetooth" || id[0] === "esphome" || id[0] === "shelly"
+        // Only include devices that are actual BLE proxies.
+        // Real BLE proxies (Shelly, ESPHome) have ["bluetooth", "MAC"] in identifiers.
+        // We must NOT include devices that only have "mac" in connections (routers, switches, etc.)
+        const hasBluetoothIdentifier = identifiers.some((id: any[]) =>
+          id[0] === "bluetooth"
         );
 
-        // Also check connections for bluetooth MAC
-        const hasBtConnection = connections.some((c: any[]) =>
-          c[0] === "bluetooth" || c[0] === "mac"
+        // Also accept ESPHome/Shelly devices that may use their own identifier namespace
+        const isEspOrShelly = identifiers.some((id: any[]) =>
+          id[0] === "esphome" || id[0] === "shelly"
         );
 
-        if (!isBluetoothDevice && !hasBtConnection) continue;
+        // Check manufacturer to filter out non-proxy devices
+        const manufacturer = (device.manufacturer || "").toLowerCase();
+        const isProxyManufacturer = manufacturer.includes("espressif") ||
+          manufacturer.includes("shelly") ||
+          manufacturer.includes("esphome");
+
+        // A device is a BLE proxy if:
+        // 1. It has a "bluetooth" identifier (registered via Bluetooth integration), OR
+        // 2. It has esphome/shelly identifier AND is from a known proxy manufacturer
+        // This excludes routers, switches, computers that only have MAC connections
+        if (!hasBluetoothIdentifier && !(isEspOrShelly && isProxyManufacturer)) continue;
 
         // Get MAC address from identifiers or connections
         let mac = "";
