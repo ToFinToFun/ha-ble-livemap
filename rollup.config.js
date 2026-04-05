@@ -7,7 +7,7 @@ import json from "@rollup/plugin-json";
 export default {
   input: "src/ble-livemap-card.ts",
   output: {
-    file: "dist/ble-livemap.js",
+    file: "dist/ble-livemap-card.js",
     format: "es",
     sourcemap: false,
   },

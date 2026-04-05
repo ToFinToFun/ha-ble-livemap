@@ -2,7 +2,7 @@
 
 [![HACS Badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/jerrypaasovaara/ha-ble-livemap/releases)
+[![Version](https://img.shields.io/badge/version-1.8.1-blue.svg)](https://github.com/ToFinToFun/ha-ble-livemap/releases)
 
 **Real-time BLE device position tracking on your floor plan for Home Assistant.**
 
@@ -17,10 +17,14 @@ Track phones, watches, tags, and any Bluetooth device on an interactive floor pl
 - **Smooth animations** — positions glide between updates at 60fps
 - **History trails** — see where devices have moved with fading trail lines
 - **Multi-floor support** — switch between floors with a dropdown
+- **Gateway transitions** — define stairways, doors, and portals between floors/buildings
+- **Zone connectivity** — doors between zones prevent wall-teleportation
+- **RSSI calibration wizard** — walk-around calibration for better accuracy
 - **Signal coverage overlay** — visualize BLE proxy coverage areas
 - **Multi-device tracking** — track multiple people with unique colors
 - **Visual card editor** — configure everything through the HA UI, no YAML needed
 - **Drag-and-drop proxy placement** — click on the map to place your BLE proxies
+- **Auto-discovery** — finds all BLE proxies from the Bluetooth integration automatically
 - **Dark/Light mode** — follows your HA theme automatically
 - **Fullscreen mode** — expand the map for detailed viewing
 - **Device panel** — expandable list showing all tracked devices with accuracy info
@@ -28,7 +32,6 @@ Track phones, watches, tags, and any Bluetooth device on an interactive floor pl
 - **Auto-purge** — old history data is automatically cleaned up
 - **Internationalization** — English and Swedish included, easy to add more
 - **HACS compatible** — one-click installation
-- **Lightweight** — 66KB minified, no external dependencies at runtime
 
 ---
 
@@ -47,26 +50,26 @@ Track phones, watches, tags, and any Bluetooth device on an interactive floor pl
 
 1. Open **HACS** in your Home Assistant instance
 2. Click the three dots menu (top right) → **Custom repositories**
-3. Add `jerrypaasovaara/ha-ble-livemap` as a **Lovelace** repository
+3. Add `ToFinToFun/ha-ble-livemap` as a **Dashboard** repository
 4. Search for **BLE LiveMap** and click **Download**
-5. Refresh your browser (Ctrl+F5)
+5. Restart Home Assistant
 
 ### Manual
 
-1. Download `ble-livemap-card.js` from the [latest release](https://github.com/jerrypaasovaara/ha-ble-livemap/releases)
+1. Download `ble-livemap-card.js` from the [latest release](https://github.com/ToFinToFun/ha-ble-livemap/releases)
 2. Copy it to `<config>/www/ble-livemap-card.js`
 3. Add a resource in **Settings → Dashboards → Resources**:
    ```yaml
    url: /local/ble-livemap-card.js
    type: module
    ```
-4. Refresh your browser
+4. Restart Home Assistant
 
 ---
 
-## Sidebar Panel (New in v1.4.0)
+## Sidebar Panel
 
-You can configure BLE LiveMap from a dedicated full-page panel in your Home Assistant sidebar. This gives you a large interactive map, entity search, drag-and-drop placement, and auto-placement features.
+You can configure BLE LiveMap from a dedicated full-page panel in your Home Assistant sidebar.
 
 ### How to enable the panel:
 
@@ -79,17 +82,14 @@ panel_custom:
     sidebar_title: BLE LiveMap
     sidebar_icon: mdi:map-marker-radius
     url_path: ble-livemap
-    # If installed via HACS, use this path:
-    module_url: /local/community/ha-ble-livemap/ble-livemap-card.js
-    # If installed manually, use this path instead:
-    # module_url: /local/ble-livemap-card.js
-    
-    # Optional: If you access HA via a proxy (like Cloudflare) and the panel fails to load, uncomment this:
-    # trust_external_script: true
+    module_url: /hacsfiles/ha-ble-livemap/ble-livemap-card.js
+    trust_external_script: true
 ```
 
 3. Restart Home Assistant
 4. You will now see **BLE LiveMap** in your sidebar!
+
+**Important:** Do NOT add `?v=X.X.X` or any query parameters to `module_url`. This prevents automatic updates from working.
 
 ---
 
@@ -97,11 +97,7 @@ panel_custom:
 
 ### 1. Prepare your floor plan
 
-Upload a floor plan image (PNG, JPG, or SVG) to your Home Assistant `www` folder. You can use:
-- Architectural drawings
-- Hand-drawn sketches
-- Screenshots from Google Maps
-- Any image that represents your home layout
+Upload a floor plan image (PNG, JPG, or SVG) to your Home Assistant `www` folder.
 
 ### 2. Add the card
 
@@ -116,7 +112,7 @@ Upload a floor plan image (PNG, JPG, or SVG) to your Home Assistant `www` folder
 
 In the card editor, go to the **Proxies** tab:
 1. Click **Add proxy**
-2. Enter the Bermuda scanner entity ID
+2. Select the BLE proxy from the dropdown (auto-discovered from Bluetooth integration)
 3. Click **Place on map** and click where the proxy is physically located
 4. Repeat for all your BLE proxies
 
@@ -130,7 +126,7 @@ In the **Devices** tab:
 
 ### 5. Set dimensions
 
-In the **Floor Plan** tab, enter the real-world dimensions of your floor plan in meters. This is critical for accurate trilateration.
+In the **Floor Plan** tab, enter the real-world dimensions of your floor plan in meters.
 
 ---
 
@@ -160,10 +156,6 @@ proxies:
     name: Living Room
     x: 65.0
     y: 35.0
-  - entity_id: sensor.bedroom_esp32_ble
-    name: Bedroom
-    x: 70.0
-    y: 80.0
 tracked_devices:
   - entity_prefix: sensor.bermuda_jerry_phone
     name: Jerry
@@ -171,41 +163,6 @@ tracked_devices:
     icon: phone
     show_trail: true
     show_label: true
-  - entity_prefix: sensor.bermuda_elina_phone
-    name: Elina
-    color: "#81C784"
-    icon: phone
-    show_trail: true
-    show_label: true
-```
-
-### Multi-Floor Example
-
-```yaml
-type: custom:ble-livemap-card
-card_title: Home Tracker
-floors:
-  - id: ground
-    name: Ground Floor
-    image: /local/floor_ground.png
-    image_width: 18
-    image_height: 12
-  - id: upper
-    name: Upper Floor
-    image: /local/floor_upper.png
-    image_width: 18
-    image_height: 10
-proxies:
-  - entity_id: sensor.kitchen_ble
-    name: Kitchen
-    x: 30
-    y: 50
-    floor_id: ground
-  - entity_id: sensor.bedroom_ble
-    name: Bedroom
-    x: 60
-    y: 40
-    floor_id: upper
 ```
 
 ### Options Reference
@@ -219,6 +176,7 @@ proxies:
 | `card_title` | string | "BLE LiveMap" | Card header title |
 | `update_interval` | number | 2 | Seconds between position updates |
 | `show_proxies` | boolean | true | Show proxy indicators on map |
+| `show_doors` | boolean | true | Show door/portal markers on map |
 | `show_signal_overlay` | boolean | false | Show BLE coverage heatmap |
 | `show_accuracy_indicator` | boolean | true | Show dashed accuracy ring |
 | `history_enabled` | boolean | true | Enable position history |
@@ -226,6 +184,9 @@ proxies:
 | `history_trail_length` | number | 50 | Max trail points per device |
 | `theme_mode` | string | "auto" | "auto", "dark", or "light" |
 | `fullscreen_enabled` | boolean | true | Show fullscreen button |
+| `gateway_timeout` | number | 30 | Seconds a gateway passage is valid |
+| `floor_override_timeout` | number | 60 | Seconds before soft floor override |
+| `zone_override_timeout` | number | 45 | Seconds before soft zone override |
 
 ---
 
@@ -241,71 +202,32 @@ The card uses **weighted least-squares trilateration** to calculate device posit
 4. Closer proxies are weighted more heavily (inverse-square weighting)
 5. The result is smoothed over time to prevent jitter
 
-### Accuracy
+### Zone Connectivity
 
-The gradient circle around each device represents positioning accuracy:
-- **Small, tight circle** = high confidence (3+ proxies nearby)
-- **Large, faded circle** = lower confidence (fewer proxies or inconsistent readings)
+Doors and portals define valid paths between zones. A device can only move between zones through a defined door, preventing "wall teleportation" from BLE signal bleed.
 
-Typical accuracy with BLE:
-- **3+ proxies in range**: 2-4 meter accuracy
-- **2 proxies**: 4-6 meter accuracy
-- **1 proxy**: Room-level only (shows near the proxy)
+### Gateway Transitions
 
-### Tips for Better Accuracy
-
-1. **More proxies = better accuracy** — aim for 3+ proxies per room
-2. **Place proxies at room edges** — not in the center
-3. **Avoid metal obstructions** — metal reflects BLE signals
-4. **Calibrate Bermuda** — set correct ref_power and attenuation
-5. **Use consistent proxy heights** — mount all at similar heights
+Gateway proxies (stairways, elevators, doors) control floor and building transitions. Soft override ensures devices are never permanently stuck on the wrong floor.
 
 ---
 
 ## Data Storage
 
-Position history is stored in your browser's **IndexedDB**, not in Home Assistant's database. This means:
-- No impact on your HA recorder database size
-- History is per-browser (different on phone vs desktop)
-- Automatically purged based on your retention setting
-- Cleared when you clear browser data
-
----
-
-## Adding Languages
-
-Create a new JSON file in `src/localize/languages/` (e.g., `de.json`) following the structure of `en.json`, then import it in `localize.ts`.
+Position history is stored in your browser's **IndexedDB**, not in Home Assistant's database.
 
 ---
 
 ## Development
 
 ```bash
-# Clone the repository
-git clone https://github.com/jerrypaasovaara/ha-ble-livemap.git
+git clone https://github.com/ToFinToFun/ha-ble-livemap.git
 cd ha-ble-livemap
-
-# Install dependencies
 pnpm install
-
-# Build for production
 pnpm build
-
-# Development with watch mode
-pnpm start
 ```
 
 The built file will be at `dist/ble-livemap-card.js`.
-
----
-
-## Contributing
-
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
 
 ---
 
@@ -320,4 +242,3 @@ MIT License — Copyright (c) 2026 Jerry Paasovaara
 - [Bermuda BLE Trilateration](https://github.com/agittins/bermuda) by Andrew Gittins
 - [Home Assistant](https://www.home-assistant.io/)
 - [Lit](https://lit.dev/) web components library
-- Built with the [HA Custom Card Boilerplate](https://github.com/custom-cards/boilerplate-card) patterns
