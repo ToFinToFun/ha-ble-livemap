@@ -1168,6 +1168,16 @@ export class BLELivemapPanel extends LitElement {
 
     if (!prefix) return distances;
 
+    // Extract the Bermuda device slug from the entity prefix.
+    // device_tracker.bermuda_XXXX_bermuda_tracker → XXXX
+    // sensor.bermuda_XXXX_distance → XXXX
+    const rawSlug = prefix
+      .replace(/^device_tracker\.bermuda_/, "")
+      .replace(/^sensor\.bermuda_/, "")
+      .replace(/^bermuda_/, "")
+      .replace(/_bermuda_tracker$/, "")
+      .replace(/_distance$/, "");
+
     // Strategy 1: Individual distance sensors per proxy
     for (const proxy of proxies) {
       const proxyName = proxy.entity_id
@@ -1176,7 +1186,9 @@ export class BLELivemapPanel extends LitElement {
         .replace(/^.*\./, "")
         .replace(/_proxy$/, "");
 
+      // Try multiple sensor naming patterns
       const possibleEntities = [
+        `sensor.bermuda_${rawSlug}_distance_to_${proxyName}`,
         `${prefix}_${proxyName}_distance`,
         `${prefix}_distance_${proxyName}`,
         `sensor.bermuda_${prefix.replace(/^.*\.bermuda_/, "").replace(/^sensor\.bermuda_/, "")}_distance_to_${proxyName}`,
