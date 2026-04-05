@@ -509,78 +509,21 @@ export class BLELivemapPanel extends LitElement {
     return panelStrings[lang]?.[key] || panelStrings["en"]?.[key] || key;
   }
   /**
-   * Discover BLE proxies from multiple sources:
-   * 1. Device registry — all devices under the "Bluetooth" integration (Shelly, ESPHome etc.)
-   * 2. Bermuda distance sensors — sensor.bermuda_*_distance_to_PROXYNAME
-   * 3. State entities — any entity with bluetooth_proxy or ble_proxy in the name
+   * Discover BLE proxies from Bermuda distance sensors.
+   * Primary source: sensor.bermuda_*_distance_to_PROXYNAME entities.
+   * These are the actual BLE scanners/proxies that Bermuda uses for trilateration.
+   * Device registry is used only to enrich with friendly names, areas, and MAC addresses.
    */
   private _discoverBLEProxies(): Map<string, { id: string; friendly_name: string; area: string; mac: string; entity_ids: string[] }> {
     const proxyMap = new Map<string, { id: string; friendly_name: string; area: string; mac: string; entity_ids: string[] }>();
 
-    // Source 1: Device registry — Bluetooth integration devices
-    if (this._deviceRegistryCache) {
-      for (const device of this._deviceRegistryCache) {
-        // Check if device has Bluetooth as one of its config entries
-        const identifiers = device.identifiers || [];
-        const connections = device.connections || [];
-        const configEntries = device.config_entries || [];
-
-        // Only include devices registered via the Bluetooth integration.
-        // These have ["bluetooth", "AA:BB:CC:DD:EE:FF"] in their identifiers.
-        // Routers, switches, computers etc. do NOT have this — they only have
-        // "mac" in connections, which is different.
-        const hasBluetoothIdentifier = identifiers.some((id: any[]) =>
-          id[0] === "bluetooth"
-        );
-
-        if (!hasBluetoothIdentifier) continue;
-
-        // Get MAC address from identifiers or connections
-        let mac = "";
-        for (const id of identifiers) {
-          if (id[0] === "bluetooth" && id[1]) {
-            mac = id[1];
-            break;
-          }
-        }
-        if (!mac) {
-          for (const c of connections) {
-            if ((c[0] === "bluetooth" || c[0] === "mac") && c[1]) {
-              mac = c[1];
-              break;
-            }
-          }
-        }
-
-        const deviceName = device.name_by_user || device.name || "Unknown";
-        const deviceId = device.id || mac;
-
-        // Get area name
-        let area = "";
-        if (device.area_id && this._areaRegistryCache) {
-          area = this._areaRegistryCache.get(device.area_id) || "";
-        }
-
-        // Create a slug from the device name for matching with Bermuda sensors
-        const slug = deviceName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-
-        if (!proxyMap.has(slug)) {
-          proxyMap.set(slug, {
-            id: slug,
-            friendly_name: deviceName,
-            area: area,
-            mac: mac,
-            entity_ids: [],
-          });
-        }
-      }
-    }
-
-    // Source 2: Bermuda distance sensors (enriches with entity tracking info)
+    // Primary source: Bermuda distance sensors — these define the actual proxy list.
+    // Only include "distance_to" sensors (not "unfiltered_distance_to").
     if (this.hass?.states) {
       for (const [entityId] of Object.entries(this.hass.states)) {
         const eid = entityId.toLowerCase();
-        if (eid.startsWith("sensor.bermuda_") && eid.includes("_distance_to_")) {
+        // Match sensor.bermuda_*_distance_to_* but NOT *_unfiltered_distance_to_*
+        if (eid.startsWith("sensor.bermuda_") && eid.includes("_distance_to_") && !eid.includes("_unfiltered_distance_to_")) {
           const parts = eid.split("_distance_to_");
           if (parts.length >= 2) {
             const proxyId = parts[parts.length - 1];
@@ -595,6 +538,45 @@ export class BLELivemapPanel extends LitElement {
                 mac: "",
                 entity_ids: [entityId],
               });
+            }
+          }
+        }
+      }
+    }
+
+    // Enrich proxy entries with device registry data (friendly names, areas, MACs)
+    if (this._deviceRegistryCache && proxyMap.size > 0) {
+      for (const device of this._deviceRegistryCache) {
+        const deviceName = device.name_by_user || device.name || "";
+        if (!deviceName) continue;
+
+        const slug = deviceName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+        // Check if this device matches any discovered proxy
+        const matchingProxy = proxyMap.get(slug);
+        if (!matchingProxy) continue;
+
+        // Enrich with device registry data
+        matchingProxy.friendly_name = deviceName;
+
+        if (device.area_id && this._areaRegistryCache) {
+          matchingProxy.area = this._areaRegistryCache.get(device.area_id) || matchingProxy.area;
+        }
+
+        // Get MAC from identifiers or connections
+        const identifiers = device.identifiers || [];
+        const connections = device.connections || [];
+        for (const id of identifiers) {
+          if ((id[0] === "bluetooth" || id[0] === "mac") && id[1]) {
+            matchingProxy.mac = id[1];
+            break;
+          }
+        }
+        if (!matchingProxy.mac) {
+          for (const c of connections) {
+            if ((c[0] === "bluetooth" || c[0] === "mac") && c[1]) {
+              matchingProxy.mac = c[1];
+              break;
             }
           }
         }
