@@ -56,6 +56,7 @@ export class BLELivemapCard extends LitElement {
   @state() private _runtimeShowProxies: boolean | null = null;
   @state() private _runtimeShowZones: boolean | null = null;
   @state() private _runtimeShowZoneLabels: boolean | null = null;
+  @state() private _showSetupDialog = false;
 
   private _canvases: Map<string, HTMLCanvasElement> = new Map();
   private _images: Map<string, HTMLImageElement> = new Map();
@@ -549,6 +550,63 @@ export class BLELivemapCard extends LitElement {
     this._runtimeShowZoneLabels = !current;
   }
 
+  private _openSetupDialog(): void {
+    this._showSetupDialog = true;
+    // After render, set config on the editor element
+    this.updateComplete.then(() => {
+      const editor = this.shadowRoot?.querySelector('ble-livemap-card-editor') as any;
+      if (editor && editor.setConfig) {
+        editor.setConfig(this._config);
+      }
+    });
+  }
+
+  private _closeSetupDialog(): void {
+    this._showSetupDialog = false;
+  }
+
+  private _handleSetupConfigChanged(e: CustomEvent): void {
+    if (e.detail?.config) {
+      this._config = { ...e.detail.config };
+      // Fire event to persist config in Lovelace
+      const event = new CustomEvent("config-changed", {
+        detail: { config: this._config },
+        bubbles: true,
+        composed: true,
+      });
+      this.dispatchEvent(event);
+      // Re-init if needed
+      this.setConfig(this._config);
+    }
+  }
+
+  private _renderSetupDialog() {
+    if (!this._showSetupDialog) return nothing;
+    const t = (key: string) => localize(key, this._lang);
+    return html`
+      <div class="setup-overlay" @click=${(e: Event) => {
+        if ((e.target as HTMLElement).classList.contains('setup-overlay')) this._closeSetupDialog();
+      }}>
+        <div class="setup-dialog">
+          <div class="setup-header">
+            <h2>${t('editor.title')}</h2>
+            <button class="setup-close" @click=${this._closeSetupDialog}>
+              <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
+                <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+              </svg>
+            </button>
+          </div>
+          <div class="setup-body" id="setup-body">
+            <ble-livemap-card-editor
+              .hass=${this.hass}
+              @config-changed=${this._handleSetupConfigChanged}
+            ></ble-livemap-card-editor>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   // ─── Floor Rendering Helpers ───────────────────────────────
 
   private _renderFloorMap(floor: FloorConfig) {
@@ -827,6 +885,91 @@ export class BLELivemapCard extends LitElement {
       :host([fullscreen]) .map-container {
         flex: 1;
       }
+
+      /* Setup Dialog */
+      .setup-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.6);
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        backdrop-filter: blur(4px);
+        animation: fadeIn 0.2s ease;
+      }
+
+      @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+
+      @keyframes slideUp {
+        from { transform: translateY(20px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+      }
+
+      .setup-dialog {
+        background: var(--card-bg, #fff);
+        border-radius: 16px;
+        width: 95vw;
+        max-width: 1200px;
+        height: 90vh;
+        max-height: 90vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.4);
+        animation: slideUp 0.25s ease;
+      }
+
+      .setup-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 24px;
+        border-bottom: 1px solid var(--divider-color, rgba(0,0,0,0.08));
+        flex-shrink: 0;
+      }
+
+      .setup-header h2 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+
+      .setup-close {
+        background: none;
+        border: none;
+        cursor: pointer;
+        padding: 8px;
+        border-radius: 50%;
+        color: var(--text-secondary);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.2s, color 0.2s;
+      }
+
+      .setup-close:hover {
+        background: var(--divider-color, rgba(0,0,0,0.08));
+        color: var(--text-primary);
+      }
+
+      .setup-body {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0;
+      }
+
+      .setup-body ble-livemap-card-editor {
+        display: block;
+        width: 100%;
+      }
     `;
   }
 
@@ -886,6 +1029,12 @@ export class BLELivemapCard extends LitElement {
                   </button>
                 `
               : nothing}
+            <!-- Setup button -->
+            <button class="header-btn" @click=${this._openSetupDialog} title="${t('common.configure')}">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z"/>
+              </svg>
+            </button>
             <button class="header-btn" @click=${this._toggleDevicePanel} title="Devices">
               <svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
@@ -967,10 +1116,13 @@ export class BLELivemapCard extends LitElement {
           </div>
           <div>v${CARD_VERSION}</div>
         </div>
+        <!-- Setup Dialog -->
+        ${this._renderSetupDialog()}
       </ha-card>
     `;
   }
 }
 
-// Also import and register the editor
+// Also import and register the editor and panel
 import "./editor";
+import "./panel";

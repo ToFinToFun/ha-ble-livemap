@@ -26,6 +26,8 @@ export interface BLELivemapConfig {
   active_floor?: string;
   floor_display_mode?: "tabs" | "stacked"; // tabs = one at a time, stacked = all visible
   auto_fit?: boolean; // auto-fit map to available space
+  image_width?: number; // real-world width in meters (for single floor)
+  image_height?: number; // real-world height in meters (for single floor)
 }
 
 export interface FloorConfig {
