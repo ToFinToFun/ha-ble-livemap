@@ -59,11 +59,15 @@ export class BLELivemapPanel extends LitElement {
   @state() private _placingMode: "proxy" | "device" | null = null;
   @state() private _drawingZone = false;
   @state() private _drawingPoints: { x: number; y: number }[] = [];
+  @state() private _drawingMode: "polygon" | "rectangle" = "rectangle";
+  @state() private _rectStart: { x: number; y: number } | null = null;
+  @state() private _rectPreview: { x: number; y: number } | null = null;
   @state() private _calibrating = false;
   @state() private _calibrationPoints: { x: number; y: number }[] = [];
   @state() private _calibrationMeters = 0;
   @state() private _draggingProxy: number | null = null;
   @state() private _mapImageLoaded = false;
+  @state() private _editingZoneIdx: number | null = null;
 
   private _lang = "en";
 
@@ -168,7 +172,6 @@ export class BLELivemapPanel extends LitElement {
   // ─── Localization Helper ────────────────────────────────────
 
   private _t(key: string): string {
-    // Panel-specific strings
     const panelStrings: Record<string, Record<string, string>> = {
       en: {
         "panel.title": "BLE LiveMap Setup",
@@ -210,14 +213,19 @@ export class BLELivemapPanel extends LitElement {
         "panel.width_m": "Width (m)",
         "panel.height_m": "Height (m)",
         "panel.zone_name": "Zone name",
-        "panel.zone_draw": "Draw zone on map",
+        "panel.zone_draw_polygon": "Draw polygon",
+        "panel.zone_draw_rectangle": "Draw rectangle",
         "panel.zone_finish": "Finish zone",
         "panel.zone_cancel": "Cancel drawing",
         "panel.add_zone": "Add zone",
         "panel.remove_zone": "Remove zone",
         "panel.zone_color": "Fill color",
+        "panel.zone_border_color": "Border color",
         "panel.zone_opacity": "Opacity",
         "panel.zone_show_label": "Show label",
+        "panel.zone_edit": "Edit zone",
+        "panel.zone_editing": "Editing zone",
+        "panel.zone_done_editing": "Done editing",
         "panel.auto_place": "Auto-place all",
         "panel.auto_place_help": "Match proxy/device names to zone names and place at zone centers",
         "panel.remove": "Remove",
@@ -284,14 +292,19 @@ export class BLELivemapPanel extends LitElement {
         "panel.width_m": "Bredd (m)",
         "panel.height_m": "Höjd (m)",
         "panel.zone_name": "Zonnamn",
-        "panel.zone_draw": "Rita zon på kartan",
+        "panel.zone_draw_polygon": "Rita polygon",
+        "panel.zone_draw_rectangle": "Rita rektangel",
         "panel.zone_finish": "Slutför zon",
         "panel.zone_cancel": "Avbryt ritning",
         "panel.add_zone": "Lägg till zon",
         "panel.remove_zone": "Ta bort zon",
         "panel.zone_color": "Fyllnadsfärg",
+        "panel.zone_border_color": "Kantfärg",
         "panel.zone_opacity": "Opacitet",
         "panel.zone_show_label": "Visa etikett",
+        "panel.zone_edit": "Redigera zon",
+        "panel.zone_editing": "Redigerar zon",
+        "panel.zone_done_editing": "Klar",
         "panel.auto_place": "Auto-placera alla",
         "panel.auto_place_help": "Matchar proxy-/enhetsnamn mot zonnamn och placerar i zonens mitt",
         "panel.remove": "Ta bort",
@@ -337,42 +350,51 @@ export class BLELivemapPanel extends LitElement {
     for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
       const friendlyName = (stateObj as any)?.attributes?.friendly_name || entityId;
       const area = (stateObj as any)?.attributes?.area || "";
-      const state = (stateObj as any)?.state || "";
+      const stateVal = (stateObj as any)?.state || "";
 
       let type: "proxy" | "device" | "unknown" = "unknown";
       let added = false;
 
-      // Detect Bermuda proxies
-      if (entityId.includes("bermuda") && (entityId.includes("proxy") || entityId.includes("scanner"))) {
+      const eid = entityId.toLowerCase();
+
+      // Detect BLE proxies (Bermuda, ESPHome, Shelly, generic BLE proxies)
+      if (
+        eid.includes("ble_proxy") ||
+        eid.includes("bluetooth_proxy") ||
+        (eid.includes("bermuda") && (eid.includes("proxy") || eid.includes("scanner"))) ||
+        (eid.includes("espresense") && eid.includes("node")) ||
+        (eid.includes("esphome") && (eid.includes("bluetooth") || eid.includes("ble"))) ||
+        (eid.includes("shelly") && eid.includes("bluetooth"))
+      ) {
         type = "proxy";
         added = addedProxies.has(entityId);
       }
       // Detect Bermuda tracked devices
-      else if (entityId.includes("bermuda") && !entityId.includes("proxy") && !entityId.includes("scanner")) {
+      else if (eid.includes("bermuda") && !eid.includes("proxy") && !eid.includes("scanner")) {
         type = "device";
         added = addedDevices.has(entityId);
       }
-      // Detect ESPresense
-      else if (entityId.includes("espresense")) {
-        type = entityId.includes("node") ? "proxy" : "device";
-        added = type === "proxy" ? addedProxies.has(entityId) : addedDevices.has(entityId);
+      // Detect ESPresense devices
+      else if (eid.includes("espresense") && !eid.includes("node")) {
+        type = "device";
+        added = addedDevices.has(entityId);
       }
 
       // Apply category filter
-      if (this._sidebarCategory === "bermuda" && !entityId.includes("bermuda")) continue;
+      if (this._sidebarCategory === "bermuda" && !eid.includes("bermuda")) continue;
       if (this._sidebarCategory === "proxies" && type !== "proxy") continue;
       if (this._sidebarCategory === "devices" && type !== "device") continue;
 
       // Apply text filter
       if (this._sidebarFilter) {
         const search = this._sidebarFilter.toLowerCase();
-        if (!entityId.toLowerCase().includes(search) && !friendlyName.toLowerCase().includes(search)) {
+        if (!eid.includes(search) && !friendlyName.toLowerCase().includes(search)) {
           continue;
         }
       }
 
       if (type !== "unknown" || this._sidebarCategory === "all") {
-        entities.push({ entity_id: entityId, friendly_name: friendlyName, area, state, type, added });
+        entities.push({ entity_id: entityId, friendly_name: friendlyName, area, state: stateVal, type, added });
       }
     }
 
@@ -415,7 +437,6 @@ export class BLELivemapPanel extends LitElement {
     const proxies = [...(this._config.proxies || [])];
     if (proxies.some((p) => p.entity_id === entity.entity_id)) return;
 
-    // Extract a clean name from entity_id
     const name = entity.friendly_name || entity.entity_id.replace(/^.*\./, "").replace(/_/g, " ");
 
     proxies.push({
@@ -477,17 +498,25 @@ export class BLELivemapPanel extends LitElement {
     const zones = [...(this._config.zones || [])];
     zones.splice(idx, 1);
     this._updateConfig("zones", zones);
+    if (this._editingZoneIdx === idx) this._editingZoneIdx = null;
   }
 
   // ─── Map Click Handler ─────────────────────────────────────
 
-  private _handleMapClick(e: MouseEvent): void {
+  private _getMapCoords(e: MouseEvent): { x: number; y: number } | null {
     const img = this.shadowRoot?.querySelector(".map-image") as HTMLImageElement;
-    if (!img) return;
-
+    if (!img) return null;
     const rect = img.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 100;
-    const y = ((e.clientY - rect.top) / rect.height) * 100;
+    return {
+      x: ((e.clientX - rect.left) / rect.width) * 100,
+      y: ((e.clientY - rect.top) / rect.height) * 100,
+    };
+  }
+
+  private _handleMapClick(e: MouseEvent): void {
+    const coords = this._getMapCoords(e);
+    if (!coords) return;
+    const { x, y } = coords;
 
     // Calibration mode
     if (this._calibrating) {
@@ -498,8 +527,30 @@ export class BLELivemapPanel extends LitElement {
       return;
     }
 
-    // Zone drawing mode
-    if (this._drawingZone) {
+    // Rectangle drawing mode
+    if (this._drawingZone && this._drawingMode === "rectangle") {
+      if (!this._rectStart) {
+        this._rectStart = { x, y };
+        this._rectPreview = null;
+      } else {
+        // Finish rectangle
+        const p1 = this._rectStart;
+        const p2 = { x, y };
+        const points = [
+          { x: Math.min(p1.x, p2.x), y: Math.min(p1.y, p2.y) },
+          { x: Math.max(p1.x, p2.x), y: Math.min(p1.y, p2.y) },
+          { x: Math.max(p1.x, p2.x), y: Math.max(p1.y, p2.y) },
+          { x: Math.min(p1.x, p2.x), y: Math.max(p1.y, p2.y) },
+        ];
+        this._finishZone(points);
+        this._rectStart = null;
+        this._rectPreview = null;
+      }
+      return;
+    }
+
+    // Polygon drawing mode
+    if (this._drawingZone && this._drawingMode === "polygon") {
       const points = [...this._drawingPoints, { x, y }];
       // Close polygon if clicking near first point
       if (points.length >= 3) {
@@ -527,6 +578,22 @@ export class BLELivemapPanel extends LitElement {
       return;
     }
 
+    // Check if clicking on a zone (for editing)
+    if (this._activeTab === "zones" && !this._drawingZone) {
+      const zones = this._config.zones || [];
+      for (let i = zones.length - 1; i >= 0; i--) {
+        if (this._isPointInZone(x, y, zones[i])) {
+          this._editingZoneIdx = i;
+          this.requestUpdate();
+          return;
+        }
+      }
+      // Clicked outside all zones - deselect
+      this._editingZoneIdx = null;
+      this.requestUpdate();
+      return;
+    }
+
     // Check if clicking on an existing proxy to start drag
     const proxies = this._config.proxies || [];
     for (let i = 0; i < proxies.length; i++) {
@@ -542,18 +609,25 @@ export class BLELivemapPanel extends LitElement {
   }
 
   private _handleMapMouseMove(e: MouseEvent): void {
+    // Rectangle preview
+    if (this._drawingZone && this._drawingMode === "rectangle" && this._rectStart) {
+      const coords = this._getMapCoords(e);
+      if (coords) {
+        this._rectPreview = coords;
+        this.requestUpdate();
+      }
+      return;
+    }
+
+    // Proxy dragging
     if (this._draggingProxy === null) return;
 
-    const img = this.shadowRoot?.querySelector(".map-image") as HTMLImageElement;
-    if (!img) return;
-
-    const rect = img.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 100;
-    const y = ((e.clientY - rect.top) / rect.height) * 100;
+    const coords = this._getMapCoords(e);
+    if (!coords) return;
 
     const proxies = [...(this._config.proxies || [])];
     if (this._draggingProxy < proxies.length) {
-      proxies[this._draggingProxy] = { ...proxies[this._draggingProxy], x, y };
+      proxies[this._draggingProxy] = { ...proxies[this._draggingProxy], x: coords.x, y: coords.y };
       this._config = { ...this._config, proxies };
       this.requestUpdate();
     }
@@ -566,11 +640,31 @@ export class BLELivemapPanel extends LitElement {
     }
   }
 
+  // ─── Point-in-polygon test ─────────────────────────────────
+
+  private _isPointInZone(px: number, py: number, zone: ZoneConfig): boolean {
+    const pts = zone.points;
+    if (!pts || pts.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i].x, yi = pts[i].y;
+      const xj = pts[j].x, yj = pts[j].y;
+      if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
   // ─── Zone Drawing ──────────────────────────────────────────
 
-  private _startDrawingZone(): void {
+  private _startDrawingZone(mode: "polygon" | "rectangle"): void {
     this._drawingZone = true;
+    this._drawingMode = mode;
     this._drawingPoints = [];
+    this._rectStart = null;
+    this._rectPreview = null;
+    this._editingZoneIdx = null;
   }
 
   private _finishZone(points?: { x: number; y: number }[]): void {
@@ -586,7 +680,7 @@ export class BLELivemapPanel extends LitElement {
       points: zonePoints,
       color: ZONE_COLORS[colorIdx],
       border_color: ZONE_COLORS[colorIdx],
-      opacity: 0.2,
+      opacity: 0.3,
       show_label: true,
       floor_id: this._getActiveFloor()?.id || "floor_0",
     });
@@ -594,11 +688,17 @@ export class BLELivemapPanel extends LitElement {
     this._updateConfig("zones", zones);
     this._drawingZone = false;
     this._drawingPoints = [];
+    this._rectStart = null;
+    this._rectPreview = null;
+    // Auto-select the new zone for editing
+    this._editingZoneIdx = zones.length - 1;
   }
 
   private _cancelDrawing(): void {
     this._drawingZone = false;
     this._drawingPoints = [];
+    this._rectStart = null;
+    this._rectPreview = null;
   }
 
   // ─── Calibration ───────────────────────────────────────────
@@ -634,7 +734,6 @@ export class BLELivemapPanel extends LitElement {
     this._updateConfig("image_width", imageWidth);
     this._updateConfig("image_height", imageHeight);
 
-    // Also update floor config if using floors
     if (this._config.floors && this._config.floors.length > 0) {
       const floors = [...this._config.floors];
       if (floors[this._activeFloorIdx]) {
@@ -662,13 +761,20 @@ export class BLELivemapPanel extends LitElement {
 
     for (let i = 0; i < proxies.length; i++) {
       const proxyName = (proxies[i].name || proxies[i].entity_id || "").toLowerCase();
+      // Extract meaningful parts from entity_id for matching
+      const entityParts = proxies[i].entity_id.replace(/^.*\./, "").replace(/_/g, " ").toLowerCase().split(" ");
 
       for (const zone of zones) {
         const zoneName = (zone.name || "").toLowerCase();
-        if (zoneName && proxyName.includes(zoneName) || (zoneName && zoneName.includes(proxyName.split(" ").pop() || ""))) {
-          // Place at zone center
-          const cx = zone.points.reduce((s, p) => s + p.x, 0) / zone.points.length;
-          const cy = zone.points.reduce((s, p) => s + p.y, 0) / zone.points.length;
+        if (!zoneName) continue;
+
+        // Match if proxy name contains zone name, or zone name contains any entity part
+        const matched = proxyName.includes(zoneName) ||
+          entityParts.some((part: string) => part.length > 2 && zoneName.includes(part));
+
+        if (matched) {
+          const cx = zone.points.reduce((s: number, p: { x: number }) => s + p.x, 0) / zone.points.length;
+          const cy = zone.points.reduce((s: number, p: { y: number }) => s + p.y, 0) / zone.points.length;
           proxies[i] = { ...proxies[i], x: cx, y: cy, floor_id: zone.floor_id };
           placed++;
           break;
@@ -1060,6 +1166,11 @@ export class BLELivemapPanel extends LitElement {
         pointer-events: none;
       }
 
+      .zone-polygon.clickable {
+        pointer-events: auto;
+        cursor: pointer;
+      }
+
       .zone-label-overlay {
         position: absolute;
         transform: translate(-50%, -50%);
@@ -1084,6 +1195,17 @@ export class BLELivemapPanel extends LitElement {
         transform: translate(-50%, -50%);
         pointer-events: none;
         z-index: 15;
+      }
+
+      /* Rectangle preview */
+      .rect-preview {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 14;
       }
 
       /* Calibration points */
@@ -1121,6 +1243,66 @@ export class BLELivemapPanel extends LitElement {
         margin-bottom: 12px;
         font-size: 13px;
         color: var(--text-primary);
+      }
+
+      /* Zone edit panel */
+      .zone-edit-panel {
+        background: var(--card-bg);
+        border: 1px solid var(--accent);
+        border-radius: 10px;
+        padding: 14px;
+        margin-bottom: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      }
+
+      .zone-edit-panel h4 {
+        margin: 0 0 10px;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--accent);
+      }
+
+      .zone-edit-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+
+      .zone-edit-row label {
+        font-size: 12px;
+        color: var(--text-secondary);
+        min-width: 80px;
+        flex-shrink: 0;
+      }
+
+      .zone-edit-row input[type="text"] {
+        flex: 1;
+        padding: 6px 10px;
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.12));
+        border-radius: 6px;
+        font-size: 12px;
+        background: var(--primary-background-color, #fafafa);
+        color: var(--text-primary);
+        outline: none;
+      }
+
+      .zone-edit-row input[type="color"] {
+        width: 36px;
+        height: 28px;
+        padding: 2px;
+        cursor: pointer;
+        border: 1px solid var(--divider-color);
+        border-radius: 4px;
+      }
+
+      .zone-edit-row input[type="range"] {
+        flex: 1;
+      }
+
+      .zone-edit-row input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
       }
 
       /* Config panels */
@@ -1401,7 +1583,7 @@ export class BLELivemapPanel extends LitElement {
         ${tabs.map((tab) => html`
           <button
             class="tab ${this._activeTab === tab.id ? "active" : ""}"
-            @click=${() => { this._activeTab = tab.id; }}
+            @click=${() => { this._activeTab = tab.id; this._editingZoneIdx = null; }}
           >${tab.label}</button>
         `)}
       </div>
@@ -1446,7 +1628,7 @@ export class BLELivemapPanel extends LitElement {
                     ${entity.area ? html`<div class="entity-area">${entity.area}</div>` : nothing}
                   </div>
                   ${entity.added
-                    ? html`<span class="entity-check">✓</span>`
+                    ? html`<span class="entity-check">\u2713</span>`
                     : html`<span class="entity-status">${entity.state}</span>`}
                 </button>
               `)}
@@ -1476,6 +1658,9 @@ export class BLELivemapPanel extends LitElement {
         ${this._activeTab === "zones" ? this._renderZoneToolbar() : nothing}
         ${this._activeTab === "proxies" ? this._renderProxyToolbar() : nothing}
 
+        <!-- Zone edit panel -->
+        ${this._editingZoneIdx !== null && this._activeTab === "zones" ? this._renderZoneEditPanel() : nothing}
+
         <!-- Map -->
         ${hasImage ? html`
           <div class="map-wrapper">
@@ -1495,6 +1680,7 @@ export class BLELivemapPanel extends LitElement {
                   ${this._renderZoneOverlays()}
                   ${this._renderProxyMarkers()}
                   ${this._renderDrawingPoints()}
+                  ${this._renderRectPreview()}
                   ${this._renderCalibrationOverlay()}
                 </div>
               ` : nothing}
@@ -1581,17 +1767,82 @@ export class BLELivemapPanel extends LitElement {
     return html`
       <div class="map-toolbar">
         ${this._drawingZone ? html`
-          <button class="btn btn-small btn-primary" @click=${() => this._finishZone()}>
-            ${this._t("panel.zone_finish")} (${this._drawingPoints.length} pts)
-          </button>
+          ${this._drawingMode === "polygon" ? html`
+            <button class="btn btn-small btn-primary" @click=${() => this._finishZone()}>
+              ${this._t("panel.zone_finish")} (${this._drawingPoints.length} pts)
+            </button>
+          ` : html`
+            <span style="font-size:12px;color:var(--text-secondary);">
+              ${this._rectStart ? "Click second corner to finish rectangle" : "Click first corner of rectangle"}
+            </span>
+          `}
           <button class="btn btn-small btn-secondary" @click=${this._cancelDrawing}>
             ${this._t("panel.zone_cancel")}
           </button>
         ` : html`
-          <button class="btn btn-small btn-primary" @click=${this._startDrawingZone}>
-            + ${this._t("panel.add_zone")}
+          <button class="btn btn-small btn-primary" @click=${() => this._startDrawingZone("rectangle")}>
+            ${this._t("panel.zone_draw_rectangle")}
           </button>
+          <button class="btn btn-small btn-secondary" @click=${() => this._startDrawingZone("polygon")}>
+            ${this._t("panel.zone_draw_polygon")}
+          </button>
+          <span style="font-size:11px;color:var(--text-secondary);">Click on a zone to edit it</span>
         `}
+      </div>
+    `;
+  }
+
+  private _renderZoneEditPanel() {
+    const zones = this._config.zones || [];
+    const zone = zones[this._editingZoneIdx!];
+    if (!zone) return nothing;
+    const idx = this._editingZoneIdx!;
+
+    return html`
+      <div class="zone-edit-panel">
+        <h4>${this._t("panel.zone_editing")}: ${zone.name || `Zone ${idx + 1}`}</h4>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.zone_name")}</label>
+          <input type="text" .value=${zone.name || ""} @change=${(e: Event) => {
+            const z = [...zones]; z[idx] = { ...z[idx], name: (e.target as HTMLInputElement).value };
+            this._updateConfig("zones", z);
+          }} />
+        </div>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.zone_color")}</label>
+          <input type="color" .value=${zone.color || ZONE_COLORS[0]} @input=${(e: Event) => {
+            const z = [...zones]; z[idx] = { ...z[idx], color: (e.target as HTMLInputElement).value };
+            this._updateConfig("zones", z);
+          }} />
+          <label>${this._t("panel.zone_border_color")}</label>
+          <input type="color" .value=${zone.border_color || zone.color || ZONE_COLORS[0]} @input=${(e: Event) => {
+            const z = [...zones]; z[idx] = { ...z[idx], border_color: (e.target as HTMLInputElement).value };
+            this._updateConfig("zones", z);
+          }} />
+        </div>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.zone_opacity")}</label>
+          <input type="range" min="0.05" max="0.8" step="0.05" .value=${String(zone.opacity || 0.3)} @input=${(e: Event) => {
+            const z = [...zones]; z[idx] = { ...z[idx], opacity: parseFloat((e.target as HTMLInputElement).value) };
+            this._updateConfig("zones", z);
+          }} />
+          <span style="font-size:11px;color:var(--text-secondary);min-width:30px;">${Math.round((zone.opacity || 0.3) * 100)}%</span>
+        </div>
+        <div class="zone-edit-row">
+          <label>${this._t("panel.zone_show_label")}</label>
+          <input type="checkbox" ?checked=${zone.show_label !== false} @change=${(e: Event) => {
+            const z = [...zones]; z[idx] = { ...z[idx], show_label: (e.target as HTMLInputElement).checked };
+            this._updateConfig("zones", z);
+          }} />
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <button class="btn btn-small btn-primary" @click=${() => { this._editingZoneIdx = null; }}>
+            ${this._t("panel.zone_done_editing")}
+          </button>
+          <button class="btn btn-small btn-danger" @click=${() => this._removeZone(idx)}>
+            ${this._t("panel.remove_zone")}
+          </button>
+        </div>
       </div>
     `;
   }
@@ -1605,7 +1856,7 @@ export class BLELivemapPanel extends LitElement {
           class="proxy-marker"
           style="left: ${proxy.x}%; top: ${proxy.y}%;"
           @mousedown=${(e: MouseEvent) => { e.preventDefault(); this._draggingProxy = idx; }}
-          title="${proxy.name || proxy.entity_id}"
+          title="${proxy.name || proxy.entity_id}\n${proxy.entity_id}\nPosition: ${proxy.x.toFixed(1)}%, ${proxy.y.toFixed(1)}%"
         >${idx + 1}</div>
         <div class="proxy-label" style="left: ${proxy.x}%; top: ${proxy.y + 2}%;">
           ${proxy.name || proxy.entity_id.replace(/^.*\./, "").replace(/_/g, " ")}
@@ -1616,20 +1867,26 @@ export class BLELivemapPanel extends LitElement {
 
   private _renderZoneOverlays() {
     const zones = this._config.zones || [];
-    return zones.map((zone) => {
+    const isZoneTab = this._activeTab === "zones";
+
+    return zones.map((zone, idx) => {
       if (!zone.points || zone.points.length < 3) return nothing;
       const pointsStr = zone.points.map((p) => `${p.x}%,${p.y}%`).join(" ");
       const cx = zone.points.reduce((s, p) => s + p.x, 0) / zone.points.length;
       const cy = zone.points.reduce((s, p) => s + p.y, 0) / zone.points.length;
+      const isEditing = this._editingZoneIdx === idx;
+      const opacity = zone.opacity || 0.3;
+      const highlightOpacity = isEditing ? Math.min(opacity + 0.2, 0.8) : opacity;
 
       return html`
-        <svg class="zone-polygon" viewBox="0 0 100 100" preserveAspectRatio="none">
+        <svg class="zone-polygon ${isZoneTab ? "clickable" : ""}" viewBox="0 0 100 100" preserveAspectRatio="none">
           <polygon
             points=${pointsStr}
-            fill="${zone.color || "#4FC3F7"}"
-            fill-opacity="${zone.opacity || 0.2}"
-            stroke="${zone.border_color || zone.color || "#4FC3F7"}"
-            stroke-width="0.3"
+            fill="${zone.color || ZONE_COLORS[0]}"
+            fill-opacity="${highlightOpacity}"
+            stroke="${isEditing ? "#fff" : (zone.border_color || zone.color || ZONE_COLORS[0])}"
+            stroke-width="${isEditing ? "0.5" : "0.3"}"
+            stroke-dasharray="${isEditing ? "1,0.5" : "none"}"
           />
         </svg>
         ${zone.show_label !== false ? html`
@@ -1642,10 +1899,51 @@ export class BLELivemapPanel extends LitElement {
   }
 
   private _renderDrawingPoints() {
-    if (!this._drawingZone) return nothing;
-    return this._drawingPoints.map((p) => html`
-      <div class="draw-point" style="left: ${p.x}%; top: ${p.y}%;"></div>
-    `);
+    if (!this._drawingZone || this._drawingMode !== "polygon") return nothing;
+    return html`
+      ${this._drawingPoints.map((p) => html`
+        <div class="draw-point" style="left: ${p.x}%; top: ${p.y}%;"></div>
+      `)}
+      ${this._drawingPoints.length >= 2 ? html`
+        <svg class="zone-polygon" viewBox="0 0 100 100" preserveAspectRatio="none">
+          ${this._drawingPoints.map((p, i) => {
+            if (i === 0) return nothing;
+            const prev = this._drawingPoints[i - 1];
+            return html`<line x1="${prev.x}" y1="${prev.y}" x2="${p.x}" y2="${p.y}" stroke="#FF5722" stroke-width="0.3" stroke-dasharray="1,0.5" />`;
+          })}
+        </svg>
+      ` : nothing}
+    `;
+  }
+
+  private _renderRectPreview() {
+    if (!this._drawingZone || this._drawingMode !== "rectangle" || !this._rectStart) return nothing;
+
+    // Show start point
+    const startHtml = html`<div class="draw-point" style="left: ${this._rectStart.x}%; top: ${this._rectStart.y}%;"></div>`;
+
+    if (!this._rectPreview) return startHtml;
+
+    const p1 = this._rectStart;
+    const p2 = this._rectPreview;
+    const minX = Math.min(p1.x, p2.x);
+    const minY = Math.min(p1.y, p2.y);
+    const maxX = Math.max(p1.x, p2.x);
+    const maxY = Math.max(p1.y, p2.y);
+
+    return html`
+      ${startHtml}
+      <svg class="rect-preview" viewBox="0 0 100 100" preserveAspectRatio="none">
+        <rect
+          x="${minX}" y="${minY}"
+          width="${maxX - minX}" height="${maxY - minY}"
+          fill="rgba(255, 87, 34, 0.15)"
+          stroke="#FF5722"
+          stroke-width="0.3"
+          stroke-dasharray="1,0.5"
+        />
+      </svg>
+    `;
   }
 
   private _renderCalibrationOverlay() {

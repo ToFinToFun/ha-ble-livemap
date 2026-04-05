@@ -162,28 +162,28 @@ export const DEFAULT_CONFIG: Partial<BLELivemapConfig> = {
   auto_fit: true,
 };
 
-// Default zone colors
+// Default zone colors (soft pastels — clearly distinct from device colors)
 export const ZONE_COLORS = [
-  "#4FC3F7", // Light Blue
-  "#81C784", // Green
-  "#FFB74D", // Orange
-  "#BA68C8", // Purple
-  "#4DB6AC", // Teal
-  "#FFD54F", // Yellow
-  "#F06292", // Pink
-  "#E57373", // Red
+  "#B3E5FC", // Pastel Blue
+  "#C8E6C9", // Pastel Green
+  "#FFE0B2", // Pastel Orange
+  "#E1BEE7", // Pastel Purple
+  "#B2DFDB", // Pastel Teal
+  "#FFF9C4", // Pastel Yellow
+  "#F8BBD0", // Pastel Pink
+  "#FFCCBC", // Pastel Coral
 ];
 
-// Default device colors
+// Default device colors (strong, saturated — clearly distinct from zone colors)
 export const DEVICE_COLORS = [
-  "#4FC3F7", // Light Blue
-  "#81C784", // Green
-  "#FFB74D", // Orange
-  "#E57373", // Red
-  "#BA68C8", // Purple
-  "#4DB6AC", // Teal
-  "#FFD54F", // Yellow
-  "#F06292", // Pink
+  "#1E88E5", // Strong Blue
+  "#43A047", // Strong Green
+  "#E53935", // Strong Red
+  "#8E24AA", // Strong Purple
+  "#FB8C00", // Strong Orange
+  "#00ACC1", // Strong Cyan
+  "#F4511E", // Strong Deep Orange
+  "#3949AB", // Strong Indigo
 ];
 
 // Default device icons
