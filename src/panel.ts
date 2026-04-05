@@ -81,6 +81,7 @@ export class BLELivemapPanel extends LitElement {
   @state() private _placingDoor = false;
   @state() private _placingDoorType: DoorType = "door";
   @state() private _editingDoorIdx: number | null = null;
+  @state() private _draggingDoor: number | null = null;
 
   // RSSI Calibration wizard state
   @state() private _calibWizardActive = false;
@@ -183,39 +184,93 @@ export class BLELivemapPanel extends LitElement {
     this.requestUpdate();
   }
 
+  /**
+   * Recursively find and update all BLE LiveMap cards in a cards array.
+   * Handles nested structures like sections, vertical-stack, horizontal-stack, etc.
+   */
+  private _updateCardsRecursive(cards: any[]): boolean {
+    let updated = false;
+    for (let i = 0; i < cards.length; i++) {
+      const card = cards[i];
+      if (card.type === `custom:${CARD_NAME}`) {
+        cards[i] = { ...this._config, type: `custom:${CARD_NAME}` };
+        updated = true;
+      }
+      // Check nested cards (vertical-stack, horizontal-stack, grid, etc.)
+      if (card.cards && Array.isArray(card.cards)) {
+        if (this._updateCardsRecursive(card.cards)) updated = true;
+      }
+      // Check sections (HA 2024+ section-based views)
+      if (card.sections && Array.isArray(card.sections)) {
+        for (const section of card.sections) {
+          if (section.cards && Array.isArray(section.cards)) {
+            if (this._updateCardsRecursive(section.cards)) updated = true;
+          }
+        }
+      }
+    }
+    return updated;
+  }
+
   private async _saveAndPush(): Promise<void> {
     this._saveConfigLocal();
     this._saving = true;
     this._saveMessage = this._t("panel.saving");
 
     try {
-      const result: any = await this.hass.callWS({
-        type: "lovelace/config",
-        url_path: null,
-      });
+      // Get list of all dashboards
+      const dashboards: any[] = await this.hass.callWS({ type: "lovelace/dashboards/list" }).catch(() => []);
+      const urlPaths: (string | null)[] = [null]; // null = default dashboard
+      for (const db of dashboards) {
+        if (db.url_path && db.mode !== "storage") continue; // skip non-storage dashboards
+        if (db.url_path) urlPaths.push(db.url_path);
+      }
 
-      if (result?.views) {
-        let updated = false;
-        for (const view of result.views) {
-          if (!view.cards) continue;
-          for (let i = 0; i < view.cards.length; i++) {
-            if (view.cards[i].type === `custom:${CARD_NAME}`) {
-              view.cards[i] = { ...this._config, type: `custom:${CARD_NAME}` };
-              updated = true;
+      let totalUpdated = 0;
+
+      for (const urlPath of urlPaths) {
+        try {
+          const result: any = await this.hass.callWS({
+            type: "lovelace/config",
+            url_path: urlPath,
+          });
+
+          if (result?.views) {
+            let updated = false;
+            for (const view of result.views) {
+              // Check cards directly on the view
+              if (view.cards && Array.isArray(view.cards)) {
+                if (this._updateCardsRecursive(view.cards)) updated = true;
+              }
+              // Check sections (HA 2024+ section-based views)
+              if (view.sections && Array.isArray(view.sections)) {
+                for (const section of view.sections) {
+                  if (section.cards && Array.isArray(section.cards)) {
+                    if (this._updateCardsRecursive(section.cards)) updated = true;
+                  }
+                }
+              }
+            }
+
+            if (updated) {
+              await this.hass.callWS({
+                type: "lovelace/config/save",
+                url_path: urlPath,
+                config: result,
+              });
+              totalUpdated++;
             }
           }
+        } catch (e) {
+          // Skip dashboards that fail (e.g., YAML-mode dashboards)
+          console.debug(`[BLE LiveMap Panel] Skipped dashboard ${urlPath}:`, e);
         }
+      }
 
-        if (updated) {
-          await this.hass.callWS({
-            type: "lovelace/config/save",
-            url_path: null,
-            config: result,
-          });
-          this._saveMessage = this._t("panel.saved");
-        } else {
-          this._saveMessage = this._t("panel.no_cards_found");
-        }
+      if (totalUpdated > 0) {
+        this._saveMessage = this._t("panel.saved");
+      } else {
+        this._saveMessage = this._t("panel.no_cards_found");
       }
     } catch (e) {
       this._saveMessage = this._t("panel.save_error");
@@ -983,6 +1038,8 @@ export class BLELivemapPanel extends LitElement {
 
     // Check if clicking on a door (for editing) in doors tab
     if (this._activeTab === "doors" && !this._placingDoor) {
+      // If we just finished dragging a door, don't re-handle click
+      if (this._draggingDoor !== null) return;
       const doors = this._config.doors || [];
       for (let i = doors.length - 1; i >= 0; i--) {
         const dx = x - doors[i].x;
@@ -1036,12 +1093,30 @@ export class BLELivemapPanel extends LitElement {
 
     // Proxy dragging
     if (this._draggingProxy !== null) {
+      e.preventDefault();
       const coords = this._getMapCoords(e);
       if (coords) {
         const proxies = [...(this._config.proxies || [])];
         if (proxies[this._draggingProxy]) {
           proxies[this._draggingProxy] = { ...proxies[this._draggingProxy], x: coords.x, y: coords.y };
-          this._updateConfig("proxies", proxies);
+          this._config = { ...this._config, proxies };
+          this._saveConfigLocal();
+          this.requestUpdate();
+        }
+      }
+    }
+
+    // Door dragging
+    if (this._draggingDoor !== null) {
+      e.preventDefault();
+      const coords = this._getMapCoords(e);
+      if (coords) {
+        const doors = [...(this._config.doors || [])];
+        if (doors[this._draggingDoor]) {
+          doors[this._draggingDoor] = { ...doors[this._draggingDoor], x: coords.x, y: coords.y };
+          this._config = { ...this._config, doors };
+          this._saveConfigLocal();
+          this.requestUpdate();
         }
       }
     }
@@ -1050,6 +1125,9 @@ export class BLELivemapPanel extends LitElement {
   private _handleMapMouseUp(): void {
     if (this._draggingProxy !== null) {
       this._draggingProxy = null;
+    }
+    if (this._draggingDoor !== null) {
+      this._draggingDoor = null;
     }
   }
 
@@ -1099,7 +1177,7 @@ export class BLELivemapPanel extends LitElement {
       points: zonePoints,
       color: ZONE_COLORS[colorIdx],
       border_color: ZONE_COLORS[colorIdx],
-      opacity: 0.3,
+      opacity: 0.5,
       show_label: true,
       floor_id: floor?.id || "floor_0",
     });
@@ -1787,6 +1865,8 @@ export class BLELivemapPanel extends LitElement {
         display: inline-block;
         max-width: 100%;
         max-height: 100%;
+        user-select: none;
+        -webkit-user-select: none;
       }
 
       .map-image {
@@ -1801,6 +1881,10 @@ export class BLELivemapPanel extends LitElement {
         cursor: grabbing;
       }
 
+      .map-inner.dragging {
+        cursor: grabbing;
+      }
+
       .map-overlay {
         position: absolute;
         top: 0;
@@ -1808,6 +1892,8 @@ export class BLELivemapPanel extends LitElement {
         width: 100%;
         height: 100%;
         pointer-events: none;
+        user-select: none;
+        -webkit-user-select: none;
       }
 
       /* Zone overlays */
@@ -1828,32 +1914,39 @@ export class BLELivemapPanel extends LitElement {
         position: absolute;
         transform: translate(-50%, -50%);
         font-size: 11px;
-        font-weight: 600;
-        color: rgba(255,255,255,0.9);
-        text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+        font-weight: 700;
+        color: #1a1a1a;
+        background: rgba(255, 255, 255, 0.85);
+        padding: 2px 8px;
+        border-radius: 4px;
+        text-shadow: none;
         pointer-events: none;
         white-space: nowrap;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        z-index: 5;
       }
 
       /* Proxy markers */
       .proxy-marker {
         position: absolute;
         transform: translate(-50%, -50%);
-        width: 24px;
-        height: 24px;
+        width: 32px;
+        height: 32px;
         border-radius: 50%;
         background: #2196F3;
         color: white;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 10px;
+        font-size: 12px;
         font-weight: 700;
         cursor: grab;
         pointer-events: all;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.35);
         transition: transform 0.1s;
         z-index: 10;
+        user-select: none;
+        -webkit-user-select: none;
       }
 
       .proxy-marker:hover {
@@ -1875,18 +1968,20 @@ export class BLELivemapPanel extends LitElement {
       .door-marker {
         position: absolute;
         transform: translate(-50%, -50%);
-        width: 28px;
-        height: 28px;
+        width: 32px;
+        height: 32px;
         border-radius: 6px;
         background: var(--door-color, #FF9800);
         display: flex;
         align-items: center;
         justify-content: center;
         pointer-events: all;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.35);
         transition: transform 0.15s, box-shadow 0.15s;
         z-index: 9;
         cursor: pointer;
+        user-select: none;
+        -webkit-user-select: none;
       }
 
       .door-marker .door-icon {
@@ -2499,15 +2594,16 @@ export class BLELivemapPanel extends LitElement {
         <!-- Map -->
         ${hasImage ? html`
           <div class="map-wrapper">
-            <div class="map-inner">
+            <div class="map-inner ${(this._draggingProxy !== null || this._draggingDoor !== null) ? 'dragging' : ''}"
+              @click=${this._handleMapClick}
+              @mousemove=${this._handleMapMouseMove}
+              @mouseup=${this._handleMapMouseUp}
+              @mouseleave=${this._handleMapMouseUp}
+            >
               <img
-                class="map-image ${this._draggingProxy !== null ? "dragging" : ""}"
+                class="map-image ${(this._draggingProxy !== null || this._draggingDoor !== null) ? "dragging" : ""}"
                 src=${floor!.image}
                 @load=${() => { this._mapImageLoaded = true; }}
-                @click=${this._handleMapClick}
-                @mousemove=${this._handleMapMouseMove}
-                @mouseup=${this._handleMapMouseUp}
-                @mouseleave=${this._handleMapMouseUp}
                 crossorigin="anonymous"
               />
               ${this._mapImageLoaded ? html`
@@ -2892,8 +2988,9 @@ export class BLELivemapPanel extends LitElement {
       return html`
         <div
           class="door-marker ${isEditing ? 'editing' : ''} ${isDoorTab ? 'clickable' : ''}"
-          style="left: ${door.x}%; top: ${door.y}%; --door-color: ${color};"
+          style="left: ${door.x}%; top: ${door.y}%; --door-color: ${color}; cursor: ${isDoorTab ? 'grab' : 'pointer'};"
           title="${door.name || `Door ${idx + 1}`}\n${door.type}"
+          @mousedown=${isDoorTab ? (e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingDoor = idx; this._editingDoorIdx = idx; this.requestUpdate(); } : undefined}
         >
           <span class="door-icon">${icon}</span>
         </div>
@@ -2919,7 +3016,7 @@ export class BLELivemapPanel extends LitElement {
         <div
           class="proxy-marker"
           style="left: ${proxy.x}%; top: ${proxy.y}%;"
-          @mousedown=${(e: MouseEvent) => { e.preventDefault(); this._draggingProxy = idx; }}
+          @mousedown=${(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingProxy = idx; }}
           title="${proxy.name || proxy.entity_id}\n${proxy.entity_id}\nPosition: ${proxy.x.toFixed(1)}%, ${proxy.y.toFixed(1)}%"
         >${idx + 1}</div>
         <div class="proxy-label" style="left: ${proxy.x}%; top: ${proxy.y + 2}%;">
@@ -2943,21 +3040,24 @@ export class BLELivemapPanel extends LitElement {
       const cx = zone.points.reduce((s, p) => s + p.x, 0) / zone.points.length;
       const cy = zone.points.reduce((s, p) => s + p.y, 0) / zone.points.length;
       const isEditing = this._editingZoneIdx === idx;
-      const opacity = zone.opacity || 0.3;
-      const highlightOpacity = isEditing ? Math.min(opacity + 0.2, 0.8) : opacity;
+      const opacity = zone.opacity || 0.5;
+      const highlightOpacity = isEditing ? Math.min(opacity + 0.2, 0.9) : opacity;
+      const zoneColor = zone.color || ZONE_COLORS[0];
+      const borderColor = isEditing ? "#ffffff" : (zone.border_color || zoneColor);
 
       return html`
-        <svg class="zone-polygon ${isZoneTab ? "clickable" : ""}" viewBox="0 0 100 100" preserveAspectRatio="none">
+        <svg class="zone-polygon ${isZoneTab ? "clickable" : ""}" viewBox="0 0 100 100" preserveAspectRatio="none"
+          @click=${isZoneTab ? () => { this._editingZoneIdx = idx; this.requestUpdate(); } : undefined}>
           <polygon
             points=${pointsStr}
-            fill="${zone.color || ZONE_COLORS[0]}"
+            fill="${zoneColor}"
             fill-opacity="${highlightOpacity}"
-            stroke="${isEditing ? "#fff" : (zone.border_color || zone.color || ZONE_COLORS[0])}"
-            stroke-width="${isEditing ? "0.5" : "0.3"}"
+            stroke="${borderColor}"
+            stroke-width="${isEditing ? "0.6" : "0.4"}"
             stroke-dasharray="${isEditing ? "1,0.5" : "none"}"
           />
         </svg>
-        ${zone.show_label !== false ? html`
+        ${zone.show_label !== false && zone.name ? html`
           <div class="zone-label-overlay" style="left: ${cx}%; top: ${cy}%;">
             ${zone.name}
           </div>

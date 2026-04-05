@@ -226,14 +226,14 @@ export const GATEWAY_TYPES: { value: GatewayType; label: string; icon: string }[
 
 // Default zone colors (soft pastels — clearly distinct from device colors)
 export const ZONE_COLORS = [
-  "#B3E5FC", // Pastel Blue
-  "#C8E6C9", // Pastel Green
-  "#FFE0B2", // Pastel Orange
-  "#E1BEE7", // Pastel Purple
-  "#B2DFDB", // Pastel Teal
-  "#FFF9C4", // Pastel Yellow
-  "#F8BBD0", // Pastel Pink
-  "#FFCCBC", // Pastel Coral
+  "#42A5F5", // Blue
+  "#66BB6A", // Green
+  "#FFA726", // Orange
+  "#AB47BC", // Purple
+  "#26A69A", // Teal
+  "#FFEE58", // Yellow
+  "#EC407A", // Pink
+  "#FF7043", // Coral
 ];
 
 // Default device colors (strong, saturated — clearly distinct from zone colors)
