@@ -525,29 +525,15 @@ export class BLELivemapPanel extends LitElement {
         const connections = device.connections || [];
         const configEntries = device.config_entries || [];
 
-        // Only include devices that are actual BLE proxies.
-        // Real BLE proxies (Shelly, ESPHome) have ["bluetooth", "MAC"] in identifiers.
-        // We must NOT include devices that only have "mac" in connections (routers, switches, etc.)
+        // Only include devices registered via the Bluetooth integration.
+        // These have ["bluetooth", "AA:BB:CC:DD:EE:FF"] in their identifiers.
+        // Routers, switches, computers etc. do NOT have this — they only have
+        // "mac" in connections, which is different.
         const hasBluetoothIdentifier = identifiers.some((id: any[]) =>
           id[0] === "bluetooth"
         );
 
-        // Also accept ESPHome/Shelly devices that may use their own identifier namespace
-        const isEspOrShelly = identifiers.some((id: any[]) =>
-          id[0] === "esphome" || id[0] === "shelly"
-        );
-
-        // Check manufacturer to filter out non-proxy devices
-        const manufacturer = (device.manufacturer || "").toLowerCase();
-        const isProxyManufacturer = manufacturer.includes("espressif") ||
-          manufacturer.includes("shelly") ||
-          manufacturer.includes("esphome");
-
-        // A device is a BLE proxy if:
-        // 1. It has a "bluetooth" identifier (registered via Bluetooth integration), OR
-        // 2. It has esphome/shelly identifier AND is from a known proxy manufacturer
-        // This excludes routers, switches, computers that only have MAC connections
-        if (!hasBluetoothIdentifier && !(isEspOrShelly && isProxyManufacturer)) continue;
+        if (!hasBluetoothIdentifier) continue;
 
         // Get MAC address from identifiers or connections
         let mac = "";
