@@ -4,8 +4,8 @@
  * License: MIT
  *
  * Full-page configuration panel accessible from the HA sidebar.
- * Features a split layout with entity sidebar + large interactive map,
- * tabbed configuration, and drag-and-drop entity placement.
+ * Features smart entity discovery, multi-floor support, and
+ * interactive map with drag-and-drop entity placement.
  */
 
 import { LitElement, html, css, CSSResultGroup, PropertyValues, nothing } from "lit";
@@ -37,6 +37,8 @@ interface DiscoveredEntity {
   state: string;
   type: "proxy" | "device" | "unknown";
   added: boolean;
+  /** For proxies: the scanner/proxy identifier extracted from Bermuda */
+  proxy_id?: string;
 }
 
 @customElement(PANEL_NAME)
@@ -51,7 +53,7 @@ export class BLELivemapPanel extends LitElement {
   @state() private _saveMessage = "";
   @state() private _loaded = false;
   @state() private _sidebarFilter = "";
-  @state() private _sidebarCategory: "all" | "proxies" | "devices" | "bermuda" = "bermuda";
+  @state() private _sidebarCategory: "smart" | "proxies" | "devices" | "all" = "smart";
   @state() private _activeFloorIdx = 0;
 
   // Map interaction state
@@ -190,10 +192,10 @@ export class BLELivemapPanel extends LitElement {
         "panel.tab_settings": "Settings",
         "panel.sidebar_title": "Available Entities",
         "panel.filter": "Search entities...",
-        "panel.category_all": "All",
+        "panel.category_smart": "Smart",
         "panel.category_proxies": "Proxies",
         "panel.category_devices": "Devices",
-        "panel.category_bermuda": "Bermuda",
+        "panel.category_all": "All",
         "panel.click_to_add": "Click to add to map",
         "panel.already_added": "Already added",
         "panel.click_map_to_place": "Click on the map to place",
@@ -202,8 +204,9 @@ export class BLELivemapPanel extends LitElement {
         "panel.floor_image": "Floor plan image URL",
         "panel.floor_image_help": "Use /local/filename.png for images in your www folder",
         "panel.floor_name": "Floor name",
-        "panel.add_floor": "Add floor",
+        "panel.add_floor": "+ Add floor",
         "panel.remove_floor": "Remove floor",
+        "panel.floor_select": "Select floor",
         "panel.calibrate": "Calibrate dimensions",
         "panel.calibrate_help": "Click two points of a known distance on the map, then enter the real distance.",
         "panel.calibrate_start": "Start calibration",
@@ -251,6 +254,11 @@ export class BLELivemapPanel extends LitElement {
         "panel.device_color": "Color",
         "panel.device_icon": "Icon",
         "panel.proxy_name": "Display name",
+        "panel.smart_help": "Showing only relevant BLE proxies and trackable devices detected from Bermuda",
+        "panel.proxy_section": "BLE Scanners / Proxies",
+        "panel.device_section": "Trackable Devices",
+        "panel.scanner_count": "scanners detected",
+        "panel.device_count": "trackable devices",
       },
       sv: {
         "panel.title": "BLE LiveMap Inställningar",
@@ -269,26 +277,27 @@ export class BLELivemapPanel extends LitElement {
         "panel.tab_settings": "Inställningar",
         "panel.sidebar_title": "Tillgängliga enheter",
         "panel.filter": "Sök enheter...",
-        "panel.category_all": "Alla",
+        "panel.category_smart": "Smart",
         "panel.category_proxies": "Proxies",
         "panel.category_devices": "Enheter",
-        "panel.category_bermuda": "Bermuda",
-        "panel.click_to_add": "Klicka för att lägga till på kartan",
+        "panel.category_all": "Alla",
+        "panel.click_to_add": "Klicka för att lägga till",
         "panel.already_added": "Redan tillagd",
         "panel.click_map_to_place": "Klicka på kartan för att placera",
         "panel.cancel_placement": "Avbryt",
         "panel.no_entities": "Inga matchande enheter hittades",
-        "panel.floor_image": "URL till planritning",
+        "panel.floor_image": "Planritnings-URL",
         "panel.floor_image_help": "Använd /local/filnamn.png för bilder i din www-mapp",
         "panel.floor_name": "Våningsnamn",
-        "panel.add_floor": "Lägg till våning",
+        "panel.add_floor": "+ Lägg till våning",
         "panel.remove_floor": "Ta bort våning",
+        "panel.floor_select": "Välj våning",
         "panel.calibrate": "Kalibrera mått",
-        "panel.calibrate_help": "Klicka på två punkter med känt avstånd på kartan, ange sedan det verkliga avståndet.",
+        "panel.calibrate_help": "Klicka på två punkter med känt avstånd, ange sedan det verkliga avståndet.",
         "panel.calibrate_start": "Starta kalibrering",
         "panel.calibrate_cancel": "Avbryt",
         "panel.calibrate_distance": "Verkligt avstånd (meter)",
-        "panel.calibrate_apply": "Applicera",
+        "panel.calibrate_apply": "Tillämpa",
         "panel.width_m": "Bredd (m)",
         "panel.height_m": "Höjd (m)",
         "panel.zone_name": "Zonnamn",
@@ -304,7 +313,7 @@ export class BLELivemapPanel extends LitElement {
         "panel.zone_show_label": "Visa etikett",
         "panel.zone_edit": "Redigera zon",
         "panel.zone_editing": "Redigerar zon",
-        "panel.zone_done_editing": "Klar",
+        "panel.zone_done_editing": "Klar med redigering",
         "panel.auto_place": "Auto-placera alla",
         "panel.auto_place_help": "Matchar proxy-/enhetsnamn mot zonnamn och placerar i zonens mitt",
         "panel.remove": "Ta bort",
@@ -319,7 +328,7 @@ export class BLELivemapPanel extends LitElement {
         "panel.history_enabled": "Aktivera positionshistorik",
         "panel.history_retention": "Historiklagring (minuter)",
         "panel.update_interval": "Uppdateringsintervall (sekunder)",
-        "panel.floor_display": "Våningsvisning",
+        "panel.floor_display": "Våningsvisningsläge",
         "panel.floor_tabs": "Flikar",
         "panel.floor_stacked": "Staplade",
         "panel.theme": "Tema",
@@ -330,6 +339,11 @@ export class BLELivemapPanel extends LitElement {
         "panel.device_color": "Färg",
         "panel.device_icon": "Ikon",
         "panel.proxy_name": "Visningsnamn",
+        "panel.smart_help": "Visar bara relevanta BLE-proxies och spårbara enheter från Bermuda",
+        "panel.proxy_section": "BLE-skannrar / Proxies",
+        "panel.device_section": "Spårbara enheter",
+        "panel.scanner_count": "skannrar hittade",
+        "panel.device_count": "spårbara enheter",
       },
     };
 
@@ -337,14 +351,169 @@ export class BLELivemapPanel extends LitElement {
     return panelStrings[lang]?.[key] || panelStrings["en"]?.[key] || key;
   }
 
-  // ─── Entity Discovery ──────────────────────────────────────
+  // ─── Smart Entity Discovery ───────────────────────────────
 
+  /**
+   * Extract unique BLE proxy/scanner identifiers from Bermuda's
+   * "distance_to_*" sensors. These are the actual BLE scanners.
+   */
+  private _discoverBermudaProxies(): Map<string, { id: string; friendly_name: string; entity_ids: string[] }> {
+    if (!this.hass?.states) return new Map();
+
+    const proxyMap = new Map<string, { id: string; friendly_name: string; entity_ids: string[] }>();
+
+    for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
+      const eid = entityId.toLowerCase();
+
+      // Match sensor.bermuda_*_distance_to_PROXYNAME
+      // The proxy identifier is the part after "distance_to_"
+      if (eid.startsWith("sensor.bermuda_") && eid.includes("_distance_to_")) {
+        const parts = eid.split("_distance_to_");
+        if (parts.length >= 2) {
+          const proxyId = parts[parts.length - 1]; // e.g. "shelly_koksbord", "bluetooth_proxy"
+          if (!proxyMap.has(proxyId)) {
+            // Create a friendly name from the proxy ID
+            const friendlyName = proxyId.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+            proxyMap.set(proxyId, {
+              id: proxyId,
+              friendly_name: friendlyName,
+              entity_ids: [entityId],
+            });
+          } else {
+            proxyMap.get(proxyId)!.entity_ids.push(entityId);
+          }
+        }
+      }
+    }
+
+    return proxyMap;
+  }
+
+  /**
+   * Find trackable devices - only device_tracker.bermuda_* entities
+   * which actually have position/area data.
+   */
+  private _discoverTrackableDevices(): DiscoveredEntity[] {
+    if (!this.hass?.states) return [];
+
+    const addedDevices = new Set((this._config.tracked_devices || []).map((d) => d.entity_prefix));
+    const devices: DiscoveredEntity[] = [];
+
+    for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
+      const eid = entityId.toLowerCase();
+
+      // Only device_tracker.bermuda_* entities have actual position data
+      if (eid.startsWith("device_tracker.bermuda_")) {
+        const friendlyName = (stateObj as any)?.attributes?.friendly_name || entityId;
+        const area = (stateObj as any)?.state || "";
+
+        devices.push({
+          entity_id: entityId,
+          friendly_name: friendlyName,
+          area: area,
+          state: area,
+          type: "device",
+          added: addedDevices.has(entityId),
+        });
+      }
+    }
+
+    // Sort: not-added first, then by name
+    devices.sort((a, b) => {
+      if (a.added !== b.added) return a.added ? 1 : -1;
+      return a.friendly_name.localeCompare(b.friendly_name);
+    });
+
+    return devices;
+  }
+
+  /**
+   * Main discovery method - combines smart proxy discovery and device discovery.
+   * In "smart" mode, shows only relevant entities.
+   * In "all" mode, shows everything for manual selection.
+   */
   private _discoverEntities(): DiscoveredEntity[] {
+    if (!this.hass?.states) return [];
+
+    if (this._sidebarCategory === "smart" || this._sidebarCategory === "proxies") {
+      return this._getSmartProxyList();
+    }
+
+    if (this._sidebarCategory === "devices") {
+      return this._getSmartDeviceList();
+    }
+
+    // "all" mode - show everything
+    return this._getAllEntities();
+  }
+
+  private _getSmartProxyList(): DiscoveredEntity[] {
+    const bermudaProxies = this._discoverBermudaProxies();
+    const addedProxies = new Set((this._config.proxies || []).map((p) => p.entity_id));
+
+    const entities: DiscoveredEntity[] = [];
+
+    for (const [proxyId, proxyInfo] of bermudaProxies) {
+      // Use the proxy_id as the entity_id for config purposes
+      // The actual entity_id used is a synthetic one based on the proxy identifier
+      const syntheticEntityId = `bermuda_proxy_${proxyId}`;
+      const added = addedProxies.has(syntheticEntityId) ||
+        addedProxies.has(proxyId) ||
+        // Check if any existing proxy matches by name
+        (this._config.proxies || []).some((p) =>
+          p.entity_id.includes(proxyId) ||
+          (p.name || "").toLowerCase().replace(/\s+/g, "_").includes(proxyId)
+        );
+
+      const entity: DiscoveredEntity = {
+        entity_id: syntheticEntityId,
+        friendly_name: proxyInfo.friendly_name,
+        area: "",
+        state: `${proxyInfo.entity_ids.length} devices tracked`,
+        type: "proxy",
+        added,
+        proxy_id: proxyId,
+      };
+
+      // Apply text filter
+      if (this._sidebarFilter) {
+        const search = this._sidebarFilter.toLowerCase();
+        if (!proxyId.includes(search) &&
+            !proxyInfo.friendly_name.toLowerCase().includes(search)) {
+          continue;
+        }
+      }
+
+      entities.push(entity);
+    }
+
+    // Sort: not-added first, then by name
+    entities.sort((a, b) => {
+      if (a.added !== b.added) return a.added ? 1 : -1;
+      return a.friendly_name.localeCompare(b.friendly_name);
+    });
+
+    return entities;
+  }
+
+  private _getSmartDeviceList(): DiscoveredEntity[] {
+    const devices = this._discoverTrackableDevices();
+
+    if (!this._sidebarFilter) return devices;
+
+    const search = this._sidebarFilter.toLowerCase();
+    return devices.filter((d) =>
+      d.entity_id.toLowerCase().includes(search) ||
+      d.friendly_name.toLowerCase().includes(search) ||
+      d.area.toLowerCase().includes(search)
+    );
+  }
+
+  private _getAllEntities(): DiscoveredEntity[] {
     if (!this.hass?.states) return [];
 
     const addedProxies = new Set((this._config.proxies || []).map((p) => p.entity_id));
     const addedDevices = new Set((this._config.tracked_devices || []).map((d) => d.entity_prefix));
-
     const entities: DiscoveredEntity[] = [];
 
     for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
@@ -352,56 +521,37 @@ export class BLELivemapPanel extends LitElement {
       const area = (stateObj as any)?.attributes?.area || "";
       const stateVal = (stateObj as any)?.state || "";
 
-      let type: "proxy" | "device" | "unknown" = "unknown";
-      let added = false;
-
-      const eid = entityId.toLowerCase();
-
-      // Detect BLE proxies (Bermuda, ESPHome, Shelly, generic BLE proxies)
-      if (
-        eid.includes("ble_proxy") ||
-        eid.includes("bluetooth_proxy") ||
-        (eid.includes("bermuda") && (eid.includes("proxy") || eid.includes("scanner"))) ||
-        (eid.includes("espresense") && eid.includes("node")) ||
-        (eid.includes("esphome") && (eid.includes("bluetooth") || eid.includes("ble"))) ||
-        (eid.includes("shelly") && eid.includes("bluetooth"))
-      ) {
-        type = "proxy";
-        added = addedProxies.has(entityId);
-      }
-      // Detect Bermuda tracked devices
-      else if (eid.includes("bermuda") && !eid.includes("proxy") && !eid.includes("scanner")) {
-        type = "device";
-        added = addedDevices.has(entityId);
-      }
-      // Detect ESPresense devices
-      else if (eid.includes("espresense") && !eid.includes("node")) {
-        type = "device";
-        added = addedDevices.has(entityId);
-      }
-
-      // Apply category filter
-      if (this._sidebarCategory === "bermuda" && !eid.includes("bermuda")) continue;
-      if (this._sidebarCategory === "proxies" && type !== "proxy") continue;
-      if (this._sidebarCategory === "devices" && type !== "device") continue;
-
       // Apply text filter
       if (this._sidebarFilter) {
         const search = this._sidebarFilter.toLowerCase();
-        if (!eid.includes(search) && !friendlyName.toLowerCase().includes(search)) {
+        if (!entityId.toLowerCase().includes(search) && !friendlyName.toLowerCase().includes(search)) {
           continue;
         }
       }
 
-      if (type !== "unknown" || this._sidebarCategory === "all") {
-        entities.push({ entity_id: entityId, friendly_name: friendlyName, area, state: stateVal, type, added });
+      const eid = entityId.toLowerCase();
+      let type: "proxy" | "device" | "unknown" = "unknown";
+      let added = false;
+
+      if (eid.startsWith("device_tracker.bermuda_")) {
+        type = "device";
+        added = addedDevices.has(entityId);
+      } else if (eid.includes("bermuda") || eid.includes("ble_proxy") || eid.includes("bluetooth_proxy")) {
+        type = "proxy";
+        added = addedProxies.has(entityId);
       }
+
+      entities.push({ entity_id: entityId, friendly_name: friendlyName, area, state: stateVal, type, added });
     }
 
-    // Sort: not-added first, then by type (proxy first), then by name
     entities.sort((a, b) => {
       if (a.added !== b.added) return a.added ? 1 : -1;
-      if (a.type !== b.type) return a.type === "proxy" ? -1 : 1;
+      if (a.type !== b.type) {
+        if (a.type === "proxy") return -1;
+        if (b.type === "proxy") return 1;
+        if (a.type === "device") return -1;
+        return 1;
+      }
       return a.friendly_name.localeCompare(b.friendly_name);
     });
 
@@ -429,6 +579,52 @@ export class BLELivemapPanel extends LitElement {
   private _getActiveFloor(): FloorConfig | null {
     const floors = this._getFloors();
     return floors[this._activeFloorIdx] || floors[0] || null;
+  }
+
+  private _addFloor(): void {
+    const floors = [...this._getFloors()];
+    const newId = `floor_${floors.length}`;
+    floors.push({
+      id: newId,
+      name: `Floor ${floors.length + 1}`,
+      image: "",
+      image_width: 20,
+      image_height: 15,
+    });
+    this._updateConfig("floors", floors);
+    this._activeFloorIdx = floors.length - 1;
+  }
+
+  private _removeFloor(idx: number): void {
+    const floors = [...this._getFloors()];
+    if (floors.length <= 1) return;
+    const removedId = floors[idx].id;
+    floors.splice(idx, 1);
+    this._updateConfig("floors", floors);
+
+    // Remove proxies and zones on this floor
+    const proxies = (this._config.proxies || []).filter((p) => p.floor_id !== removedId);
+    this._updateConfig("proxies", proxies);
+    const zones = (this._config.zones || []).filter((z) => z.floor_id !== removedId);
+    this._updateConfig("zones", zones);
+
+    if (this._activeFloorIdx >= floors.length) {
+      this._activeFloorIdx = floors.length - 1;
+    }
+  }
+
+  private _updateFloor(idx: number, key: string, value: any): void {
+    const floors = [...this._getFloors()];
+    if (!floors[idx]) return;
+    floors[idx] = { ...floors[idx], [key]: value };
+    this._updateConfig("floors", floors);
+
+    // Also update legacy fields for backwards compatibility
+    if (idx === 0) {
+      if (key === "image") this._updateConfig("floorplan_image", value);
+      if (key === "image_width") this._updateConfig("image_width", value);
+      if (key === "image_height") this._updateConfig("image_height", value);
+    }
   }
 
   // ─── Entity Actions ────────────────────────────────────────
@@ -475,7 +671,7 @@ export class BLELivemapPanel extends LitElement {
   private _handleEntityClick(entity: DiscoveredEntity): void {
     if (entity.added) return;
 
-    if (entity.type === "proxy") {
+    if (entity.type === "proxy" || (this._activeTab === "proxies" && this._sidebarCategory !== "devices")) {
       this._addEntityAsProxy(entity);
     } else {
       this._addEntityAsDevice(entity);
@@ -533,7 +729,6 @@ export class BLELivemapPanel extends LitElement {
         this._rectStart = { x, y };
         this._rectPreview = null;
       } else {
-        // Finish rectangle
         const p1 = this._rectStart;
         const p2 = { x, y };
         const points = [
@@ -552,7 +747,6 @@ export class BLELivemapPanel extends LitElement {
     // Polygon drawing mode
     if (this._drawingZone && this._drawingMode === "polygon") {
       const points = [...this._drawingPoints, { x, y }];
-      // Close polygon if clicking near first point
       if (points.length >= 3) {
         const dx = x - points[0].x;
         const dy = y - points[0].y;
@@ -588,7 +782,6 @@ export class BLELivemapPanel extends LitElement {
           return;
         }
       }
-      // Clicked outside all zones - deselect
       this._editingZoneIdx = null;
       this.requestUpdate();
       return;
@@ -599,9 +792,7 @@ export class BLELivemapPanel extends LitElement {
     for (let i = 0; i < proxies.length; i++) {
       const px = proxies[i].x;
       const py = proxies[i].y;
-      const dx = x - px;
-      const dy = y - py;
-      if (Math.sqrt(dx * dx + dy * dy) < 3) {
+      if (Math.abs(x - px) < 3 && Math.abs(y - py) < 3) {
         this._draggingProxy = i;
         return;
       }
@@ -614,49 +805,43 @@ export class BLELivemapPanel extends LitElement {
       const coords = this._getMapCoords(e);
       if (coords) {
         this._rectPreview = coords;
-        this.requestUpdate();
       }
-      return;
     }
 
     // Proxy dragging
-    if (this._draggingProxy === null) return;
-
-    const coords = this._getMapCoords(e);
-    if (!coords) return;
-
-    const proxies = [...(this._config.proxies || [])];
-    if (this._draggingProxy < proxies.length) {
-      proxies[this._draggingProxy] = { ...proxies[this._draggingProxy], x: coords.x, y: coords.y };
-      this._config = { ...this._config, proxies };
-      this.requestUpdate();
+    if (this._draggingProxy !== null) {
+      const coords = this._getMapCoords(e);
+      if (coords) {
+        const proxies = [...(this._config.proxies || [])];
+        if (proxies[this._draggingProxy]) {
+          proxies[this._draggingProxy] = { ...proxies[this._draggingProxy], x: coords.x, y: coords.y };
+          this._updateConfig("proxies", proxies);
+        }
+      }
     }
   }
 
   private _handleMapMouseUp(): void {
     if (this._draggingProxy !== null) {
-      this._saveConfigLocal();
       this._draggingProxy = null;
     }
   }
 
-  // ─── Point-in-polygon test ─────────────────────────────────
+  // ─── Zone Helpers ─────────────────────────────────────────
 
-  private _isPointInZone(px: number, py: number, zone: ZoneConfig): boolean {
-    const pts = zone.points;
-    if (!pts || pts.length < 3) return false;
+  private _isPointInZone(x: number, y: number, zone: ZoneConfig): boolean {
+    const points = zone.points || [];
+    if (points.length < 3) return false;
     let inside = false;
-    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-      const xi = pts[i].x, yi = pts[i].y;
-      const xj = pts[j].x, yj = pts[j].y;
-      if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const xi = points[i].x, yi = points[i].y;
+      const xj = points[j].x, yj = points[j].y;
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
         inside = !inside;
       }
     }
     return inside;
   }
-
-  // ─── Zone Drawing ──────────────────────────────────────────
 
   private _startDrawingZone(mode: "polygon" | "rectangle"): void {
     this._drawingZone = true;
@@ -667,22 +852,30 @@ export class BLELivemapPanel extends LitElement {
     this._editingZoneIdx = null;
   }
 
+  private _cancelDrawing(): void {
+    this._drawingZone = false;
+    this._drawingPoints = [];
+    this._rectStart = null;
+    this._rectPreview = null;
+  }
+
   private _finishZone(points?: { x: number; y: number }[]): void {
     const zonePoints = points || this._drawingPoints;
     if (zonePoints.length < 3) return;
 
     const zones = [...(this._config.zones || [])];
     const colorIdx = zones.length % ZONE_COLORS.length;
+    const floor = this._getActiveFloor();
 
     zones.push({
       id: `zone_${Date.now()}`,
-      name: `Zone ${zones.length + 1}`,
+      name: "",
       points: zonePoints,
       color: ZONE_COLORS[colorIdx],
       border_color: ZONE_COLORS[colorIdx],
       opacity: 0.3,
       show_label: true,
-      floor_id: this._getActiveFloor()?.id || "floor_0",
+      floor_id: floor?.id || "floor_0",
     });
 
     this._updateConfig("zones", zones);
@@ -690,15 +883,9 @@ export class BLELivemapPanel extends LitElement {
     this._drawingPoints = [];
     this._rectStart = null;
     this._rectPreview = null;
+
     // Auto-select the new zone for editing
     this._editingZoneIdx = zones.length - 1;
-  }
-
-  private _cancelDrawing(): void {
-    this._drawingZone = false;
-    this._drawingPoints = [];
-    this._rectStart = null;
-    this._rectPreview = null;
   }
 
   // ─── Calibration ───────────────────────────────────────────
@@ -731,20 +918,9 @@ export class BLELivemapPanel extends LitElement {
     const imageWidth = Math.round(img.naturalWidth * metersPerPixel * 100) / 100;
     const imageHeight = Math.round(img.naturalHeight * metersPerPixel * 100) / 100;
 
-    this._updateConfig("image_width", imageWidth);
-    this._updateConfig("image_height", imageHeight);
-
-    if (this._config.floors && this._config.floors.length > 0) {
-      const floors = [...this._config.floors];
-      if (floors[this._activeFloorIdx]) {
-        floors[this._activeFloorIdx] = {
-          ...floors[this._activeFloorIdx],
-          image_width: imageWidth,
-          image_height: imageHeight,
-        };
-        this._updateConfig("floors", floors);
-      }
-    }
+    // Update current floor
+    this._updateFloor(this._activeFloorIdx, "image_width", imageWidth);
+    this._updateFloor(this._activeFloorIdx, "image_height", imageHeight);
 
     this._calibrating = false;
     this._calibrationPoints = [];
@@ -761,15 +937,14 @@ export class BLELivemapPanel extends LitElement {
 
     for (let i = 0; i < proxies.length; i++) {
       const proxyName = (proxies[i].name || proxies[i].entity_id || "").toLowerCase();
-      // Extract meaningful parts from entity_id for matching
       const entityParts = proxies[i].entity_id.replace(/^.*\./, "").replace(/_/g, " ").toLowerCase().split(" ");
 
       for (const zone of zones) {
         const zoneName = (zone.name || "").toLowerCase();
         if (!zoneName) continue;
 
-        // Match if proxy name contains zone name, or zone name contains any entity part
         const matched = proxyName.includes(zoneName) ||
+          zoneName.split(" ").some((zp: string) => zp.length > 2 && proxyName.includes(zp)) ||
           entityParts.some((part: string) => part.length > 2 && zoneName.includes(part));
 
         if (matched) {
@@ -965,6 +1140,23 @@ export class BLELivemapPanel extends LitElement {
         padding: 4px 0;
       }
 
+      .sidebar-section-header {
+        padding: 10px 16px 4px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--text-secondary);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .sidebar-section-count {
+        font-weight: 400;
+        opacity: 0.7;
+      }
+
       .entity-item {
         display: flex;
         align-items: center;
@@ -1054,6 +1246,15 @@ export class BLELivemapPanel extends LitElement {
         flex-shrink: 0;
       }
 
+      .smart-help {
+        padding: 8px 16px;
+        font-size: 11px;
+        color: var(--text-secondary);
+        background: rgba(79, 195, 247, 0.05);
+        border-bottom: 1px solid var(--divider-color, rgba(0,0,0,0.06));
+        font-style: italic;
+      }
+
       /* ── Map Area ── */
       .map-area {
         flex: 1;
@@ -1069,6 +1270,34 @@ export class BLELivemapPanel extends LitElement {
         gap: 8px;
         margin-bottom: 12px;
         flex-wrap: wrap;
+      }
+
+      .floor-tabs {
+        display: flex;
+        gap: 4px;
+        margin-bottom: 12px;
+      }
+
+      .floor-tab {
+        padding: 6px 14px;
+        border-radius: 8px;
+        font-size: 12px;
+        font-weight: 500;
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.12));
+        background: none;
+        color: var(--text-secondary);
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+
+      .floor-tab.active {
+        background: var(--accent);
+        color: white;
+        border-color: var(--accent);
+      }
+
+      .floor-tab:hover:not(.active) {
+        background: var(--divider-color, rgba(0,0,0,0.05));
       }
 
       .map-wrapper {
@@ -1092,7 +1321,7 @@ export class BLELivemapPanel extends LitElement {
       .map-image {
         display: block;
         max-width: 100%;
-        max-height: calc(100vh - 220px);
+        max-height: calc(100vh - 260px);
         object-fit: contain;
         cursor: crosshair;
       }
@@ -1101,7 +1330,6 @@ export class BLELivemapPanel extends LitElement {
         cursor: grabbing;
       }
 
-      /* Map overlays */
       .map-overlay {
         position: absolute;
         top: 0;
@@ -1111,63 +1339,17 @@ export class BLELivemapPanel extends LitElement {
         pointer-events: none;
       }
 
-      .proxy-marker {
-        position: absolute;
-        width: 24px;
-        height: 24px;
-        border-radius: 50%;
-        background: #2196F3;
-        border: 2px solid white;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-        transform: translate(-50%, -50%);
-        cursor: grab;
-        pointer-events: auto;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 10px;
-        color: white;
-        font-weight: 700;
-        transition: transform 0.1s;
-        z-index: 10;
-      }
-
-      .proxy-marker:hover {
-        transform: translate(-50%, -50%) scale(1.2);
-        z-index: 20;
-      }
-
-      .proxy-marker.not-placed {
-        background: #9E9E9E;
-        opacity: 0.5;
-      }
-
-      .proxy-label {
-        position: absolute;
-        transform: translate(-50%, 4px);
-        font-size: 10px;
-        font-weight: 600;
-        color: var(--text-primary);
-        background: rgba(255,255,255,0.85);
-        padding: 1px 6px;
-        border-radius: 4px;
-        white-space: nowrap;
-        pointer-events: none;
-        z-index: 5;
-      }
-
-      /* Zone overlay */
+      /* Zone overlays */
       .zone-polygon {
         position: absolute;
         top: 0;
         left: 0;
         width: 100%;
         height: 100%;
-        pointer-events: none;
       }
 
       .zone-polygon.clickable {
-        pointer-events: auto;
+        pointer-events: all;
         cursor: pointer;
       }
 
@@ -1176,71 +1358,92 @@ export class BLELivemapPanel extends LitElement {
         transform: translate(-50%, -50%);
         font-size: 11px;
         font-weight: 600;
-        color: var(--text-primary);
-        background: rgba(255,255,255,0.8);
-        padding: 2px 8px;
-        border-radius: 6px;
+        color: rgba(255,255,255,0.9);
+        text-shadow: 0 1px 3px rgba(0,0,0,0.5);
         pointer-events: none;
-        z-index: 5;
+        white-space: nowrap;
       }
 
-      /* Drawing point */
+      /* Proxy markers */
+      .proxy-marker {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        background: #2196F3;
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        font-weight: 700;
+        cursor: grab;
+        pointer-events: all;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        transition: transform 0.1s;
+        z-index: 10;
+      }
+
+      .proxy-marker:hover {
+        transform: translate(-50%, -50%) scale(1.2);
+      }
+
+      .proxy-label {
+        position: absolute;
+        transform: translate(-50%, 0);
+        font-size: 10px;
+        color: var(--text-primary);
+        text-shadow: 0 0 3px var(--card-bg), 0 0 3px var(--card-bg);
+        white-space: nowrap;
+        pointer-events: none;
+        font-weight: 500;
+      }
+
+      /* Drawing points */
       .draw-point {
         position: absolute;
+        transform: translate(-50%, -50%);
         width: 10px;
         height: 10px;
         border-radius: 50%;
         background: #FF5722;
         border: 2px solid white;
-        transform: translate(-50%, -50%);
         pointer-events: none;
-        z-index: 15;
+        z-index: 20;
       }
 
-      /* Rectangle preview */
-      .rect-preview {
+      .rect-preview, .cal-line {
         position: absolute;
         top: 0;
         left: 0;
         width: 100%;
         height: 100%;
         pointer-events: none;
-        z-index: 14;
       }
 
-      /* Calibration points */
       .cal-point {
         position: absolute;
+        transform: translate(-50%, -50%);
         width: 12px;
         height: 12px;
         border-radius: 50%;
         background: #FF9800;
         border: 2px solid white;
-        transform: translate(-50%, -50%);
         pointer-events: none;
-        z-index: 15;
-      }
-
-      .cal-line {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 14;
+        z-index: 20;
       }
 
       /* Placement banner */
       .placement-banner {
-        background: rgba(79, 195, 247, 0.15);
+        background: rgba(79, 195, 247, 0.1);
         border: 1px solid var(--accent);
         border-radius: 8px;
         padding: 10px 16px;
+        margin-bottom: 12px;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 12px;
         font-size: 13px;
         color: var(--text-primary);
       }
@@ -1248,18 +1451,18 @@ export class BLELivemapPanel extends LitElement {
       /* Zone edit panel */
       .zone-edit-panel {
         background: var(--card-bg);
-        border: 1px solid var(--accent);
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.12));
         border-radius: 10px;
         padding: 14px;
         margin-bottom: 12px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
       }
 
       .zone-edit-panel h4 {
         margin: 0 0 10px;
         font-size: 14px;
         font-weight: 600;
-        color: var(--accent);
+        color: var(--text-primary);
       }
 
       .zone-edit-row {
@@ -1273,7 +1476,6 @@ export class BLELivemapPanel extends LitElement {
         font-size: 12px;
         color: var(--text-secondary);
         min-width: 80px;
-        flex-shrink: 0;
       }
 
       .zone-edit-row input[type="text"] {
@@ -1291,9 +1493,9 @@ export class BLELivemapPanel extends LitElement {
         width: 36px;
         height: 28px;
         padding: 2px;
-        cursor: pointer;
-        border: 1px solid var(--divider-color);
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.12));
         border-radius: 4px;
+        cursor: pointer;
       }
 
       .zone-edit-row input[type="range"] {
@@ -1591,6 +1793,58 @@ export class BLELivemapPanel extends LitElement {
   }
 
   private _renderEntitySidebar() {
+    const isSmart = this._sidebarCategory === "smart";
+
+    // In smart mode, show proxies and devices in separate sections
+    if (isSmart) {
+      const proxies = this._getSmartProxyList();
+      const devices = this._getSmartDeviceList();
+
+      return html`
+        <div class="entity-sidebar">
+          <div class="sidebar-header">
+            <div class="sidebar-title">${this._t("panel.sidebar_title")}</div>
+            <input
+              class="sidebar-filter"
+              type="text"
+              placeholder="${this._t("panel.filter")}"
+              .value=${this._sidebarFilter}
+              @input=${(e: Event) => { this._sidebarFilter = (e.target as HTMLInputElement).value; }}
+            />
+          </div>
+          <div class="sidebar-categories">
+            ${(["smart", "proxies", "devices", "all"] as const).map((cat) => html`
+              <button
+                class="cat-btn ${this._sidebarCategory === cat ? "active" : ""}"
+                @click=${() => { this._sidebarCategory = cat; }}
+              >${this._t(`panel.category_${cat}`)}</button>
+            `)}
+          </div>
+          <div class="smart-help">${this._t("panel.smart_help")}</div>
+          <div class="sidebar-list">
+            <!-- Proxy section -->
+            <div class="sidebar-section-header">
+              ${this._t("panel.proxy_section")}
+              <span class="sidebar-section-count">(${proxies.length} ${this._t("panel.scanner_count")})</span>
+            </div>
+            ${proxies.length === 0
+              ? html`<div style="padding:8px 16px;font-size:12px;color:var(--text-secondary);">No Bermuda proxies detected</div>`
+              : proxies.map((entity) => this._renderEntityItem(entity))}
+
+            <!-- Device section -->
+            <div class="sidebar-section-header" style="margin-top:8px;">
+              ${this._t("panel.device_section")}
+              <span class="sidebar-section-count">(${devices.length} ${this._t("panel.device_count")})</span>
+            </div>
+            ${devices.length === 0
+              ? html`<div style="padding:8px 16px;font-size:12px;color:var(--text-secondary);">No trackable devices found</div>`
+              : devices.map((entity) => this._renderEntityItem(entity))}
+          </div>
+        </div>
+      `;
+    }
+
+    // Non-smart modes
     const entities = this._discoverEntities();
 
     return html`
@@ -1606,7 +1860,7 @@ export class BLELivemapPanel extends LitElement {
           />
         </div>
         <div class="sidebar-categories">
-          ${(["bermuda", "proxies", "devices", "all"] as const).map((cat) => html`
+          ${(["smart", "proxies", "devices", "all"] as const).map((cat) => html`
             <button
               class="cat-btn ${this._sidebarCategory === cat ? "active" : ""}"
               @click=${() => { this._sidebarCategory = cat; }}
@@ -1616,33 +1870,50 @@ export class BLELivemapPanel extends LitElement {
         <div class="sidebar-list">
           ${entities.length === 0
             ? html`<div style="padding:20px;text-align:center;color:var(--text-secondary);font-size:13px;">${this._t("panel.no_entities")}</div>`
-            : entities.map((entity) => html`
-                <button
-                  class="entity-item ${entity.added ? "added" : ""} ${this._placingEntity?.entity_id === entity.entity_id ? "placing" : ""}"
-                  @click=${() => this._handleEntityClick(entity)}
-                >
-                  <span class="entity-type-badge badge-${entity.type}">${entity.type === "proxy" ? "P" : entity.type === "device" ? "D" : "?"}</span>
-                  <div class="entity-info">
-                    <div class="entity-name">${entity.friendly_name}</div>
-                    <div class="entity-id">${entity.entity_id}</div>
-                    ${entity.area ? html`<div class="entity-area">${entity.area}</div>` : nothing}
-                  </div>
-                  ${entity.added
-                    ? html`<span class="entity-check">\u2713</span>`
-                    : html`<span class="entity-status">${entity.state}</span>`}
-                </button>
-              `)}
+            : entities.map((entity) => this._renderEntityItem(entity))}
         </div>
       </div>
     `;
   }
 
+  private _renderEntityItem(entity: DiscoveredEntity) {
+    return html`
+      <button
+        class="entity-item ${entity.added ? "added" : ""} ${this._placingEntity?.entity_id === entity.entity_id ? "placing" : ""}"
+        @click=${() => this._handleEntityClick(entity)}
+      >
+        <span class="entity-type-badge badge-${entity.type}">${entity.type === "proxy" ? "P" : entity.type === "device" ? "D" : "?"}</span>
+        <div class="entity-info">
+          <div class="entity-name">${entity.friendly_name}</div>
+          <div class="entity-id">${entity.proxy_id || entity.entity_id}</div>
+          ${entity.area ? html`<div class="entity-area">${entity.area}</div>` : nothing}
+        </div>
+        ${entity.added
+          ? html`<span class="entity-check">\u2713</span>`
+          : html`<span class="entity-status">${entity.state}</span>`}
+      </button>
+    `;
+  }
+
   private _renderMapArea() {
+    const floors = this._getFloors();
     const floor = this._getActiveFloor();
     const hasImage = floor?.image;
 
     return html`
       <div class="map-area">
+        <!-- Floor tabs (if multiple floors) -->
+        ${floors.length > 1 ? html`
+          <div class="floor-tabs">
+            ${floors.map((f, idx) => html`
+              <button
+                class="floor-tab ${this._activeFloorIdx === idx ? "active" : ""}"
+                @click=${() => { this._activeFloorIdx = idx; this._mapImageLoaded = false; }}
+              >${f.name || `Floor ${idx + 1}`}</button>
+            `)}
+          </div>
+        ` : nothing}
+
         <!-- Placement banner -->
         ${this._placingEntity ? html`
           <div class="placement-banner">
@@ -1699,7 +1970,21 @@ export class BLELivemapPanel extends LitElement {
                   type="text"
                   placeholder="/local/floorplan.png"
                   .value=${this._config.floorplan_image || ""}
-                  @change=${(e: Event) => this._updateConfig("floorplan_image", (e.target as HTMLInputElement).value)}
+                  @change=${(e: Event) => {
+                    const val = (e.target as HTMLInputElement).value;
+                    this._updateConfig("floorplan_image", val);
+                    // Also create first floor entry
+                    const floors = this._getFloors();
+                    if (floors.length === 0) {
+                      this._updateConfig("floors", [{
+                        id: "floor_0",
+                        name: "Floor 1",
+                        image: val,
+                        image_width: 20,
+                        image_height: 15,
+                      }]);
+                    }
+                  }}
                 />
               </div>
             </div>
@@ -1711,16 +1996,27 @@ export class BLELivemapPanel extends LitElement {
 
   private _renderMapToolbar() {
     const floor = this._getActiveFloor();
+    const floors = this._getFloors();
+
     return html`
       <div class="map-toolbar">
+        <div class="config-row" style="margin-bottom:0;">
+          <label>${this._t("panel.floor_name")}</label>
+          <input
+            type="text"
+            .value=${floor?.name || ""}
+            @change=${(e: Event) => this._updateFloor(this._activeFloorIdx, "name", (e.target as HTMLInputElement).value)}
+            style="max-width:150px;"
+          />
+        </div>
         <div class="config-row" style="margin-bottom:0;">
           <label>${this._t("panel.floor_image")}</label>
           <input
             type="text"
             placeholder="/local/floorplan.png"
-            .value=${floor?.image || this._config.floorplan_image || ""}
-            @change=${(e: Event) => this._updateConfig("floorplan_image", (e.target as HTMLInputElement).value)}
-            style="max-width:300px;"
+            .value=${floor?.image || ""}
+            @change=${(e: Event) => this._updateFloor(this._activeFloorIdx, "image", (e.target as HTMLInputElement).value)}
+            style="max-width:250px;"
           />
         </div>
         ${this._calibrating ? html`
@@ -1742,12 +2038,20 @@ export class BLELivemapPanel extends LitElement {
         `}
         <div class="config-row" style="margin-bottom:0;">
           <label>${this._t("panel.width_m")}</label>
-          <input type="number" step="0.1" .value=${String(this._config.image_width || "")} @change=${(e: Event) => this._updateConfig("image_width", parseFloat((e.target as HTMLInputElement).value))} style="width:80px;" />
+          <input type="number" step="0.1" .value=${String(floor?.image_width || "")} @change=${(e: Event) => this._updateFloor(this._activeFloorIdx, "image_width", parseFloat((e.target as HTMLInputElement).value))} style="width:80px;" />
         </div>
         <div class="config-row" style="margin-bottom:0;">
           <label>${this._t("panel.height_m")}</label>
-          <input type="number" step="0.1" .value=${String(this._config.image_height || "")} @change=${(e: Event) => this._updateConfig("image_height", parseFloat((e.target as HTMLInputElement).value))} style="width:80px;" />
+          <input type="number" step="0.1" .value=${String(floor?.image_height || "")} @change=${(e: Event) => this._updateFloor(this._activeFloorIdx, "image_height", parseFloat((e.target as HTMLInputElement).value))} style="width:80px;" />
         </div>
+        <button class="btn btn-small btn-secondary" @click=${this._addFloor}>
+          ${this._t("panel.add_floor")}
+        </button>
+        ${floors.length > 1 ? html`
+          <button class="btn btn-small btn-danger" @click=${() => this._removeFloor(this._activeFloorIdx)}>
+            ${this._t("panel.remove_floor")}
+          </button>
+        ` : nothing}
       </div>
     `;
   }
@@ -1773,7 +2077,7 @@ export class BLELivemapPanel extends LitElement {
             </button>
           ` : html`
             <span style="font-size:12px;color:var(--text-secondary);">
-              ${this._rectStart ? "Click second corner to finish rectangle" : "Click first corner of rectangle"}
+              ${this._rectStart ? this._t("panel.zone_finish") : this._t("panel.calibrate_help")}
             </span>
           `}
           <button class="btn btn-small btn-secondary" @click=${this._cancelDrawing}>
@@ -1786,7 +2090,7 @@ export class BLELivemapPanel extends LitElement {
           <button class="btn btn-small btn-secondary" @click=${() => this._startDrawingZone("polygon")}>
             ${this._t("panel.zone_draw_polygon")}
           </button>
-          <span style="font-size:11px;color:var(--text-secondary);">Click on a zone to edit it</span>
+          <span style="font-size:11px;color:var(--text-secondary);">${this._t("panel.zone_edit")}</span>
         `}
       </div>
     `;
@@ -1849,8 +2153,13 @@ export class BLELivemapPanel extends LitElement {
 
   private _renderProxyMarkers() {
     const proxies = this._config.proxies || [];
+    const floor = this._getActiveFloor();
+
     return proxies.map((proxy, idx) => {
       if (!proxy.x && !proxy.y) return nothing;
+      // Only show proxies on the active floor
+      if (floor && proxy.floor_id && proxy.floor_id !== floor.id) return nothing;
+
       return html`
         <div
           class="proxy-marker"
@@ -1868,9 +2177,13 @@ export class BLELivemapPanel extends LitElement {
   private _renderZoneOverlays() {
     const zones = this._config.zones || [];
     const isZoneTab = this._activeTab === "zones";
+    const floor = this._getActiveFloor();
 
     return zones.map((zone, idx) => {
       if (!zone.points || zone.points.length < 3) return nothing;
+      // Only show zones on the active floor
+      if (floor && zone.floor_id && zone.floor_id !== floor.id) return nothing;
+
       const pointsStr = zone.points.map((p) => `${p.x}%,${p.y}%`).join(" ");
       const cx = zone.points.reduce((s, p) => s + p.x, 0) / zone.points.length;
       const cy = zone.points.reduce((s, p) => s + p.y, 0) / zone.points.length;
@@ -1919,7 +2232,6 @@ export class BLELivemapPanel extends LitElement {
   private _renderRectPreview() {
     if (!this._drawingZone || this._drawingMode !== "rectangle" || !this._rectStart) return nothing;
 
-    // Show start point
     const startHtml = html`<div class="draw-point" style="left: ${this._rectStart.x}%; top: ${this._rectStart.y}%;"></div>`;
 
     if (!this._rectPreview) return startHtml;
