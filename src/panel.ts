@@ -2024,7 +2024,6 @@ export class BLELivemapPanel extends LitElement {
         display: block;
         max-width: 100%;
         max-height: calc(100vh - 260px);
-        object-fit: contain;
         cursor: crosshair;
       }
 
@@ -3270,25 +3269,32 @@ export class BLELivemapPanel extends LitElement {
       const cx = zone.points.reduce((s, p) => s + p.x, 0) / zone.points.length;
       const cy = zone.points.reduce((s, p) => s + p.y, 0) / zone.points.length;
       const isEditing = this._editingZoneIdx === idx;
-      const opacity = zone.opacity || 0.5;
-      const highlightOpacity = isEditing ? Math.min(opacity + 0.2, 0.9) : opacity;
-      const zoneColor = zone.color || ZONE_COLORS[0];
+      const rawOpacity = zone.opacity ?? 0.5;
+      const opacity = Math.max(rawOpacity, 0.35);
+      const highlightOpacity = isEditing ? Math.min(opacity + 0.25, 0.9) : opacity;
+      // Use saturated fallback colors even for old zones with pastel colors
+      const zoneColor = zone.color || ZONE_COLORS[idx % ZONE_COLORS.length];
       const borderColor = isEditing ? "#ffffff" : (zone.border_color || zoneColor);
 
       return html`
-        <svg class="zone-polygon ${isZoneTab ? "clickable" : ""}" viewBox="0 0 100 100" preserveAspectRatio="none"
-          @click=${isZoneTab ? () => { this._editingZoneIdx = idx; this.requestUpdate(); } : undefined}>
+        <svg class="zone-polygon clickable" viewBox="0 0 100 100" preserveAspectRatio="none"
+          @click=${(e: Event) => { e.stopPropagation(); this._editingZoneIdx = idx; this._activeTab = 'zones'; this.requestUpdate(); }}>
           <polygon
             points=${pointsStr}
             fill="${zoneColor}"
             fill-opacity="${highlightOpacity}"
             stroke="${borderColor}"
-            stroke-width="${isEditing ? "0.6" : "0.4"}"
-            stroke-dasharray="${isEditing ? "1,0.5" : "none"}"
+            stroke-width="${isEditing ? "0.8" : "0.5"}"
+            stroke-opacity="0.8"
+            stroke-dasharray="${isEditing ? "2,1" : "none"}"
           />
         </svg>
         ${zone.show_label !== false && zone.name ? html`
-          <div class="zone-label-overlay" style="left: ${cx}%; top: ${cy}%;">
+          <div class="zone-label-overlay"
+            style="left: ${cx}%; top: ${cy}%; pointer-events: all; cursor: pointer; border: ${isEditing ? '2px solid var(--accent, #2196F3)' : 'none'};"
+            @click=${(e: Event) => { e.stopPropagation(); this._editingZoneIdx = idx; this._activeTab = 'zones'; this.requestUpdate(); }}
+            title="Click to edit zone"
+          >
             ${zone.name}
           </div>
         ` : nothing}
