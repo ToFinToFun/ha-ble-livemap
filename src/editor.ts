@@ -32,6 +32,11 @@ export class BLELivemapCardEditor extends LitElement {
   @state() private _calibrating = false;
   @state() private _calibrationPoints: { x: number; y: number }[] = [];
   @state() private _calibrationMeters = 0;
+  @state() private _fullscreenEditor = false;
+  @state() private _entityFilter = "";
+  @state() private _deviceEntityFilter = "";
+  @state() private _showEntityDropdown: number | null = null;
+  @state() private _showDeviceEntityDropdown: number | null = null;
 
   private _lang = "en";
 
@@ -55,6 +60,77 @@ export class BLELivemapCardEditor extends LitElement {
   private _updateConfig(key: string, value: any): void {
     this._config = { ...this._config, [key]: value };
     this._fireConfigChanged();
+  }
+
+  // ─── Entity Discovery ─────────────────────────────────────
+
+  private _getAvailableEntities(filter: string, type: "proxy" | "device"): { entity_id: string; name: string }[] {
+    if (!this.hass?.states) return [];
+
+    const entities = Object.keys(this.hass.states)
+      .filter((eid) => {
+        if (type === "proxy") {
+          // BLE proxies are typically esphome bluetooth_proxy or esp32_ble_tracker entities
+          // Also match common proxy patterns
+          return (
+            eid.includes("bluetooth") ||
+            eid.includes("ble") ||
+            eid.includes("proxy") ||
+            eid.includes("esp") ||
+            eid.startsWith("sensor.") ||
+            eid.startsWith("binary_sensor.")
+          );
+        } else {
+          // Bermuda tracked devices
+          return (
+            eid.includes("bermuda") ||
+            eid.includes("ble") ||
+            eid.startsWith("sensor.") ||
+            eid.startsWith("device_tracker.")
+          );
+        }
+      })
+      .filter((eid) => {
+        if (!filter) return true;
+        const lf = filter.toLowerCase();
+        const name = this.hass.states[eid]?.attributes?.friendly_name || "";
+        return eid.toLowerCase().includes(lf) || name.toLowerCase().includes(lf);
+      })
+      .slice(0, 50) // Limit results
+      .map((eid) => ({
+        entity_id: eid,
+        name: this.hass.states[eid]?.attributes?.friendly_name || eid,
+      }));
+
+    return entities;
+  }
+
+  private _getBermudaDevicePrefixes(): { prefix: string; name: string }[] {
+    if (!this.hass?.states) return [];
+
+    // Find all bermuda-related entities and extract unique prefixes
+    const prefixes = new Map<string, string>();
+
+    Object.keys(this.hass.states)
+      .filter((eid) => eid.includes("bermuda"))
+      .forEach((eid) => {
+        // Extract prefix: sensor.bermuda_xxx_distance -> sensor.bermuda_xxx
+        const parts = eid.split("_");
+        // Try to find the device prefix by removing the last part (distance, area, etc.)
+        const lastPart = parts[parts.length - 1];
+        const suffixes = ["distance", "area", "rssi", "power", "scanner"];
+        if (suffixes.includes(lastPart)) {
+          const prefix = parts.slice(0, -1).join("_");
+          if (!prefixes.has(prefix)) {
+            const name = this.hass.states[eid]?.attributes?.friendly_name || prefix;
+            // Clean up the name
+            const cleanName = name.replace(/ (Distance|Area|RSSI|Power|Scanner)$/i, "");
+            prefixes.set(prefix, cleanName);
+          }
+        }
+      });
+
+    return Array.from(prefixes.entries()).map(([prefix, name]) => ({ prefix, name }));
   }
 
   // ─── Section: Floor Plan ───────────────────────────────────
@@ -96,7 +172,6 @@ export class BLELivemapCardEditor extends LitElement {
 
                 <div class="map-preview calibration-map" @click=${this._handleCalibrationMapClick}>
                   <img src=${floorplanImage} alt="Floor plan" />
-                  <!-- SVG overlay for calibration line -->
                   <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="none">
                     ${this._calibrationPoints.length >= 1
                       ? html`
@@ -188,7 +263,7 @@ export class BLELivemapCardEditor extends LitElement {
                               <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
                                 <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
                               </svg>
-                              ${this._t("editor.calibration_result")}: 
+                              ${this._t("editor.calibration_result")}:
                               <strong>${this._getCalibrationResult()}</strong>
                             </div>
                           `
@@ -199,7 +274,7 @@ export class BLELivemapCardEditor extends LitElement {
             `
           : nothing}
 
-        <!-- Manual dimensions (always visible as fallback / result) -->
+        <!-- Manual dimensions -->
         <div class="field">
           <label>${this._t("editor.real_dimensions")}</label>
           <div class="field-row">
@@ -298,12 +373,48 @@ export class BLELivemapCardEditor extends LitElement {
           (proxy, idx) => html`
             <div class="list-item">
               <div class="list-item-content">
-                <input
-                  type="text"
-                  .value=${proxy.entity_id}
-                  @input=${(e: Event) => this._updateProxy(idx, "entity_id", (e.target as HTMLInputElement).value)}
-                  placeholder="${this._t("editor.proxy_entity")}"
-                />
+                <div class="entity-picker">
+                  <input
+                    type="text"
+                    .value=${proxy.entity_id}
+                    @input=${(e: Event) => {
+                      const val = (e.target as HTMLInputElement).value;
+                      this._updateProxy(idx, "entity_id", val);
+                      this._entityFilter = val;
+                      this._showEntityDropdown = idx;
+                    }}
+                    @focus=${() => {
+                      this._entityFilter = proxy.entity_id || "";
+                      this._showEntityDropdown = idx;
+                    }}
+                    @blur=${() => setTimeout(() => { this._showEntityDropdown = null; }, 200)}
+                    placeholder="${this._t("editor.proxy_entity")}"
+                    autocomplete="off"
+                  />
+                  ${this._showEntityDropdown === idx
+                    ? html`
+                        <div class="entity-dropdown">
+                          ${this._getAvailableEntities(this._entityFilter, "proxy").map(
+                            (e) => html`
+                              <div
+                                class="entity-option"
+                                @mousedown=${() => {
+                                  this._updateProxy(idx, "entity_id", e.entity_id);
+                                  this._showEntityDropdown = null;
+                                }}
+                              >
+                                <span class="entity-id">${e.entity_id}</span>
+                                <span class="entity-name">${e.name}</span>
+                              </div>
+                            `
+                          )}
+                          ${this._getAvailableEntities(this._entityFilter, "proxy").length === 0
+                            ? html`<div class="entity-option empty">${this._t("editor.no_entities_found")}</div>`
+                            : nothing}
+                        </div>
+                      `
+                    : nothing}
+                </div>
                 <input
                   type="text"
                   .value=${proxy.name || ""}
@@ -350,7 +461,6 @@ export class BLELivemapCardEditor extends LitElement {
           ? html`
               <div class="map-preview zone-drawing" @click=${this._handleZoneMapClick}>
                 <img src=${floorplanImage} alt="Floor plan" />
-                <!-- Render existing zones as SVG overlay -->
                 <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="none">
                   ${zones.map(
                     (z, idx) => html`
@@ -362,6 +472,19 @@ export class BLELivemapCardEditor extends LitElement {
                         stroke-width="0.3"
                         stroke-dasharray="1,0.5"
                       />
+                      ${z.show_label !== false
+                        ? html`
+                            <text
+                              x="${this._getZoneCentroid(z.points).x}"
+                              y="${this._getZoneCentroid(z.points).y}"
+                              text-anchor="middle"
+                              dominant-baseline="central"
+                              font-size="2.5"
+                              fill="${z.border_color || z.color || ZONE_COLORS[idx % ZONE_COLORS.length]}"
+                              font-weight="600"
+                            >${z.name}</text>
+                          `
+                        : nothing}
                     `
                   )}
                   <!-- Drawing in progress -->
@@ -370,29 +493,18 @@ export class BLELivemapCardEditor extends LitElement {
                         <polyline
                           points="${this._drawingPoints.map((p) => `${p.x},${p.y}`).join(" ")}"
                           fill="none"
-                          stroke="#E57373"
+                          stroke="#4FC3F7"
                           stroke-width="0.3"
-                          stroke-dasharray="0.5,0.3"
+                          stroke-dasharray="0.5,0.5"
                         />
                         ${this._drawingPoints.map(
                           (p) => html`
-                            <circle cx="${p.x}" cy="${p.y}" r="0.6" fill="#E57373" />
+                            <circle cx="${p.x}" cy="${p.y}" r="0.5" fill="#4FC3F7" />
                           `
                         )}
                       `
                     : nothing}
                 </svg>
-                <!-- Zone labels -->
-                ${zones.map(
-                  (z, idx) => {
-                    const c = this._getZoneCentroid(z.points);
-                    return html`
-                      <div class="zone-label" style="left: ${c.x}%; top: ${c.y}%">
-                        ${z.name || `Zone ${idx + 1}`}
-                      </div>
-                    `;
-                  }
-                )}
                 ${this._drawingZone !== null
                   ? html`<div class="placing-hint">${this._t("editor.zone_draw_hint")}</div>`
                   : nothing}
@@ -407,7 +519,7 @@ export class BLELivemapCardEditor extends LitElement {
               <div class="list-item-content">
                 <input
                   type="text"
-                  .value=${zone.name || ""}
+                  .value=${zone.name}
                   @input=${(e: Event) => this._updateZone(idx, "name", (e.target as HTMLInputElement).value)}
                   placeholder="${this._t("editor.zone_name")}"
                 />
@@ -424,6 +536,7 @@ export class BLELivemapCardEditor extends LitElement {
                     @input=${(e: Event) => this._updateZone(idx, "border_color", (e.target as HTMLInputElement).value)}
                     title="${this._t("editor.zone_border_color")}"
                   />
+                  <span class="label-sm">${zone.points.length} ${this._t("editor.zone_points")}</span>
                   <label class="checkbox">
                     <input
                       type="checkbox"
@@ -432,10 +545,9 @@ export class BLELivemapCardEditor extends LitElement {
                     />
                     ${this._t("editor.zone_show_label")}
                   </label>
-                  <span class="label-sm">${zone.points.length} ${this._t("editor.zone_points")}</span>
                 </div>
-                <div class="field">
-                  <label>${this._t("editor.zone_opacity")}</label>
+                <div class="field-row">
+                  <span class="label-sm">${this._t("editor.zone_opacity")}</span>
                   <input
                     type="range"
                     min="0"
@@ -477,22 +589,90 @@ export class BLELivemapCardEditor extends LitElement {
 
   private _renderDevicesSection() {
     const devices = this._config.tracked_devices || [];
+    const bermudaPrefixes = this._getBermudaDevicePrefixes();
 
     return html`
       <div class="section">
         <div class="section-title">${this._t("editor.devices")}</div>
+
+        ${bermudaPrefixes.length > 0
+          ? html`
+              <div class="discovered-devices">
+                <div class="label-sm" style="margin-bottom: 6px;">${this._t("editor.discovered_devices")}</div>
+                <div class="discovered-list">
+                  ${bermudaPrefixes
+                    .filter((bp) => !devices.some((d) => d.entity_prefix === bp.prefix))
+                    .map(
+                      (bp) => html`
+                        <button class="discovered-btn" @click=${() => this._addDeviceFromDiscovery(bp.prefix, bp.name)}>
+                          <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
+                            <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+                          </svg>
+                          ${bp.name}
+                        </button>
+                      `
+                    )}
+                </div>
+              </div>
+            `
+          : nothing}
 
         ${devices.map(
           (device, idx) => html`
             <div class="list-item">
               <div class="device-color-dot" style="background: ${device.color || DEVICE_COLORS[idx % DEVICE_COLORS.length]}"></div>
               <div class="list-item-content">
-                <input
-                  type="text"
-                  .value=${device.entity_prefix || ""}
-                  @input=${(e: Event) => this._updateDevice(idx, "entity_prefix", (e.target as HTMLInputElement).value)}
-                  placeholder="${this._t("editor.device_entity")}"
-                />
+                <div class="entity-picker">
+                  <input
+                    type="text"
+                    .value=${device.entity_prefix || ""}
+                    @input=${(e: Event) => {
+                      const val = (e.target as HTMLInputElement).value;
+                      this._updateDevice(idx, "entity_prefix", val);
+                      this._deviceEntityFilter = val;
+                      this._showDeviceEntityDropdown = idx;
+                    }}
+                    @focus=${() => {
+                      this._deviceEntityFilter = device.entity_prefix || "";
+                      this._showDeviceEntityDropdown = idx;
+                    }}
+                    @blur=${() => setTimeout(() => { this._showDeviceEntityDropdown = null; }, 200)}
+                    placeholder="${this._t("editor.device_entity")}"
+                    autocomplete="off"
+                  />
+                  ${this._showDeviceEntityDropdown === idx
+                    ? html`
+                        <div class="entity-dropdown">
+                          ${bermudaPrefixes
+                            .filter((bp) => {
+                              if (!this._deviceEntityFilter) return true;
+                              const lf = this._deviceEntityFilter.toLowerCase();
+                              return bp.prefix.toLowerCase().includes(lf) || bp.name.toLowerCase().includes(lf);
+                            })
+                            .map(
+                              (bp) => html`
+                                <div
+                                  class="entity-option"
+                                  @mousedown=${() => {
+                                    this._updateDevice(idx, "entity_prefix", bp.prefix);
+                                    if (!device.name || device.name.startsWith("Device ")) {
+                                      this._updateDevice(idx, "name", bp.name);
+                                    }
+                                    this._showDeviceEntityDropdown = null;
+                                  }}
+                                >
+                                  <span class="entity-id">${bp.prefix}</span>
+                                  <span class="entity-name">${bp.name}</span>
+                                </div>
+                              `
+                            )}
+                          ${bermudaPrefixes.length === 0
+                            ? html`<div class="entity-option empty">${this._t("editor.no_bermuda_devices")}</div>`
+                            : nothing}
+                        </div>
+                      `
+                    : nothing}
+                </div>
                 <input
                   type="text"
                   .value=${device.name}
@@ -586,6 +766,25 @@ export class BLELivemapCardEditor extends LitElement {
             <option value="light" ?selected=${this._config.theme_mode === "light"}>${this._t("editor.theme_light")}</option>
           </select>
         </div>
+
+        <div class="field">
+          <label>${this._t("editor.floor_display")}</label>
+          <select
+            @change=${(e: Event) => this._updateConfig("floor_display_mode", (e.target as HTMLSelectElement).value)}
+          >
+            <option value="tabs" ?selected=${this._config.floor_display_mode === "tabs"}>${this._t("editor.floor_display_tabs")}</option>
+            <option value="stacked" ?selected=${this._config.floor_display_mode === "stacked"}>${this._t("editor.floor_display_stacked")}</option>
+          </select>
+        </div>
+
+        <label class="checkbox">
+          <input
+            type="checkbox"
+            .checked=${this._config.auto_fit !== false}
+            @change=${(e: Event) => this._updateConfig("auto_fit", (e.target as HTMLInputElement).checked)}
+          />
+          ${this._t("editor.auto_fit")}
+        </label>
 
         <label class="checkbox">
           <input
@@ -765,6 +964,20 @@ export class BLELivemapCardEditor extends LitElement {
     this._updateConfig("tracked_devices", devices);
   }
 
+  private _addDeviceFromDiscovery(prefix: string, name: string): void {
+    const devices = [...(this._config.tracked_devices || [])];
+    const idx = devices.length;
+    devices.push({
+      entity_prefix: prefix,
+      name: name,
+      color: DEVICE_COLORS[idx % DEVICE_COLORS.length],
+      icon: "phone",
+      show_trail: true,
+      show_label: true,
+    });
+    this._updateConfig("tracked_devices", devices);
+  }
+
   private _removeDevice(idx: number): void {
     const devices = [...(this._config.tracked_devices || [])];
     devices.splice(idx, 1);
@@ -814,7 +1027,7 @@ export class BLELivemapCardEditor extends LitElement {
   private _startDrawingZone(idx: number): void {
     this._drawingZone = idx;
     this._drawingPoints = [];
-    this._placingProxy = null; // cancel any proxy placement
+    this._placingProxy = null;
   }
 
   private _finishDrawingZone(): void {
@@ -841,15 +1054,13 @@ export class BLELivemapCardEditor extends LitElement {
     return { x: cx / points.length, y: cy / points.length };
   }
 
-  // ─── Calibration ────────────────────────────────────
+  // ─── Calibration ────────────────────────────────────────────
 
   private _toggleCalibration(): void {
     if (this._calibrating) {
-      // Cancel
       this._calibrating = false;
       this._calibrationPoints = [];
     } else {
-      // Start
       this._calibrating = true;
       this._calibrationPoints = [];
       this._calibrationMeters = 0;
@@ -879,7 +1090,7 @@ export class BLELivemapCardEditor extends LitElement {
     this._calibrationPoints = [...this._calibrationPoints, point];
 
     if (this._calibrationPoints.length === 2) {
-      this._calibrating = false; // Done clicking
+      this._calibrating = false;
     }
 
     this.requestUpdate();
@@ -894,34 +1105,16 @@ export class BLELivemapCardEditor extends LitElement {
 
     const p1 = this._calibrationPoints[0];
     const p2 = this._calibrationPoints[1];
-
-    // Calculate pixel distance in percentage units
     const dx = p2.x - p1.x;
     const dy = p2.y - p1.y;
     const distPercent = Math.sqrt(dx * dx + dy * dy);
 
-    if (distPercent < 0.5) return; // Too short to calibrate
+    if (distPercent < 0.5) return;
 
-    // We need to account for image aspect ratio.
-    // The % coords are relative to image dimensions.
-    // We need the image's natural aspect ratio to convert % to real proportions.
     const img = this.shadowRoot?.querySelector(".calibration-map img") as HTMLImageElement;
     if (!img || !img.naturalWidth || !img.naturalHeight) return;
 
     const aspectRatio = img.naturalWidth / img.naturalHeight;
-
-    // Convert % to proportional units (accounting for aspect ratio)
-    // dx% of width = dx/100 * realWidth
-    // dy% of height = dy/100 * realHeight
-    // realWidth / realHeight = aspectRatio
-    // So: realHeight = realWidth / aspectRatio
-    //
-    // pixelDist = sqrt((dx/100 * W)^2 + (dy/100 * H)^2) = knownMeters
-    // W = H * aspectRatio
-    // pixelDist = sqrt((dx/100 * H * ar)^2 + (dy/100 * H)^2) = knownMeters
-    // H * sqrt((dx/100 * ar)^2 + (dy/100)^2) = knownMeters
-    // H = knownMeters / sqrt((dx/100 * ar)^2 + (dy/100)^2)
-
     const dxNorm = dx / 100 * aspectRatio;
     const dyNorm = dy / 100;
     const normDist = Math.sqrt(dxNorm * dxNorm + dyNorm * dyNorm);
@@ -929,18 +1122,14 @@ export class BLELivemapCardEditor extends LitElement {
     const realHeight = this._calibrationMeters / normDist;
     const realWidth = realHeight * aspectRatio;
 
-    // Round to 1 decimal
     const roundedWidth = Math.round(realWidth * 10) / 10;
     const roundedHeight = Math.round(realHeight * 10) / 10;
 
-    // Apply to config
     const floors = [...(this._config.floors || [])];
     if (floors.length > 0) {
       floors[0] = { ...floors[0], image_width: roundedWidth, image_height: roundedHeight };
       this._updateConfig("floors", floors);
     } else {
-      // For single-floor mode, store in a temporary floor or directly
-      // We need to create a floor to store dimensions
       this._config = {
         ...this._config,
         floors: [{
@@ -1007,12 +1196,10 @@ export class BLELivemapCardEditor extends LitElement {
     const point = { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };
     this._drawingPoints = [...this._drawingPoints, point];
 
-    // Auto-close polygon if clicking near the first point (within 3%)
     if (this._drawingPoints.length >= 3) {
       const first = this._drawingPoints[0];
       const dist = Math.sqrt(Math.pow(point.x - first.x, 2) + Math.pow(point.y - first.y, 2));
       if (dist < 3) {
-        // Remove the last point (too close to first) and finish
         this._drawingPoints = this._drawingPoints.slice(0, -1);
         this._finishDrawingZone();
         return;
@@ -1020,6 +1207,12 @@ export class BLELivemapCardEditor extends LitElement {
     }
 
     this.requestUpdate();
+  }
+
+  // ─── Fullscreen Editor Toggle ─────────────────────────────
+
+  private _toggleFullscreenEditor(): void {
+    this._fullscreenEditor = !this._fullscreenEditor;
   }
 
   // ─── Styles ────────────────────────────────────────────────
@@ -1034,6 +1227,60 @@ export class BLELivemapCardEditor extends LitElement {
         --editor-text-secondary: var(--secondary-text-color, #727272);
         --editor-border: var(--divider-color, rgba(0,0,0,0.12));
         --editor-accent: var(--primary-color, #4FC3F7);
+      }
+
+      :host(.fullscreen-editor) {
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        z-index: 999 !important;
+        background: var(--editor-bg) !important;
+        overflow-y: auto !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        width: 100vw !important;
+        height: 100vh !important;
+      }
+
+      .editor-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 16px;
+        border-bottom: 1px solid var(--editor-border);
+      }
+
+      .editor-toolbar-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--editor-text);
+      }
+
+      .expand-btn {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 12px;
+        border: 1px solid var(--editor-border);
+        border-radius: 8px;
+        background: transparent;
+        color: var(--editor-text-secondary);
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+
+      .expand-btn:hover {
+        background: var(--editor-accent);
+        color: white;
+        border-color: var(--editor-accent);
+      }
+
+      .expand-btn svg {
+        width: 14px;
+        height: 14px;
       }
 
       .tabs {
@@ -1200,6 +1447,41 @@ export class BLELivemapCardEditor extends LitElement {
         color: var(--editor-text-secondary);
       }
 
+      .subsection {
+        margin-bottom: 16px;
+      }
+
+      .subsection-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--editor-text);
+      }
+
+      .add-btn {
+        padding: 6px 12px;
+        border: 1px dashed var(--editor-border);
+        border-radius: 8px;
+        background: transparent;
+        color: var(--editor-accent);
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+
+      .add-btn:hover {
+        border-color: var(--editor-accent);
+        background: rgba(79, 195, 247, 0.05);
+      }
+
+      .add-btn.full {
+        width: 100%;
+        text-align: center;
+      }
+
       .remove-btn {
         background: none;
         border: none;
@@ -1208,80 +1490,98 @@ export class BLELivemapCardEditor extends LitElement {
         padding: 4px;
         border-radius: 4px;
         display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: color 0.2s;
+        flex-shrink: 0;
         margin-top: 8px;
       }
 
       .remove-btn:hover {
         color: #E57373;
-        background: rgba(229, 115, 115, 0.1);
       }
 
-      .add-btn {
-        background: none;
-        border: 1px dashed var(--editor-border);
-        border-radius: 8px;
-        padding: 8px 16px;
-        font-size: 12px;
-        color: var(--editor-accent);
-        cursor: pointer;
-        transition: background 0.2s;
-      }
-
-      .add-btn:hover {
-        background: rgba(79, 195, 247, 0.05);
-      }
-
-      .add-btn.full {
-        width: 100%;
-        margin-top: 4px;
+      .remove-btn svg {
+        width: 16px;
+        height: 16px;
       }
 
       .place-btn {
-        background: var(--editor-accent);
-        color: white;
-        border: none;
-        border-radius: 4px;
-        padding: 3px 8px;
+        padding: 4px 10px;
+        border: 1px solid var(--editor-border);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--editor-text-secondary);
         font-size: 11px;
         cursor: pointer;
+        transition: all 0.2s;
+        white-space: nowrap;
+      }
+
+      .place-btn:hover {
+        border-color: var(--editor-accent);
+        color: var(--editor-accent);
       }
 
       .place-btn.active {
-        background: #E57373;
-        animation: blink 1s ease-in-out infinite;
-      }
-
-      @keyframes blink {
-        50% { opacity: 0.6; }
-      }
-
-      .subsection {
-        margin-top: 16px;
-      }
-
-      .subsection-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 8px;
-        font-size: 13px;
-        font-weight: 500;
-        color: var(--editor-text);
+        background: var(--editor-accent);
+        color: white;
+        border-color: var(--editor-accent);
       }
 
       .map-preview {
         position: relative;
-        width: 100%;
-        margin-bottom: 12px;
+        border: 1px solid var(--editor-border);
         border-radius: 8px;
         overflow: hidden;
+        margin-bottom: 12px;
         cursor: crosshair;
-        border: 1px solid var(--editor-border);
       }
 
       .map-preview img {
         width: 100%;
         display: block;
+        opacity: 0.7;
+      }
+
+      .proxy-marker {
+        position: absolute;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: var(--editor-accent);
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 9px;
+        font-weight: 700;
+        transform: translate(-50%, -50%);
+        border: 2px solid white;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        pointer-events: none;
+      }
+
+      .proxy-marker.placing {
+        animation: pulse 1s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%, 100% { transform: translate(-50%, -50%) scale(1); }
+        50% { transform: translate(-50%, -50%) scale(1.3); }
+      }
+
+      .placing-hint {
+        position: absolute;
+        bottom: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0,0,0,0.7);
+        color: white;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        z-index: 10;
       }
 
       .zone-overlay {
@@ -1291,54 +1591,6 @@ export class BLELivemapCardEditor extends LitElement {
         width: 100%;
         height: 100%;
         pointer-events: none;
-      }
-
-      .zone-label {
-        position: absolute;
-        transform: translate(-50%, -50%);
-        font-size: 10px;
-        font-weight: 500;
-        color: var(--editor-text);
-        background: rgba(255,255,255,0.7);
-        padding: 1px 6px;
-        border-radius: 4px;
-        pointer-events: none;
-        white-space: nowrap;
-      }
-
-      .proxy-marker {
-        position: absolute;
-        width: 16px;
-        height: 16px;
-        border-radius: 50%;
-        background: var(--editor-accent);
-        transform: translate(-50%, -50%);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 8px;
-        font-weight: bold;
-        color: white;
-        border: 2px solid white;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.3);
-      }
-
-      .proxy-marker.placing {
-        background: #E57373;
-        animation: blink 0.5s ease-in-out infinite;
-      }
-
-      .placing-hint {
-        position: absolute;
-        top: 8px;
-        left: 50%;
-        transform: translateX(-50%);
-        background: rgba(0,0,0,0.7);
-        color: white;
-        padding: 4px 12px;
-        border-radius: 12px;
-        font-size: 12px;
-        z-index: 10;
       }
 
       input[type="color"] {
@@ -1373,8 +1625,97 @@ export class BLELivemapCardEditor extends LitElement {
         transition: border-color 0.2s;
       }
 
-      .calibration-map:has(.placing-hint) {
-        border-color: #FF5722;
+      /* Entity picker dropdown */
+      .entity-picker {
+        position: relative;
+      }
+
+      .entity-dropdown {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        max-height: 200px;
+        overflow-y: auto;
+        background: var(--editor-bg, #fff);
+        border: 1px solid var(--editor-border);
+        border-radius: 0 0 8px 8px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        z-index: 100;
+      }
+
+      .entity-option {
+        padding: 8px 10px;
+        cursor: pointer;
+        transition: background 0.15s;
+        border-bottom: 1px solid var(--editor-border);
+      }
+
+      .entity-option:last-child {
+        border-bottom: none;
+      }
+
+      .entity-option:hover {
+        background: rgba(79, 195, 247, 0.08);
+      }
+
+      .entity-option.empty {
+        color: var(--editor-text-secondary);
+        font-style: italic;
+        cursor: default;
+      }
+
+      .entity-option .entity-id {
+        display: block;
+        font-size: 11px;
+        color: var(--editor-text);
+        font-family: monospace;
+      }
+
+      .entity-option .entity-name {
+        display: block;
+        font-size: 10px;
+        color: var(--editor-text-secondary);
+        margin-top: 1px;
+      }
+
+      /* Discovered devices */
+      .discovered-devices {
+        padding: 10px;
+        border: 1px solid rgba(76, 175, 80, 0.25);
+        border-radius: 8px;
+        background: rgba(76, 175, 80, 0.04);
+        margin-bottom: 12px;
+      }
+
+      .discovered-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .discovered-btn {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 10px;
+        border: 1px solid rgba(76, 175, 80, 0.3);
+        border-radius: 16px;
+        background: transparent;
+        color: #4CAF50;
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+
+      .discovered-btn:hover {
+        background: #4CAF50;
+        color: white;
+      }
+
+      .discovered-btn svg {
+        width: 14px;
+        height: 14px;
       }
     `;
   }
@@ -1384,6 +1725,13 @@ export class BLELivemapCardEditor extends LitElement {
 
     if (this.hass) {
       this._lang = this.hass.selectedLanguage || this.hass.language || "en";
+    }
+
+    // Toggle fullscreen class on host
+    if (this._fullscreenEditor) {
+      this.classList.add("fullscreen-editor");
+    } else {
+      this.classList.remove("fullscreen-editor");
     }
 
     const sections = [
@@ -1396,6 +1744,19 @@ export class BLELivemapCardEditor extends LitElement {
     ];
 
     return html`
+      <!-- Editor toolbar with expand button -->
+      <div class="editor-toolbar">
+        <span class="editor-toolbar-title">${this._t("editor.title")}</span>
+        <button class="expand-btn" @click=${this._toggleFullscreenEditor}>
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            ${this._fullscreenEditor
+              ? html`<path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>`
+              : html`<path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>`}
+          </svg>
+          ${this._fullscreenEditor ? this._t("editor.collapse_editor") : this._t("editor.expand_editor")}
+        </button>
+      </div>
+
       <div class="tabs">
         ${sections.map(
           (s) => html`

@@ -4,11 +4,11 @@
  *
  * Author: Jerry Paasovaara
  * License: MIT
- * Version: 1.0.0
+ * Version: 1.2.0
  */
 
 import { LitElement, html, css, PropertyValues, nothing, CSSResultGroup } from "lit";
-import { customElement, property, state, query } from "lit/decorators.js";
+import { customElement, property, state } from "lit/decorators.js";
 import {
   BLELivemapConfig,
   HomeAssistant,
@@ -17,6 +17,7 @@ import {
   ZoneConfig,
   ProxyDistance,
   DevicePosition,
+  FloorConfig,
   DEFAULT_CONFIG,
   DEVICE_COLORS,
 } from "./types";
@@ -33,7 +34,7 @@ import { localize } from "./localize/localize";
   name: "BLE LiveMap",
   description: "Real-time BLE device position tracking on your floor plan",
   preview: true,
-  documentationURL: "https://github.com/jerrypaasovaara/ha-ble-livemap",
+  documentationURL: "https://github.com/ToFinToFun/ha-ble-livemap",
 });
 
 console.info(
@@ -49,16 +50,15 @@ export class BLELivemapCard extends LitElement {
   @state() private _devices: DeviceState[] = [];
   @state() private _activeFloor: string | null = null;
   @state() private _isFullscreen = false;
-  @state() private _imageLoaded = false;
-  @state() private _imageError = false;
+  @state() private _imageLoaded: { [floorId: string]: boolean } = {};
+  @state() private _imageError: { [floorId: string]: boolean } = {};
   @state() private _showDevicePanel = false;
   @state() private _runtimeShowProxies: boolean | null = null;
   @state() private _runtimeShowZones: boolean | null = null;
   @state() private _runtimeShowZoneLabels: boolean | null = null;
 
-  @query("#livemap-canvas") private _canvas!: HTMLCanvasElement;
-  @query("#floorplan-img") private _image!: HTMLImageElement;
-
+  private _canvases: Map<string, HTMLCanvasElement> = new Map();
+  private _images: Map<string, HTMLImageElement> = new Map();
   private _historyStore: HistoryStore | null = null;
   private _animationFrame: number | null = null;
   private _updateTimer: number | null = null;
@@ -78,74 +78,64 @@ export class BLELivemapCard extends LitElement {
       floorplan_image: "",
       tracked_devices: [],
       proxies: [],
-      ...DEFAULT_CONFIG,
     };
   }
 
   setConfig(config: BLELivemapConfig): void {
-    if (!config) throw new Error("Invalid configuration");
-    this._config = { ...DEFAULT_CONFIG, ...config } as BLELivemapConfig;
+    this._config = { ...DEFAULT_CONFIG, ...config };
 
-    // Initialize history store
     if (this._config.history_enabled) {
       this._historyStore = new HistoryStore(
         this._config.history_retention || 60,
         this._config.history_trail_length || 50
       );
-      this._historyStore.init();
     }
 
-    // Set active floor
-    if (this._config.floors && this._config.floors.length > 0) {
-      this._activeFloor = this._config.active_floor || this._config.floors[0].id;
+    const floors = this._getFloors();
+    if (floors.length > 0 && !this._activeFloor) {
+      this._activeFloor = config.active_floor || floors[0].id;
     }
+  }
+
+  connectedCallback(): void {
+    super.connectedCallback();
+    this._startUpdateLoop();
+  }
+
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this._stopUpdateLoop();
+    this._stopRenderLoop();
+    this._resizeObserver?.disconnect();
+  }
+
+  protected firstUpdated(_changedProperties: PropertyValues): void {
+    super.firstUpdated(_changedProperties);
+    this._setupResizeObserver();
+    this._startRenderLoop();
+  }
+
+  protected updated(changedProperties: PropertyValues): void {
+    super.updated(changedProperties);
+
+    if (changedProperties.has("hass") && this.hass) {
+      this._lang = this.hass.selectedLanguage || this.hass.language || "en";
+    }
+
+    // Update canvas/image references after render
+    this._updateCanvasRefs();
   }
 
   getCardSize(): number {
     return 6;
   }
 
-  connectedCallback(): void {
-    super.connectedCallback();
-    this._startUpdateLoop();
-    this._setupResizeObserver();
-  }
-
-  disconnectedCallback(): void {
-    super.disconnectedCallback();
-    this._stopUpdateLoop();
-    if (this._animationFrame) {
-      cancelAnimationFrame(this._animationFrame);
-      this._animationFrame = null;
-    }
-    if (this._resizeObserver) {
-      this._resizeObserver.disconnect();
-      this._resizeObserver = null;
-    }
-  }
-
-  updated(changedProps: PropertyValues): void {
-    super.updated(changedProps);
-
-    if (changedProps.has("hass") && this.hass) {
-      this._lang = this.hass.selectedLanguage || this.hass.language || "en";
-    }
-
-    if (changedProps.has("_imageLoaded") && this._imageLoaded) {
-      this._resizeCanvas();
-      this._startRenderLoop();
-    }
-  }
-
-  // ─── Data Processing ───────────────────────────────────────
+  // ─── Data Update ───────────────────────────────────────────
 
   private _startUpdateLoop(): void {
     const interval = (this._config?.update_interval || 2) * 1000;
-    this._updateTimer = window.setInterval(() => {
-      this._updateDevicePositions();
-    }, interval);
-    // Initial update
-    this._updateDevicePositions();
+    this._updateTimer = window.setInterval(() => this._updateDevices(), interval);
+    this._updateDevices();
   }
 
   private _stopUpdateLoop(): void {
@@ -155,128 +145,111 @@ export class BLELivemapCard extends LitElement {
     }
   }
 
-  private _updateDevicePositions(): void {
-    if (!this.hass || !this._config) return;
+  private _updateDevices(): void {
+    if (!this.hass || !this._config?.tracked_devices) return;
 
-    const trackedDevices = this._config.tracked_devices || [];
+    const devices: DeviceState[] = [];
     const proxies = this._getAllProxies();
-    const newDevices: DeviceState[] = [];
 
-    // Build proxy position map
-    const proxyPositions = new Map<string, { x: number; y: number }>();
-    for (const proxy of proxies) {
-      proxyPositions.set(proxy.entity_id, { x: proxy.x, y: proxy.y });
-    }
-
-    // Get floor dimensions
-    const floor = this._getActiveFloor();
-    const realWidth = floor?.image_width || 20;
-    const realHeight = floor?.image_height || 15;
-
-    for (let i = 0; i < trackedDevices.length; i++) {
-      const deviceConfig = trackedDevices[i];
-      const deviceId = deviceConfig.bermuda_device_id || deviceConfig.entity_prefix || `device_${i}`;
-
-      // Collect distances from all proxies for this device
+    for (const deviceConfig of this._config.tracked_devices) {
       const distances = this._getDeviceDistances(deviceConfig, proxies);
-
-      // Calculate position via trilateration
-      let rawPosition = trilaterate(proxyPositions, distances, 100, 100, realWidth, realHeight);
-
-      // Smooth position
-      const prevPos = this._previousPositions.get(deviceId);
-      const smoothed = smoothPosition(
-        rawPosition
-          ? { x: rawPosition.x, y: rawPosition.y, accuracy: rawPosition.accuracy, confidence: rawPosition.confidence }
-          : null,
-        prevPos
-          ? { x: prevPos.x, y: prevPos.y, accuracy: prevPos.accuracy, confidence: prevPos.confidence }
-          : null,
-        0.25
-      );
-
       let position: DevicePosition | null = null;
-      if (smoothed) {
-        position = {
-          x: smoothed.x,
-          y: smoothed.y,
-          accuracy: smoothed.accuracy,
-          confidence: smoothed.confidence,
-          timestamp: Date.now(),
-          floor_id: this._activeFloor || undefined,
-        };
-        this._previousPositions.set(deviceId, position);
 
-        // Store history
-        if (this._historyStore && this._config.history_enabled) {
-          this._historyStore.addPoint(deviceId, {
-            x: position.x,
-            y: position.y,
-            timestamp: position.timestamp,
-            floor_id: position.floor_id,
-          });
+      if (distances.length >= 1) {
+        const proxyMap = new Map<string, { x: number; y: number }>();
+        for (const d of distances) {
+          const proxy = proxies.find((p) => p.entity_id === d.proxy_entity_id);
+          if (proxy) {
+            proxyMap.set(d.proxy_entity_id, { x: proxy.x, y: proxy.y });
+          }
+        }
+
+        if (proxyMap.size >= 1) {
+          const floor = this._getFloors()[0];
+          const imageWidth = floor?.image_width || 20;
+          const imageHeight = floor?.image_height || 15;
+          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight);
+
+          if (result) {
+            const prevKey = deviceConfig.entity_prefix || "";
+            const prevPos = this._previousPositions.get(prevKey);
+            const prevResult = prevPos
+              ? { x: prevPos.x, y: prevPos.y, accuracy: prevPos.accuracy, confidence: prevPos.confidence }
+              : null;
+            const smoothed = smoothPosition(result, prevResult, 0.3);
+
+            if (smoothed) {
+              position = {
+                x: smoothed.x,
+                y: smoothed.y,
+                accuracy: smoothed.accuracy,
+                confidence: smoothed.confidence,
+                timestamp: Date.now(),
+              };
+
+              this._previousPositions.set(prevKey, position);
+            }
+          }
         }
       }
 
-      // Get area from Bermuda sensor
-      const areaEntity = this._findEntity(deviceConfig, "area");
-      const area = areaEntity ? this.hass.states[areaEntity]?.state : null;
+      // Find nearest proxy
+      let nearestProxy: string | null = null;
+      if (distances.length > 0) {
+        const nearest = distances.reduce((a, b) => (a.distance < b.distance ? a : b));
+        const proxy = proxies.find((p) => p.entity_id === nearest.proxy_entity_id);
+        nearestProxy = proxy?.name || proxy?.entity_id || null;
+      }
 
-      // Get nearest proxy
-      const nearestEntity = this._findEntity(deviceConfig, "nearest");
-      const nearest = nearestEntity ? this.hass.states[nearestEntity]?.state : null;
+      // Get history
+      const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
+      let history = this._historyStore?.getTrail(deviceId) || [];
+      if (position && this._historyStore) {
+        this._historyStore.addPoint(deviceId, {
+          x: position.x,
+          y: position.y,
+          timestamp: position.timestamp,
+        });
+        history = this._historyStore.getTrail(deviceId);
+      }
 
-      // Get history trail
-      const trail = this._historyStore ? this._historyStore.getTrail(deviceId) : [];
-
-      newDevices.push({
+      devices.push({
         device_id: deviceId,
-        name: deviceConfig.name || `Device ${i + 1}`,
+        name: deviceConfig.name,
         position,
-        history: trail,
+        history,
         distances,
-        nearest_proxy: nearest,
-        area,
-        last_seen: position?.timestamp || 0,
-        config: {
-          ...deviceConfig,
-          color: deviceConfig.color || DEVICE_COLORS[i % DEVICE_COLORS.length],
-        },
+        nearest_proxy: nearestProxy,
+        area: null,
+        last_seen: position ? Date.now() : 0,
+        config: deviceConfig,
       });
     }
 
-    this._devices = newDevices;
-    cleanupAnimations(newDevices.map((d) => d.device_id));
+    this._devices = devices;
+    cleanupAnimations(devices.map((d) => d.device_id));
   }
 
   private _getDeviceDistances(deviceConfig: any, proxies: ProxyConfig[]): ProxyDistance[] {
+    if (!this.hass) return [];
+
+    const prefix = deviceConfig.entity_prefix;
     const distances: ProxyDistance[] = [];
-    if (!this.hass) return distances;
 
-    const prefix = deviceConfig.entity_prefix || "";
+    // Strategy 1: Individual distance sensors per proxy
+    if (prefix) {
+      for (const proxy of proxies) {
+        const proxyName = proxy.entity_id.replace(/^.*\./, "").replace(/_proxy$/, "");
+        const possibleEntities = [
+          `${prefix}_${proxyName}_distance`,
+          `${prefix}_distance_${proxyName}`,
+        ];
 
-    // Strategy 1: Look for individual distance sensors per proxy
-    // Bermuda creates sensors like: sensor.bermuda_<device>_<scanner>_distance
-    for (const proxy of proxies) {
-      // Try to find a distance entity for this device-proxy pair
-      const proxyShortId = proxy.entity_id.replace(/^sensor\./, "").replace(/_[^_]+$/, "");
-
-      // Search through all states for matching distance entities
-      for (const [entityId, state] of Object.entries(this.hass.states)) {
-        if (!entityId.startsWith("sensor.bermuda_")) continue;
-        if (!entityId.includes("distance")) continue;
-
-        // Check if this entity's attributes reference this proxy
-        const attrs = state.attributes || {};
-        if (
-          prefix &&
-          entityId.includes(prefix.replace("sensor.bermuda_", "")) &&
-          (attrs.scanner_name?.includes(proxy.name || "") ||
-            attrs.scanner_entity_id === proxy.entity_id ||
-            entityId.includes(proxyShortId))
-        ) {
-          const dist = parseFloat(state.state);
-          if (!isNaN(dist) && dist > 0) {
+        for (const entityId of possibleEntities) {
+          const state = this.hass.states[entityId];
+          if (state && !isNaN(parseFloat(state.state))) {
+            const dist = parseFloat(state.state);
+            const attrs = state.attributes || {};
             distances.push({
               proxy_entity_id: proxy.entity_id,
               distance: dist,
@@ -290,13 +263,11 @@ export class BLELivemapCard extends LitElement {
     }
 
     // Strategy 2: Use the main distance sensor attributes
-    // Bermuda main sensor often has scanner distances in attributes
     if (distances.length === 0 && prefix) {
       const mainEntity = `${prefix}_distance`;
       const mainState = this.hass.states[mainEntity];
       if (mainState) {
         const attrs = mainState.attributes || {};
-        // Check for scanner_distances attribute
         if (attrs.scanners) {
           for (const [scannerId, scannerData] of Object.entries(attrs.scanners as Record<string, any>)) {
             const matchingProxy = proxies.find(
@@ -315,8 +286,7 @@ export class BLELivemapCard extends LitElement {
       }
     }
 
-    // Strategy 3: Use bermuda.dump_devices service result if available
-    // This is handled via the device tracker entity attributes
+    // Strategy 3: Device tracker entity attributes
     if (distances.length === 0 && prefix) {
       const dtEntity = prefix.replace("sensor.bermuda_", "device_tracker.bermuda_");
       const dtState = this.hass.states[dtEntity];
@@ -346,18 +316,51 @@ export class BLELivemapCard extends LitElement {
 
   private _getAllProxies(): ProxyConfig[] {
     if (!this._config) return [];
-
-    // Combine floor-specific and global proxies
-    const floor = this._getActiveFloor();
-    const floorProxies = floor?.proxies || [];
     const globalProxies = this._config.proxies || [];
-
+    // In stacked mode, combine all floor proxies too
+    const floorProxies: ProxyConfig[] = [];
+    for (const floor of this._getFloors()) {
+      if (floor.proxies) {
+        floorProxies.push(...floor.proxies);
+      }
+    }
     return [...globalProxies, ...floorProxies];
   }
 
-  private _getActiveFloor() {
-    if (!this._config?.floors) return null;
-    return this._config.floors.find((f) => f.id === this._activeFloor) || this._config.floors[0] || null;
+  private _getProxiesForFloor(floorId: string): ProxyConfig[] {
+    if (!this._config) return [];
+    const globalProxies = (this._config.proxies || []).filter(
+      (p) => !p.floor_id || p.floor_id === floorId
+    );
+    const floor = this._getFloors().find((f) => f.id === floorId);
+    const floorProxies = floor?.proxies || [];
+    return [...globalProxies, ...floorProxies];
+  }
+
+  private _getZonesForFloor(floorId: string): ZoneConfig[] {
+    return (this._config.zones || []).filter(
+      (z) => !z.floor_id || z.floor_id === floorId
+    );
+  }
+
+  private _getFloors(): FloorConfig[] {
+    const floors = this._config?.floors || [];
+    // If no floors defined but floorplan_image exists, create a virtual floor
+    if (floors.length === 0 && this._config?.floorplan_image) {
+      return [{
+        id: "default",
+        name: "Floor 1",
+        image: this._config.floorplan_image,
+        image_width: 20,
+        image_height: 15,
+      }];
+    }
+    return floors;
+  }
+
+  private _getActiveFloor(): FloorConfig | null {
+    const floors = this._getFloors();
+    return floors.find((f) => f.id === this._activeFloor) || floors[0] || null;
   }
 
   private _getFloorplanImage(): string {
@@ -365,48 +368,104 @@ export class BLELivemapCard extends LitElement {
     return floor?.image || this._config?.floorplan_image || "";
   }
 
+  private _isStackedMode(): boolean {
+    return this._config?.floor_display_mode === "stacked" && this._getFloors().length > 1;
+  }
+
   // ─── Canvas Rendering ──────────────────────────────────────
+
+  private _updateCanvasRefs(): void {
+    const root = this.shadowRoot;
+    if (!root) return;
+
+    // Collect all canvas and image elements
+    const canvasElements = root.querySelectorAll<HTMLCanvasElement>("canvas[data-floor-id]");
+    const imgElements = root.querySelectorAll<HTMLImageElement>("img[data-floor-id]");
+
+    canvasElements.forEach((canvas) => {
+      const floorId = canvas.dataset.floorId || "";
+      this._canvases.set(floorId, canvas);
+    });
+
+    imgElements.forEach((img) => {
+      const floorId = img.dataset.floorId || "";
+      this._images.set(floorId, img);
+    });
+  }
 
   private _setupResizeObserver(): void {
     this._resizeObserver = new ResizeObserver(() => {
-      this._resizeCanvas();
+      this._resizeAllCanvases();
     });
-    const container = this.shadowRoot?.querySelector(".map-container");
-    if (container) {
-      this._resizeObserver.observe(container);
-    }
+    const containers = this.shadowRoot?.querySelectorAll(".map-container");
+    containers?.forEach((container) => {
+      this._resizeObserver!.observe(container);
+    });
   }
 
-  private _resizeCanvas(): void {
-    const canvas = this._canvas;
-    const image = this._image;
-    if (!canvas || !image) return;
+  private _resizeAllCanvases(): void {
+    for (const [floorId, canvas] of this._canvases.entries()) {
+      const image = this._images.get(floorId);
+      if (!canvas || !image) continue;
 
-    const container = canvas.parentElement;
-    if (!container) return;
+      const container = canvas.parentElement;
+      if (!container) continue;
 
-    const containerWidth = container.clientWidth;
-    const imgRatio = image.naturalWidth / image.naturalHeight;
-    const canvasWidth = containerWidth;
-    const canvasHeight = containerWidth / imgRatio;
+      const containerWidth = container.clientWidth;
+      if (containerWidth === 0 || !image.naturalWidth || !image.naturalHeight) continue;
 
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = canvasWidth * dpr;
-    canvas.height = canvasHeight * dpr;
-    canvas.style.width = `${canvasWidth}px`;
-    canvas.style.height = `${canvasHeight}px`;
+      const imgRatio = image.naturalWidth / image.naturalHeight;
+      const canvasWidth = containerWidth;
+      const canvasHeight = containerWidth / imgRatio;
+
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvasWidth * dpr;
+      canvas.height = canvasHeight * dpr;
+      canvas.style.width = `${canvasWidth}px`;
+      canvas.style.height = `${canvasHeight}px`;
+    }
   }
 
   private _startRenderLoop(): void {
     const renderFrame = () => {
-      this._renderCanvas();
+      this._renderAllCanvases();
       this._animationFrame = requestAnimationFrame(renderFrame);
     };
     this._animationFrame = requestAnimationFrame(renderFrame);
   }
 
-  private _renderCanvas(): void {
-    const canvas = this._canvas;
+  private _stopRenderLoop(): void {
+    if (this._animationFrame) {
+      cancelAnimationFrame(this._animationFrame);
+      this._animationFrame = null;
+    }
+  }
+
+  private _renderAllCanvases(): void {
+    const isDark = this._isDarkMode();
+    const effectiveConfig = {
+      ...this._config,
+      show_proxies: this._runtimeShowProxies ?? this._config.show_proxies,
+      show_zones: this._runtimeShowZones ?? this._config.show_zones,
+      show_zone_labels: this._runtimeShowZoneLabels ?? this._config.show_zone_labels,
+    };
+
+    if (this._isStackedMode()) {
+      // Render each floor's canvas
+      for (const floor of this._getFloors()) {
+        this._renderFloorCanvas(floor.id, effectiveConfig, isDark);
+      }
+    } else {
+      // Single floor mode
+      const activeFloor = this._getActiveFloor();
+      if (activeFloor) {
+        this._renderFloorCanvas(activeFloor.id, effectiveConfig, isDark);
+      }
+    }
+  }
+
+  private _renderFloorCanvas(floorId: string, config: any, isDark: boolean): void {
+    const canvas = this._canvases.get(floorId);
     if (!canvas) return;
 
     const ctx = canvas.getContext("2d");
@@ -416,25 +475,18 @@ export class BLELivemapCard extends LitElement {
     const width = canvas.width / dpr;
     const height = canvas.height / dpr;
 
-    const isDark = this._isDarkMode();
+    if (width === 0 || height === 0) return;
 
-    // Build effective config with runtime overrides
-    const effectiveConfig = {
-      ...this._config,
-      show_proxies: this._runtimeShowProxies ?? this._config.show_proxies,
-      show_zones: this._runtimeShowZones ?? this._config.show_zones,
-      show_zone_labels: this._runtimeShowZoneLabels ?? this._config.show_zone_labels,
-    };
-
-    const zones = this._config.zones || [];
+    const proxies = this._getProxiesForFloor(floorId);
+    const zones = this._getZonesForFloor(floorId);
 
     renderCanvas(
       { ctx, width, height, dpr, isDark },
       this._devices,
-      this._getAllProxies(),
+      proxies,
       zones,
-      effectiveConfig,
-      this._activeFloor
+      config,
+      floorId
     );
   }
 
@@ -446,14 +498,22 @@ export class BLELivemapCard extends LitElement {
 
   // ─── Event Handlers ────────────────────────────────────────
 
-  private _handleImageLoad(): void {
-    this._imageLoaded = true;
-    this._imageError = false;
+  private _handleImageLoad(floorId: string): void {
+    this._imageLoaded = { ...this._imageLoaded, [floorId]: true };
+    this._imageError = { ...this._imageError, [floorId]: false };
+    // Re-setup resize observer and resize canvases
+    requestAnimationFrame(() => {
+      this._updateCanvasRefs();
+      this._resizeAllCanvases();
+      // Re-observe new containers
+      this._resizeObserver?.disconnect();
+      this._setupResizeObserver();
+    });
   }
 
-  private _handleImageError(): void {
-    this._imageError = true;
-    this._imageLoaded = false;
+  private _handleImageError(floorId: string): void {
+    this._imageError = { ...this._imageError, [floorId]: true };
+    this._imageLoaded = { ...this._imageLoaded, [floorId]: false };
   }
 
   private _handleFloorChange(e: Event): void {
@@ -487,6 +547,35 @@ export class BLELivemapCard extends LitElement {
   private _toggleZoneLabels(): void {
     const current = this._runtimeShowZoneLabels ?? this._config.show_zone_labels ?? true;
     this._runtimeShowZoneLabels = !current;
+  }
+
+  // ─── Floor Rendering Helpers ───────────────────────────────
+
+  private _renderFloorMap(floor: FloorConfig) {
+    const loaded = this._imageLoaded[floor.id] || false;
+    const error = this._imageError[floor.id] || false;
+
+    return html`
+      <div class="map-container" data-floor-id="${floor.id}">
+        ${this._isStackedMode()
+          ? html`<div class="floor-label">${floor.name}</div>`
+          : nothing}
+        <img
+          data-floor-id="${floor.id}"
+          src=${floor.image}
+          @load=${() => this._handleImageLoad(floor.id)}
+          @error=${() => this._handleImageError(floor.id)}
+          alt="${floor.name}"
+          crossorigin="anonymous"
+        />
+        ${loaded
+          ? html`<canvas data-floor-id="${floor.id}"></canvas>`
+          : nothing}
+        ${error
+          ? html`<div class="empty-state"><p>Failed to load: ${floor.image}</p></div>`
+          : nothing}
+      </div>
+    `;
   }
 
   // ─── Rendering ─────────────────────────────────────────────
@@ -584,6 +673,11 @@ export class BLELivemapCard extends LitElement {
         outline: none;
       }
 
+      .maps-wrapper {
+        display: flex;
+        flex-direction: column;
+      }
+
       .map-container {
         position: relative;
         width: 100%;
@@ -603,6 +697,25 @@ export class BLELivemapCard extends LitElement {
         left: 0;
         width: 100%;
         pointer-events: none;
+      }
+
+      .floor-label {
+        position: absolute;
+        top: 8px;
+        left: 12px;
+        z-index: 5;
+        background: rgba(0,0,0,0.5);
+        color: white;
+        padding: 3px 10px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+      }
+
+      .floor-divider {
+        height: 2px;
+        background: var(--divider-color, rgba(0,0,0,0.08));
       }
 
       .status-bar {
@@ -720,11 +833,12 @@ export class BLELivemapCard extends LitElement {
   protected render() {
     if (!this._config) return nothing;
 
-    const floorplanImage = this._getFloorplanImage();
-    const floors = this._config.floors || [];
+    const floors = this._getFloors();
     const hasMultipleFloors = floors.length > 1;
+    const isStacked = this._isStackedMode();
     const title = this._config.card_title || "BLE LiveMap";
     const t = (key: string) => localize(key, this._lang);
+    const hasFloorplanImage = floors.some((f) => f.image);
 
     return html`
       <ha-card>
@@ -735,7 +849,7 @@ export class BLELivemapCard extends LitElement {
             ${title}
           </div>
           <div class="header-actions">
-            ${hasMultipleFloors
+            ${hasMultipleFloors && !isStacked
               ? html`
                   <select class="floor-select" @change=${this._handleFloorChange}>
                     ${floors.map(
@@ -789,24 +903,20 @@ export class BLELivemapCard extends LitElement {
           </div>
         </div>
 
-        <!-- Map -->
-        ${floorplanImage
+        <!-- Maps -->
+        ${hasFloorplanImage
           ? html`
-              <div class="map-container">
-                <img
-                  id="floorplan-img"
-                  src=${floorplanImage}
-                  @load=${this._handleImageLoad}
-                  @error=${this._handleImageError}
-                  alt="Floor plan"
-                  crossorigin="anonymous"
-                />
-                ${this._imageLoaded
-                  ? html`<canvas id="livemap-canvas"></canvas>`
-                  : nothing}
-                ${this._imageError
-                  ? html`<div class="empty-state"><p>Failed to load floor plan image</p></div>`
-                  : nothing}
+              <div class="maps-wrapper">
+                ${isStacked
+                  ? floors.map(
+                      (floor, idx) => html`
+                        ${idx > 0 ? html`<div class="floor-divider"></div>` : nothing}
+                        ${this._renderFloorMap(floor)}
+                      `
+                    )
+                  : this._getActiveFloor()
+                    ? this._renderFloorMap(this._getActiveFloor()!)
+                    : nothing}
               </div>
             `
           : html`

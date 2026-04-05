@@ -24,6 +24,8 @@ export interface BLELivemapConfig {
   card_title?: string;
   fullscreen_enabled?: boolean;
   active_floor?: string;
+  floor_display_mode?: "tabs" | "stacked"; // tabs = one at a time, stacked = all visible
+  auto_fit?: boolean; // auto-fit map to available space
 }
 
 export interface FloorConfig {
@@ -154,6 +156,8 @@ export const DEFAULT_CONFIG: Partial<BLELivemapConfig> = {
   show_accuracy_indicator: true,
   theme_mode: "auto",
   fullscreen_enabled: true,
+  floor_display_mode: "tabs",
+  auto_fit: true,
 };
 
 // Default zone colors
