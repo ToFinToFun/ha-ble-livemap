@@ -155,42 +155,106 @@ function getPolygonCentroid(points: { x: number; y: number }[]): { x: number; y:
   return { x: cx / points.length, y: cy / points.length };
 }
 
+// Gateway type icon characters for canvas rendering
+const GATEWAY_ICONS: Record<string, string> = {
+  stairway: "\u2191", // ↑ arrow
+  elevator: "\u25A0", // ■ square
+  door: "\u25C6",     // ◆ diamond
+  passage: "\u25CF",  // ● circle
+};
+
 /**
  * Draw a BLE proxy indicator on the map.
+ * Gateway proxies get a distinct visual treatment with colored ring and icon.
  */
 function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
   const { ctx, width, height, isDark } = rc;
   const x = (proxy.x / 100) * width;
   const y = (proxy.y / 100) * height;
   const radius = 6;
+  const isGateway = proxy.is_gateway === true;
+  const isCalibrated = proxy.calibration?.ref_rssi !== undefined;
 
-  // Outer ring
-  ctx.beginPath();
-  ctx.arc(x, y, radius + 2, 0, Math.PI * 2);
-  ctx.fillStyle = isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.05)";
-  ctx.fill();
+  if (isGateway) {
+    // Gateway proxy: larger, colored ring with gateway icon
+    const gwRadius = 9;
+    const gwColor = proxy.color || "#FF9800"; // Orange for gateways
 
-  // Inner dot
-  ctx.beginPath();
-  ctx.arc(x, y, radius, 0, Math.PI * 2);
-  const color = proxy.color || (isDark ? "#546E7A" : "#90A4AE");
-  ctx.fillStyle = color;
-  ctx.fill();
+    // Pulsing outer ring for gateways
+    const pulsePhase = (Date.now() % 4000) / 4000;
+    const pulseAlpha = 0.15 + Math.sin(pulsePhase * Math.PI * 2) * 0.1;
+    ctx.beginPath();
+    ctx.arc(x, y, gwRadius + 4, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255, 152, 0, ${pulseAlpha})`;
+    ctx.fill();
 
-  // Bluetooth icon (simplified)
-  ctx.fillStyle = "#fff";
-  ctx.font = `bold ${radius}px sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText("B", x, y);
+    // Outer ring
+    ctx.beginPath();
+    ctx.arc(x, y, gwRadius + 2, 0, Math.PI * 2);
+    ctx.strokeStyle = gwColor;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([3, 2]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Inner dot
+    ctx.beginPath();
+    ctx.arc(x, y, gwRadius, 0, Math.PI * 2);
+    ctx.fillStyle = gwColor;
+    ctx.fill();
+
+    // Gateway icon
+    const icon = GATEWAY_ICONS[proxy.gateway_type || "passage"] || "G";
+    ctx.fillStyle = "#fff";
+    ctx.font = `bold ${gwRadius}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(icon, x, y);
+  } else {
+    // Standard proxy rendering
+    // Outer ring
+    ctx.beginPath();
+    ctx.arc(x, y, radius + 2, 0, Math.PI * 2);
+    ctx.fillStyle = isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.05)";
+    ctx.fill();
+
+    // Inner dot
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    const color = proxy.color || (isDark ? "#546E7A" : "#90A4AE");
+    ctx.fillStyle = color;
+    ctx.fill();
+
+    // Bluetooth icon (simplified)
+    ctx.fillStyle = "#fff";
+    ctx.font = `bold ${radius}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("B", x, y);
+  }
+
+  // Calibration indicator: small green dot
+  if (isCalibrated) {
+    ctx.beginPath();
+    ctx.arc(x + (isGateway ? 9 : 6) + 1, y - (isGateway ? 9 : 6) - 1, 3, 0, Math.PI * 2);
+    ctx.fillStyle = "#4CAF50";
+    ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
 
   // Label
-  if (proxy.name) {
+  const labelText = proxy.name || "";
+  const gatewayLabel = isGateway ? ` [${proxy.gateway_type || "GW"}]` : "";
+  const fullLabel = labelText + gatewayLabel;
+
+  if (fullLabel) {
     ctx.font = `10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
     ctx.fillStyle = isDark ? "rgba(255,255,255,0.5)" : "rgba(0,0,0,0.4)";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    ctx.fillText(proxy.name, x, y + radius + 6);
+    ctx.fillText(fullLabel, x, y + (isGateway ? 13 : radius + 6));
   }
 }
 

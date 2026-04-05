@@ -28,6 +28,9 @@ export interface BLELivemapConfig {
   auto_fit?: boolean; // auto-fit map to available space
   image_width?: number; // real-world width in meters (for single floor)
   image_height?: number; // real-world height in meters (for single floor)
+  gateway_timeout?: number; // seconds a gateway detection remains valid (default: 30)
+  floor_override_timeout?: number; // seconds before soft floor override without gateway (default: 60)
+  floor_override_min_proxies?: number; // min proxies on new floor before soft override (default: 2)
 }
 
 export interface FloorConfig {
@@ -36,7 +39,19 @@ export interface FloorConfig {
   image: string; // URL or /local/ path to floor plan image
   image_width?: number; // real-world width in meters
   image_height?: number; // real-world height in meters
+  building_id?: string; // which building this floor belongs to (default: "default")
   proxies?: ProxyConfig[];
+}
+
+/** Gateway types for transition proxies */
+export type GatewayType = "stairway" | "elevator" | "door" | "passage";
+
+/** RSSI calibration data for a proxy */
+export interface ProxyCalibration {
+  ref_rssi: number; // RSSI measured at ref_distance (dBm, e.g. -62)
+  ref_distance: number; // distance in meters where ref_rssi was measured (default: 1.0)
+  attenuation?: number; // path-loss exponent (calculated, typically 2.0-4.0)
+  calibrated_at?: number; // timestamp of last calibration
 }
 
 export interface ProxyConfig {
@@ -47,6 +62,12 @@ export interface ProxyConfig {
   floor_id?: string;
   icon?: string;
   color?: string;
+  // Gateway properties
+  is_gateway?: boolean;
+  gateway_type?: GatewayType;
+  gateway_connects?: string[]; // floor_ids this gateway connects (e.g. ["floor_0", "floor_1"])
+  // RSSI calibration
+  calibration?: ProxyCalibration;
 }
 
 export interface ZoneConfig {
@@ -112,6 +133,7 @@ export interface DeviceState {
   area: string | null;
   last_seen: number;
   config: TrackedDeviceConfig;
+  current_floor_id?: string; // runtime: which floor the device is currently on
 }
 
 // Home Assistant types (minimal)
@@ -160,7 +182,18 @@ export const DEFAULT_CONFIG: Partial<BLELivemapConfig> = {
   fullscreen_enabled: true,
   floor_display_mode: "tabs",
   auto_fit: true,
+  gateway_timeout: 30,
+  floor_override_timeout: 60,
+  floor_override_min_proxies: 2,
 };
+
+// Gateway type labels and icons
+export const GATEWAY_TYPES: { value: GatewayType; label: string; icon: string }[] = [
+  { value: "stairway", label: "Stairway", icon: "🪜" },
+  { value: "elevator", label: "Elevator", icon: "🛗" },
+  { value: "door", label: "Door", icon: "🚪" },
+  { value: "passage", label: "Passage", icon: "🚶" },
+];
 
 // Default zone colors (soft pastels — clearly distinct from device colors)
 export const ZONE_COLORS = [

@@ -21,6 +21,9 @@ import {
   DEVICE_COLORS,
   DEVICE_ICONS,
   ZONE_COLORS,
+  GATEWAY_TYPES,
+  GatewayType,
+  ProxyCalibration,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
 import { localize } from "./localize/localize";
@@ -71,7 +74,21 @@ export class BLELivemapPanel extends LitElement {
   @state() private _mapImageLoaded = false;
   @state() private _editingZoneIdx: number | null = null;
 
+  // RSSI Calibration wizard state
+  @state() private _calibWizardActive = false;
+  @state() private _calibWizardProxyIdx: number | null = null;
+  @state() private _calibWizardDistance = 1.0;
+  @state() private _calibWizardRssi: number | null = null;
+  @state() private _calibWizardSamples: number[] = [];
+  private _calibWizardTimer: number | null = null;
+
   private _lang = "en";
+
+  // Device registry cache for BLE scanner discovery
+  private _deviceRegistryCache: any[] | null = null;
+  private _areaRegistryCache: Map<string, string> | null = null;
+  private _registryCacheStamp = 0;
+  private _registryLoadPromise: Promise<void> | null = null;
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -80,11 +97,56 @@ export class BLELivemapPanel extends LitElement {
     this._loadConfig();
   }
 
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    if (this._calibWizardTimer) {
+      clearInterval(this._calibWizardTimer);
+      this._calibWizardTimer = null;
+    }
+  }
+
   protected updated(changedProperties: PropertyValues): void {
     super.updated(changedProperties);
     if (changedProperties.has("hass") && this.hass) {
       this._lang = this.hass.selectedLanguage || this.hass.language || "en";
+      // Load device/area registry when hass becomes available
+      this._ensureRegistryLoaded();
     }
+  }
+
+  /**
+   * Load device and area registries from HA via WebSocket.
+   * Caches results for 5 minutes to avoid excessive calls.
+   */
+  private async _ensureRegistryLoaded(): Promise<void> {
+    if (!this.hass) return;
+    const now = Date.now();
+    // Cache for 5 minutes
+    if (this._deviceRegistryCache && (now - this._registryCacheStamp) < 300000) return;
+    if (this._registryLoadPromise) return;
+
+    this._registryLoadPromise = (async () => {
+      try {
+        // Load device registry
+        const devices = await this.hass.callWS({ type: "config/device_registry/list" });
+        this._deviceRegistryCache = devices as any[];
+
+        // Load area registry
+        const areas = await this.hass.callWS({ type: "config/area_registry/list" });
+        this._areaRegistryCache = new Map();
+        for (const area of areas as any[]) {
+          this._areaRegistryCache.set(area.area_id, area.name);
+        }
+
+        this._registryCacheStamp = now;
+      } catch (e) {
+        console.warn("[BLE LiveMap Panel] Failed to load registries:", e);
+      } finally {
+        this._registryLoadPromise = null;
+      }
+    })();
+
+    await this._registryLoadPromise;
   }
 
   // ─── Config Persistence ─────────────────────────────────────
@@ -259,6 +321,31 @@ export class BLELivemapPanel extends LitElement {
         "panel.device_section": "Trackable Devices",
         "panel.scanner_count": "scanners detected",
         "panel.device_count": "trackable devices",
+        "panel.gateway": "Gateway",
+        "panel.gateway_type": "Gateway type",
+        "panel.gateway_connects": "Connects floors",
+        "panel.gateway_stairway": "Stairway",
+        "panel.gateway_elevator": "Elevator",
+        "panel.gateway_door": "Door",
+        "panel.gateway_passage": "Passage",
+        "panel.calibrate_rssi": "Calibrate RSSI",
+        "panel.calibrate_rssi_help": "Walk to each proxy and record signal strength at a known distance",
+        "panel.calibrate_proxy": "Calibrate",
+        "panel.calibrate_stand": "Stand at the specified distance from",
+        "panel.calibrate_distance_label": "Distance (meters)",
+        "panel.calibrate_sampling": "Sampling RSSI...",
+        "panel.calibrate_confirm": "Confirm calibration",
+        "panel.calibrate_reset": "Reset calibration",
+        "panel.calibrate_done": "Done",
+        "panel.calibrate_rssi_value": "RSSI",
+        "panel.calibrate_samples": "samples",
+        "panel.calibrated": "Calibrated",
+        "panel.not_calibrated": "Not calibrated",
+        "panel.calibrate_saved": "Calibration saved!",
+        "panel.gateway_timeout": "Gateway detection timeout (s)",
+        "panel.floor_override_timeout": "Soft floor override timeout (s)",
+        "panel.floor_override_min_proxies": "Min proxies for floor override",
+        "panel.area": "Area",
       },
       sv: {
         "panel.title": "BLE LiveMap Inställningar",
@@ -344,6 +431,31 @@ export class BLELivemapPanel extends LitElement {
         "panel.device_section": "Spårbara enheter",
         "panel.scanner_count": "skannrar hittade",
         "panel.device_count": "spårbara enheter",
+        "panel.gateway": "Gateway",
+        "panel.gateway_type": "Gateway-typ",
+        "panel.gateway_connects": "Förbinder våningar",
+        "panel.gateway_stairway": "Trappa",
+        "panel.gateway_elevator": "Hiss",
+        "panel.gateway_door": "Dörr",
+        "panel.gateway_passage": "Passage",
+        "panel.calibrate_rssi": "Kalibrera RSSI",
+        "panel.calibrate_rssi_help": "Gå till varje proxy och registrera signalstyrka på känt avstånd",
+        "panel.calibrate_proxy": "Kalibrera",
+        "panel.calibrate_stand": "Stå på angivet avstånd från",
+        "panel.calibrate_distance_label": "Avstånd (meter)",
+        "panel.calibrate_sampling": "Samplar RSSI...",
+        "panel.calibrate_confirm": "Bekräfta kalibrering",
+        "panel.calibrate_reset": "Återställ kalibrering",
+        "panel.calibrate_done": "Klar",
+        "panel.calibrate_rssi_value": "RSSI",
+        "panel.calibrate_samples": "sampel",
+        "panel.calibrated": "Kalibrerad",
+        "panel.not_calibrated": "Ej kalibrerad",
+        "panel.calibrate_saved": "Kalibrering sparad!",
+        "panel.gateway_timeout": "Gateway-detektions-timeout (s)",
+        "panel.floor_override_timeout": "Mjuk våningsövergångs-timeout (s)",
+        "panel.floor_override_min_proxies": "Min proxies för våningsövergång",
+        "panel.area": "Område",
       },
     };
 
@@ -924,6 +1036,169 @@ export class BLELivemapPanel extends LitElement {
 
     this._calibrating = false;
     this._calibrationPoints = [];
+  }
+
+  // ─── RSSI Calibration Wizard ──────────────────────────────────
+
+  private _startCalibWizard(proxyIdx: number): void {
+    this._calibWizardActive = true;
+    this._calibWizardProxyIdx = proxyIdx;
+    this._calibWizardDistance = 1.0;
+    this._calibWizardRssi = null;
+    this._calibWizardSamples = [];
+
+    // Start sampling RSSI values
+    this._startRssiSampling(proxyIdx);
+  }
+
+  private _stopCalibWizard(): void {
+    this._calibWizardActive = false;
+    this._calibWizardProxyIdx = null;
+    this._calibWizardRssi = null;
+    this._calibWizardSamples = [];
+    if (this._calibWizardTimer) {
+      clearInterval(this._calibWizardTimer);
+      this._calibWizardTimer = null;
+    }
+  }
+
+  private _startRssiSampling(proxyIdx: number): void {
+    if (this._calibWizardTimer) clearInterval(this._calibWizardTimer);
+
+    this._calibWizardSamples = [];
+    this._calibWizardRssi = null;
+
+    // Sample RSSI every 2 seconds for 10 seconds (5 samples)
+    this._calibWizardTimer = window.setInterval(() => {
+      const rssi = this._getCurrentRssiForProxy(proxyIdx);
+      if (rssi !== null) {
+        this._calibWizardSamples = [...this._calibWizardSamples, rssi];
+        // Calculate running average
+        const avg = this._calibWizardSamples.reduce((a, b) => a + b, 0) / this._calibWizardSamples.length;
+        this._calibWizardRssi = Math.round(avg);
+      }
+    }, 2000);
+  }
+
+  /**
+   * Try to get current RSSI reading for a proxy from Bermuda sensors.
+   * Looks for any sensor.bermuda_*_distance_to_PROXYNAME and reads its rssi attribute.
+   */
+  private _getCurrentRssiForProxy(proxyIdx: number): number | null {
+    if (!this.hass?.states) return null;
+    const proxies = this._config.proxies || [];
+    const proxy = proxies[proxyIdx];
+    if (!proxy) return null;
+
+    // Extract proxy slug from entity_id
+    const proxySlug = proxy.entity_id.replace(/^bermuda_proxy_/, "").replace(/^.*\./, "");
+
+    // Search for any distance sensor that targets this proxy
+    for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
+      if (entityId.includes("_distance_to_") && entityId.includes(proxySlug)) {
+        const attrs = (stateObj as any)?.attributes;
+        if (attrs?.rssi !== undefined) {
+          return attrs.rssi;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private _confirmCalibration(): void {
+    if (this._calibWizardProxyIdx === null || this._calibWizardRssi === null) return;
+
+    const proxies = [...(this._config.proxies || [])];
+    const idx = this._calibWizardProxyIdx;
+    if (!proxies[idx]) return;
+
+    proxies[idx] = {
+      ...proxies[idx],
+      calibration: {
+        ref_rssi: this._calibWizardRssi,
+        ref_distance: this._calibWizardDistance,
+        calibrated_at: Date.now(),
+      },
+    };
+
+    this._updateConfig("proxies", proxies);
+    this._stopCalibWizard();
+
+    // Show success message
+    this._saveMessage = this._t("panel.calibrate_saved");
+    this._saving = true;
+    setTimeout(() => { this._saving = false; this._saveMessage = ""; }, 2000);
+  }
+
+  private _resetProxyCalibration(proxyIdx: number): void {
+    const proxies = [...(this._config.proxies || [])];
+    if (!proxies[proxyIdx]) return;
+
+    const { calibration, ...rest } = proxies[proxyIdx] as any;
+    proxies[proxyIdx] = rest;
+    this._updateConfig("proxies", proxies);
+  }
+
+  // ─── Gateway Config Helpers ─────────────────────────────────
+
+  private _toggleProxyGateway(proxyIdx: number): void {
+    const proxies = [...(this._config.proxies || [])];
+    if (!proxies[proxyIdx]) return;
+
+    const isGateway = !proxies[proxyIdx].is_gateway;
+    proxies[proxyIdx] = {
+      ...proxies[proxyIdx],
+      is_gateway: isGateway,
+      gateway_type: isGateway ? (proxies[proxyIdx].gateway_type || "stairway") : undefined,
+      gateway_connects: isGateway ? (proxies[proxyIdx].gateway_connects || []) : undefined,
+    };
+    this._updateConfig("proxies", proxies);
+  }
+
+  private _updateProxyGatewayType(proxyIdx: number, type: GatewayType): void {
+    const proxies = [...(this._config.proxies || [])];
+    if (!proxies[proxyIdx]) return;
+    proxies[proxyIdx] = { ...proxies[proxyIdx], gateway_type: type };
+    this._updateConfig("proxies", proxies);
+  }
+
+  private _updateProxyGatewayConnects(proxyIdx: number, floorIds: string[]): void {
+    const proxies = [...(this._config.proxies || [])];
+    if (!proxies[proxyIdx]) return;
+    proxies[proxyIdx] = { ...proxies[proxyIdx], gateway_connects: floorIds };
+    this._updateConfig("proxies", proxies);
+  }
+
+  private _toggleGatewayFloor(proxyIdx: number, floorId: string): void {
+    const proxies = this._config.proxies || [];
+    const proxy = proxies[proxyIdx];
+    if (!proxy) return;
+
+    const current = proxy.gateway_connects || [];
+    const newConnects = current.includes(floorId)
+      ? current.filter((f) => f !== floorId)
+      : [...current, floorId];
+    this._updateProxyGatewayConnects(proxyIdx, newConnects);
+  }
+
+  /**
+   * Get area name for a proxy from device registry.
+   */
+  private _getProxyAreaName(proxy: ProxyConfig): string {
+    if (!this._deviceRegistryCache || !this._areaRegistryCache) return "";
+
+    const proxySlug = proxy.entity_id.replace(/^bermuda_proxy_/, "").replace(/^.*\./, "").toLowerCase();
+
+    for (const device of this._deviceRegistryCache) {
+      const deviceName = (device.name || "").toLowerCase().replace(/[\s-]+/g, "_");
+      if (deviceName.includes(proxySlug) || proxySlug.includes(deviceName)) {
+        if (device.area_id && this._areaRegistryCache.has(device.area_id)) {
+          return this._areaRegistryCache.get(device.area_id) || "";
+        }
+      }
+    }
+    return "";
   }
 
   // ─── Auto-place ────────────────────────────────────────────
@@ -1707,6 +1982,50 @@ export class BLELivemapPanel extends LitElement {
         font-size: 14px;
       }
 
+      /* Calibration Wizard */
+      .calib-wizard-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+      }
+
+      .calib-wizard-card {
+        background: var(--card-bg);
+        border-radius: 16px;
+        padding: 24px;
+        max-width: 400px;
+        width: 90%;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+      }
+
+      .calib-wizard-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+
+      .calib-wizard-row label {
+        font-size: 13px;
+        color: var(--text-primary);
+        font-weight: 500;
+      }
+
+      .calib-wizard-rssi {
+        text-align: center;
+        padding: 16px;
+        background: var(--primary-background-color, #fafafa);
+        border-radius: 12px;
+        margin: 8px 0;
+      }
+
       /* Responsive */
       @media (max-width: 900px) {
         .main-content {
@@ -2063,6 +2382,53 @@ export class BLELivemapPanel extends LitElement {
           ${this._t("panel.auto_place")}
         </button>
         <span style="font-size:11px;color:var(--text-secondary);">${this._t("panel.auto_place_help")}</span>
+        <span style="flex:1;"></span>
+        <span style="font-size:11px;color:var(--text-secondary);">${this._t("panel.calibrate_rssi_help")}</span>
+      </div>
+      ${this._calibWizardActive ? this._renderCalibWizardOverlay() : nothing}
+    `;
+  }
+
+  private _renderCalibWizardOverlay() {
+    const proxies = this._config.proxies || [];
+    const proxy = this._calibWizardProxyIdx !== null ? proxies[this._calibWizardProxyIdx] : null;
+    if (!proxy) return nothing;
+
+    return html`
+      <div class="calib-wizard-overlay">
+        <div class="calib-wizard-card">
+          <h4 style="margin:0 0 12px;">${this._t("panel.calibrate_rssi")}: ${proxy.name || proxy.entity_id}</h4>
+          <p style="font-size:13px;color:var(--text-secondary);margin:0 0 12px;">
+            ${this._t("panel.calibrate_stand")} <strong>${proxy.name || proxy.entity_id}</strong>
+          </p>
+          <div class="calib-wizard-row">
+            <label>${this._t("panel.calibrate_distance_label")}</label>
+            <input type="number" step="0.1" min="0.1" max="10" .value=${String(this._calibWizardDistance)}
+              @change=${(e: Event) => {
+                this._calibWizardDistance = parseFloat((e.target as HTMLInputElement).value) || 1.0;
+              }}
+              style="width:80px;padding:6px 10px;border:1px solid var(--divider-color);border-radius:6px;font-size:13px;"
+            />
+          </div>
+          <div class="calib-wizard-rssi">
+            <div style="font-size:12px;color:var(--text-secondary);">${this._t("panel.calibrate_sampling")}</div>
+            <div style="font-size:28px;font-weight:700;color:var(--accent);margin:8px 0;">
+              ${this._calibWizardRssi !== null ? `${this._calibWizardRssi} dBm` : "--"}
+            </div>
+            <div style="font-size:11px;color:var(--text-secondary);">
+              ${this._calibWizardSamples.length} ${this._t("panel.calibrate_samples")}
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:16px;">
+            <button class="btn btn-small btn-primary" @click=${this._confirmCalibration}
+              ?disabled=${this._calibWizardRssi === null}>
+              ${this._t("panel.calibrate_confirm")}
+            </button>
+            <button class="btn btn-small btn-secondary" @click=${this._stopCalibWizard}>
+              ${this._t("panel.calibrate_cancel")}
+            </button>
+          </div>
+        </div>
       </div>
     `;
   }
@@ -2315,6 +2681,23 @@ export class BLELivemapPanel extends LitElement {
           </div>
         </div>
 
+        <!-- Gateway & Floor Override Settings -->
+        <div class="config-section">
+          <h3>${this._t("panel.gateway")}</h3>
+          <div class="config-row">
+            <label>${this._t("panel.gateway_timeout")}</label>
+            <input type="number" min="5" max="300" .value=${String(this._config.gateway_timeout || 30)} @change=${(e: Event) => this._updateConfig("gateway_timeout", parseInt((e.target as HTMLInputElement).value))} />
+          </div>
+          <div class="config-row">
+            <label>${this._t("panel.floor_override_timeout")}</label>
+            <input type="number" min="10" max="600" .value=${String(this._config.floor_override_timeout || 60)} @change=${(e: Event) => this._updateConfig("floor_override_timeout", parseInt((e.target as HTMLInputElement).value))} />
+          </div>
+          <div class="config-row">
+            <label>${this._t("panel.floor_override_min_proxies")}</label>
+            <input type="number" min="1" max="10" .value=${String(this._config.floor_override_min_proxies || 2)} @change=${(e: Event) => this._updateConfig("floor_override_min_proxies", parseInt((e.target as HTMLInputElement).value))} />
+          </div>
+        </div>
+
         <div class="config-section">
           <h3>${this._t("panel.history_enabled")}</h3>
           <div class="config-row">
@@ -2335,21 +2718,75 @@ export class BLELivemapPanel extends LitElement {
         <div class="config-section">
           <h3>${this._t("panel.tab_proxies")} (${(this._config.proxies || []).length})</h3>
           <div class="item-list">
-            ${(this._config.proxies || []).map((proxy, idx) => html`
-              <div class="item-card">
-                <div class="item-color" style="background: #2196F3;"></div>
-                <div class="item-info">
-                  <div class="item-name">${proxy.name || proxy.entity_id}</div>
-                  <div class="item-detail">${proxy.entity_id} · ${proxy.x > 0 ? this._t("panel.placed") : this._t("panel.not_placed")}</div>
+            ${(this._config.proxies || []).map((proxy, idx) => {
+              const areaName = this._getProxyAreaName(proxy);
+              const isCalibrated = proxy.calibration?.ref_rssi !== undefined;
+              const calibAge = proxy.calibration?.calibrated_at
+                ? Math.round((Date.now() - proxy.calibration.calibrated_at) / 3600000)
+                : null;
+
+              return html`
+                <div class="item-card" style="flex-wrap:wrap;">
+                  <div class="item-color" style="background: ${proxy.is_gateway ? '#FF9800' : '#2196F3'};"></div>
+                  <div class="item-info">
+                    <div class="item-name">${proxy.name || proxy.entity_id}</div>
+                    <div class="item-detail">
+                      ${proxy.entity_id} · ${proxy.x > 0 ? this._t("panel.placed") : this._t("panel.not_placed")}
+                      ${areaName ? html` · <span style="color:var(--accent);">${areaName}</span>` : nothing}
+                    </div>
+                    ${isCalibrated ? html`
+                      <div class="item-detail" style="color:#4CAF50;">
+                        ${this._t("panel.calibrated")} (${proxy.calibration!.ref_rssi} dBm @ ${proxy.calibration!.ref_distance}m)
+                        ${calibAge !== null ? html` · ${calibAge}h ago` : nothing}
+                      </div>
+                    ` : nothing}
+                  </div>
+                  <input type="text" placeholder="${this._t("panel.proxy_name")}" .value=${proxy.name || ""} @change=${(e: Event) => {
+                    const proxies = [...(this._config.proxies || [])];
+                    proxies[idx] = { ...proxies[idx], name: (e.target as HTMLInputElement).value };
+                    this._updateConfig("proxies", proxies);
+                  }} style="width:100px;padding:4px 8px;border:1px solid var(--divider-color);border-radius:6px;font-size:12px;" />
+                  <button class="btn btn-small ${proxy.is_gateway ? 'btn-primary' : 'btn-secondary'}" @click=${() => this._toggleProxyGateway(idx)}
+                    title="${this._t('panel.gateway')}">
+                    ${proxy.is_gateway ? '✓ GW' : 'GW'}
+                  </button>
+                  <button class="btn btn-small btn-secondary" @click=${() => this._startCalibWizard(idx)}
+                    title="${this._t('panel.calibrate_rssi')}">
+                    ${isCalibrated ? '✓ Cal' : 'Cal'}
+                  </button>
+                  ${isCalibrated ? html`
+                    <button class="btn btn-small btn-danger" @click=${() => this._resetProxyCalibration(idx)}
+                      title="${this._t('panel.calibrate_reset')}">×</button>
+                  ` : nothing}
+                  <button class="btn btn-danger btn-small" @click=${() => this._removeProxy(idx)}>${this._t("panel.remove")}</button>
+
+                  <!-- Gateway config (expanded when is_gateway) -->
+                  ${proxy.is_gateway ? html`
+                    <div style="width:100%;padding:8px 0 0 28px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+                      <label style="font-size:11px;color:var(--text-secondary);">${this._t("panel.gateway_type")}:</label>
+                      <select style="padding:3px 6px;border:1px solid var(--divider-color);border-radius:4px;font-size:11px;"
+                        @change=${(e: Event) => this._updateProxyGatewayType(idx, (e.target as HTMLSelectElement).value as GatewayType)}>
+                        ${GATEWAY_TYPES.map((gt) => html`
+                          <option value=${gt.value} ?selected=${proxy.gateway_type === gt.value}>
+                            ${gt.icon} ${this._t(`panel.gateway_${gt.value}`)}
+                          </option>
+                        `)}
+                      </select>
+                      <label style="font-size:11px;color:var(--text-secondary);margin-left:8px;">${this._t("panel.gateway_connects")}:</label>
+                      ${this._getFloors().map((floor) => html`
+                        <label style="font-size:11px;display:flex;align-items:center;gap:3px;cursor:pointer;">
+                          <input type="checkbox"
+                            ?checked=${(proxy.gateway_connects || []).includes(floor.id)}
+                            @change=${() => this._toggleGatewayFloor(idx, floor.id)}
+                          />
+                          ${floor.name}
+                        </label>
+                      `)}
+                    </div>
+                  ` : nothing}
                 </div>
-                <input type="text" placeholder="${this._t("panel.proxy_name")}" .value=${proxy.name || ""} @change=${(e: Event) => {
-                  const proxies = [...(this._config.proxies || [])];
-                  proxies[idx] = { ...proxies[idx], name: (e.target as HTMLInputElement).value };
-                  this._updateConfig("proxies", proxies);
-                }} style="width:120px;padding:4px 8px;border:1px solid var(--divider-color);border-radius:6px;font-size:12px;" />
-                <button class="btn btn-danger btn-small" @click=${() => this._removeProxy(idx)}>${this._t("panel.remove")}</button>
-              </div>
-            `)}
+              `;
+            })}
           </div>
         </div>
 

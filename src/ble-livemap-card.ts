@@ -4,7 +4,7 @@
  *
  * Author: Jerry Paasovaara
  * License: MIT
- * Version: 1.2.0
+ * Version: 1.7.0
  */
 
 import { LitElement, html, css, PropertyValues, nothing, CSSResultGroup } from "lit";
@@ -43,6 +43,23 @@ console.info(
   "color: #4FC3F7; background: #263238; font-weight: bold; padding: 2px 6px; border-radius: 0 4px 4px 0;"
 );
 
+// Cache-busting: detect version changes
+const CACHE_VERSION_KEY = "ble-livemap-version";
+const storedVersion = localStorage.getItem(CACHE_VERSION_KEY);
+if (storedVersion && storedVersion !== CARD_VERSION) {
+  console.info(`[BLE LiveMap] Version changed: ${storedVersion} -> ${CARD_VERSION}`);
+}
+localStorage.setItem(CACHE_VERSION_KEY, CARD_VERSION);
+
+/** Per-device floor tracking state for gateway logic */
+interface DeviceFloorState {
+  current_floor_id: string;
+  last_gateway_passage: number; // timestamp of last gateway detection
+  last_gateway_floor: string | null; // floor the gateway connects to
+  override_start: number; // timestamp when soft override started counting
+  override_candidate_floor: string | null; // floor being considered for soft override
+}
+
 @customElement(CARD_NAME)
 export class BLELivemapCard extends LitElement {
   @property({ attribute: false }) public hass!: HomeAssistant;
@@ -66,6 +83,9 @@ export class BLELivemapCard extends LitElement {
   private _previousPositions: Map<string, DevicePosition> = new Map();
   private _lang = "en";
   private _resizeObserver: ResizeObserver | null = null;
+
+  // Gateway transition state per device
+  private _deviceFloorState: Map<string, DeviceFloorState> = new Map();
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -131,6 +151,130 @@ export class BLELivemapCard extends LitElement {
     return 6;
   }
 
+  // ─── Gateway Transition Logic ─────────────────────────────
+
+  /**
+   * Determine which floor a device should be on based on gateway logic.
+   * 
+   * Rules:
+   * 1. If device passes through a gateway proxy → immediate floor transition
+   * 2. If no gateway passage but consistent signals from another floor for
+   *    floor_override_timeout seconds → soft override (allow transition)
+   * 3. Manual reset always available
+   */
+  private _resolveDeviceFloor(
+    deviceId: string,
+    distances: ProxyDistance[],
+    proxies: ProxyConfig[]
+  ): string | null {
+    const floors = this._getFloors();
+    if (floors.length <= 1) return floors[0]?.id || null;
+
+    const now = Date.now();
+    const gatewayTimeout = (this._config.gateway_timeout || 30) * 1000;
+    const overrideTimeout = (this._config.floor_override_timeout || 60) * 1000;
+    const overrideMinProxies = this._config.floor_override_min_proxies || 2;
+
+    // Get or create floor state for this device
+    let floorState = this._deviceFloorState.get(deviceId);
+    if (!floorState) {
+      floorState = {
+        current_floor_id: floors[0].id,
+        last_gateway_passage: 0,
+        last_gateway_floor: null,
+        override_start: 0,
+        override_candidate_floor: null,
+      };
+      this._deviceFloorState.set(deviceId, floorState);
+    }
+
+    // Count how many proxies on each floor see this device
+    const floorProxyCounts: Map<string, number> = new Map();
+    const floorMinDistances: Map<string, number> = new Map();
+
+    for (const dist of distances) {
+      const proxy = proxies.find((p) => p.entity_id === dist.proxy_entity_id);
+      if (!proxy || !proxy.floor_id) continue;
+
+      const floorId = proxy.floor_id;
+      floorProxyCounts.set(floorId, (floorProxyCounts.get(floorId) || 0) + 1);
+
+      const currentMin = floorMinDistances.get(floorId) || Infinity;
+      if (dist.distance < currentMin) {
+        floorMinDistances.set(floorId, dist.distance);
+      }
+
+      // Check if this is a gateway proxy that sees the device
+      if (proxy.is_gateway && proxy.gateway_connects && proxy.gateway_connects.length > 0) {
+        // Gateway detected! Check if it connects to a different floor
+        for (const connectedFloor of proxy.gateway_connects) {
+          if (connectedFloor !== floorState.current_floor_id) {
+            floorState.last_gateway_passage = now;
+            floorState.last_gateway_floor = connectedFloor;
+          }
+        }
+      }
+    }
+
+    // Rule 1: Gateway passage → immediate transition
+    if (
+      floorState.last_gateway_floor &&
+      (now - floorState.last_gateway_passage) < gatewayTimeout
+    ) {
+      const targetFloor = floorState.last_gateway_floor;
+      // Verify the target floor actually exists
+      if (floors.some((f) => f.id === targetFloor)) {
+        floorState.current_floor_id = targetFloor;
+        floorState.last_gateway_floor = null; // consumed
+        floorState.override_start = 0;
+        floorState.override_candidate_floor = null;
+        return targetFloor;
+      }
+    }
+
+    // Rule 2: Soft override — check if signals consistently point to another floor
+    // Find the floor with the most proxies seeing the device
+    let bestFloor = floorState.current_floor_id;
+    let bestCount = floorProxyCounts.get(bestFloor) || 0;
+
+    for (const [floorId, count] of floorProxyCounts) {
+      if (floorId !== floorState.current_floor_id && count > bestCount) {
+        bestFloor = floorId;
+        bestCount = count;
+      }
+    }
+
+    // If a different floor has more proxies seeing the device (and meets minimum)
+    if (bestFloor !== floorState.current_floor_id && bestCount >= overrideMinProxies) {
+      // Check if current floor has fewer or zero proxies seeing the device
+      const currentFloorCount = floorProxyCounts.get(floorState.current_floor_id) || 0;
+
+      if (bestCount > currentFloorCount) {
+        // Start or continue override timer
+        if (floorState.override_candidate_floor === bestFloor) {
+          // Same candidate — check if timeout has elapsed
+          if ((now - floorState.override_start) >= overrideTimeout) {
+            // Soft override: transition without gateway
+            floorState.current_floor_id = bestFloor;
+            floorState.override_start = 0;
+            floorState.override_candidate_floor = null;
+            return bestFloor;
+          }
+        } else {
+          // New candidate — start timer
+          floorState.override_candidate_floor = bestFloor;
+          floorState.override_start = now;
+        }
+      }
+    } else {
+      // Reset override timer if signals no longer point elsewhere
+      floorState.override_start = 0;
+      floorState.override_candidate_floor = null;
+    }
+
+    return floorState.current_floor_id;
+  }
+
   // ─── Data Update ───────────────────────────────────────────
 
   private _startUpdateLoop(): void {
@@ -151,6 +295,8 @@ export class BLELivemapCard extends LitElement {
 
     const devices: DeviceState[] = [];
     const proxies = this._getAllProxies();
+    const floors = this._getFloors();
+    const hasMultipleFloors = floors.length > 1;
 
     for (const deviceConfig of this._config.tracked_devices) {
       const distances = this._getDeviceDistances(deviceConfig, proxies);
@@ -158,17 +304,43 @@ export class BLELivemapCard extends LitElement {
 
       if (distances.length >= 1) {
         const proxyMap = new Map<string, { x: number; y: number }>();
+
+        // Resolve which floor this device should be on
+        const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
+        let resolvedFloorId: string | null = null;
+
+        if (hasMultipleFloors) {
+          resolvedFloorId = this._resolveDeviceFloor(deviceId, distances, proxies);
+        }
+
+        // Only use proxies on the resolved floor for trilateration
         for (const d of distances) {
           const proxy = proxies.find((p) => p.entity_id === d.proxy_entity_id);
           if (proxy) {
+            // If we have a resolved floor, only use proxies on that floor
+            if (resolvedFloorId && proxy.floor_id && proxy.floor_id !== resolvedFloorId) {
+              continue;
+            }
             proxyMap.set(d.proxy_entity_id, { x: proxy.x, y: proxy.y });
           }
         }
 
         if (proxyMap.size >= 1) {
-          const floor = this._getFloors()[0];
-          const imageWidth = floor?.image_width || 20;
-          const imageHeight = floor?.image_height || 15;
+          // Use the resolved floor's dimensions
+          let imageWidth = 20;
+          let imageHeight = 15;
+          if (resolvedFloorId) {
+            const floor = floors.find((f) => f.id === resolvedFloorId);
+            if (floor) {
+              imageWidth = floor.image_width || 20;
+              imageHeight = floor.image_height || 15;
+            }
+          } else {
+            const floor = floors[0];
+            imageWidth = floor?.image_width || 20;
+            imageHeight = floor?.image_height || 15;
+          }
+
           const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight);
 
           if (result) {
@@ -186,6 +358,7 @@ export class BLELivemapCard extends LitElement {
                 accuracy: smoothed.accuracy,
                 confidence: smoothed.confidence,
                 timestamp: Date.now(),
+                floor_id: resolvedFloorId || undefined,
               };
 
               this._previousPositions.set(prevKey, position);
@@ -210,9 +383,13 @@ export class BLELivemapCard extends LitElement {
           x: position.x,
           y: position.y,
           timestamp: position.timestamp,
+          floor_id: position.floor_id,
         });
         history = this._historyStore.getTrail(deviceId);
       }
+
+      // Get current floor from floor state
+      const floorState = this._deviceFloorState.get(deviceId);
 
       devices.push({
         device_id: deviceId,
@@ -224,6 +401,7 @@ export class BLELivemapCard extends LitElement {
         area: null,
         last_seen: position ? Date.now() : 0,
         config: deviceConfig,
+        current_floor_id: floorState?.current_floor_id || undefined,
       });
     }
 
@@ -249,7 +427,19 @@ export class BLELivemapCard extends LitElement {
         for (const entityId of possibleEntities) {
           const state = this.hass.states[entityId];
           if (state && !isNaN(parseFloat(state.state))) {
-            const dist = parseFloat(state.state);
+            let dist = parseFloat(state.state);
+
+            // Apply RSSI calibration if available
+            if (proxy.calibration?.ref_rssi !== undefined && state.attributes?.rssi) {
+              const calibratedDist = this._applyCalibration(
+                state.attributes.rssi,
+                proxy.calibration
+              );
+              if (calibratedDist !== null) {
+                dist = calibratedDist;
+              }
+            }
+
             const attrs = state.attributes || {};
             distances.push({
               proxy_entity_id: proxy.entity_id,
@@ -307,6 +497,29 @@ export class BLELivemapCard extends LitElement {
     }
 
     return distances;
+  }
+
+  /**
+   * Apply per-proxy RSSI calibration to convert RSSI to distance.
+   * Uses the log-distance path loss model:
+   *   distance = 10^((ref_rssi - measured_rssi) / (10 * n))
+   */
+  private _applyCalibration(
+    measuredRssi: number,
+    calibration: { ref_rssi: number; ref_distance: number; attenuation?: number }
+  ): number | null {
+    if (!calibration || calibration.ref_rssi === undefined) return null;
+
+    const refRssi = calibration.ref_rssi;
+    const refDist = calibration.ref_distance || 1.0;
+    const n = calibration.attenuation || 2.5; // default path-loss exponent
+
+    // Log-distance path loss model
+    const exponent = (refRssi - measuredRssi) / (10 * n);
+    const distance = refDist * Math.pow(10, exponent);
+
+    // Clamp to reasonable range
+    return Math.max(0.1, Math.min(distance, 50));
   }
 
   private _findEntity(deviceConfig: any, suffix: string): string | null {
@@ -699,7 +912,7 @@ export class BLELivemapCard extends LitElement {
         display: flex;
         align-items: center;
         justify-content: center;
-        transition: background 0.2s, color 0.2s;
+        transition: all 0.2s;
       }
 
       .header-btn:hover {
@@ -708,45 +921,36 @@ export class BLELivemapCard extends LitElement {
       }
 
       .header-btn.off {
-        opacity: 0.35;
-      }
-
-      .header-btn.off:hover {
-        opacity: 0.6;
+        opacity: 0.4;
       }
 
       .header-btn svg {
-        width: 18px;
-        height: 18px;
+        width: 20px;
+        height: 20px;
       }
 
       .floor-select {
-        background: var(--divider-color, rgba(0,0,0,0.05));
-        border: none;
-        border-radius: 8px;
         padding: 4px 8px;
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.12));
+        border-radius: 6px;
         font-size: 12px;
+        background: var(--card-bg);
         color: var(--text-primary);
-        cursor: pointer;
-        outline: none;
       }
 
       .maps-wrapper {
-        display: flex;
-        flex-direction: column;
+        position: relative;
       }
 
       .map-container {
         position: relative;
-        width: 100%;
-        overflow: hidden;
-        background: var(--divider-color, rgba(0,0,0,0.03));
+        line-height: 0;
       }
 
       .map-container img {
         width: 100%;
+        height: auto;
         display: block;
-        opacity: 0.85;
       }
 
       .map-container canvas {
@@ -754,21 +958,18 @@ export class BLELivemapCard extends LitElement {
         top: 0;
         left: 0;
         width: 100%;
+        height: 100%;
         pointer-events: none;
       }
 
       .floor-label {
-        position: absolute;
-        top: 8px;
-        left: 12px;
-        z-index: 5;
-        background: rgba(0,0,0,0.5);
-        color: white;
-        padding: 3px 10px;
-        border-radius: 12px;
-        font-size: 11px;
+        padding: 6px 12px;
+        font-size: 12px;
         font-weight: 600;
-        letter-spacing: 0.3px;
+        color: var(--text-secondary);
+        background: var(--divider-color, rgba(0,0,0,0.03));
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
       }
 
       .floor-divider {
@@ -776,33 +977,27 @@ export class BLELivemapCard extends LitElement {
         background: var(--divider-color, rgba(0,0,0,0.08));
       }
 
-      .status-bar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 8px 16px 12px;
-        font-size: 11px;
+      .empty-state {
+        padding: 40px 20px;
+        text-align: center;
         color: var(--text-secondary);
       }
 
-      .status-left {
-        display: flex;
-        gap: 12px;
-        align-items: center;
+      .empty-state svg {
+        width: 48px;
+        height: 48px;
+        opacity: 0.3;
+        margin-bottom: 12px;
       }
 
-      .status-item {
-        display: flex;
-        align-items: center;
-        gap: 4px;
+      .empty-state p {
+        margin: 4px 0;
+        font-size: 13px;
       }
 
-      .status-item .count {
-        font-weight: 600;
-        color: var(--text-primary);
-      }
-
+      /* Device Panel */
       .device-panel {
+        padding: 8px 12px;
         border-top: 1px solid var(--divider-color, rgba(0,0,0,0.08));
         max-height: 200px;
         overflow-y: auto;
@@ -811,19 +1006,19 @@ export class BLELivemapCard extends LitElement {
 
       .device-panel.collapsed {
         max-height: 0;
-        border-top: none;
+        padding: 0 12px;
+        overflow: hidden;
       }
 
       .device-item {
         display: flex;
         align-items: center;
-        padding: 8px 16px;
         gap: 10px;
-        transition: background 0.15s;
+        padding: 6px 0;
       }
 
-      .device-item:hover {
-        background: var(--divider-color, rgba(0,0,0,0.03));
+      .device-item + .device-item {
+        border-top: 1px solid var(--divider-color, rgba(0,0,0,0.04));
       }
 
       .device-dot {
@@ -842,9 +1037,6 @@ export class BLELivemapCard extends LitElement {
         font-size: 13px;
         font-weight: 500;
         color: var(--text-primary);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
       }
 
       .device-detail {
@@ -853,37 +1045,36 @@ export class BLELivemapCard extends LitElement {
       }
 
       .device-accuracy {
+        text-align: right;
         font-size: 11px;
         color: var(--text-secondary);
-        text-align: right;
-        flex-shrink: 0;
       }
 
-      .empty-state {
-        padding: 40px 20px;
-        text-align: center;
+      /* Status Bar */
+      .status-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 6px 16px;
+        font-size: 11px;
         color: var(--text-secondary);
+        border-top: 1px solid var(--divider-color, rgba(0,0,0,0.06));
       }
 
-      .empty-state svg {
-        width: 48px;
-        height: 48px;
-        margin-bottom: 12px;
-        opacity: 0.3;
+      .status-left {
+        display: flex;
+        gap: 16px;
       }
 
-      .empty-state p {
-        margin: 4px 0;
-        font-size: 13px;
+      .status-item {
+        display: flex;
+        gap: 4px;
+        align-items: center;
       }
 
-      :host([fullscreen]) ha-card {
-        height: 100vh;
-        border-radius: 0;
-      }
-
-      :host([fullscreen]) .map-container {
-        flex: 1;
+      .status-item .count {
+        font-weight: 600;
+        color: var(--text-primary);
       }
 
       /* Setup Dialog */
@@ -893,11 +1084,11 @@ export class BLELivemapCard extends LitElement {
         left: 0;
         right: 0;
         bottom: 0;
-        background: rgba(0, 0, 0, 0.6);
         z-index: 9999;
         display: flex;
         align-items: center;
         justify-content: center;
+        background: rgba(0, 0, 0, 0.5);
         backdrop-filter: blur(4px);
         animation: fadeIn 0.2s ease;
       }
@@ -1087,6 +1278,9 @@ export class BLELivemapCard extends LitElement {
                   <div class="device-name">${device.name}</div>
                   <div class="device-detail">
                     ${device.area || device.nearest_proxy || t("common.unknown")}
+                    ${device.current_floor_id
+                      ? html` <span style="opacity:0.6;">| ${this._getFloors().find(f => f.id === device.current_floor_id)?.name || device.current_floor_id}</span>`
+                      : nothing}
                   </div>
                 </div>
                 <div class="device-accuracy">
