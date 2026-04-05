@@ -1,6 +1,6 @@
 {
   "name": "BLE LiveMap",
   "render_readme": true,
-  "filename": "ble-livemap-card.js",
+  "filename": "ble-livemap.js",
   "content_in_root": false
 }
