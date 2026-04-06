@@ -27,6 +27,8 @@ import {
   GatewayType,
   ProxyCalibration,
   CalibrationSample,
+  CalibrationHealth,
+  CalibrationHealthLevel,
   DOOR_TYPES,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
@@ -118,6 +120,8 @@ export class BLELivemapPanel extends LitElement {
   /** "I Am Here" calibration mode */
   @state() private _calibrationMode: boolean = false;
   @state() private _calibrationToast: string = "";
+  /** Per-proxy calibration health computed after auto-calibrate */
+  @state() private _calibrationHealthMap: Map<string, CalibrationHealth> = new Map();
   private _liveTrackingTimer: number | null = null;
   private _dragStarted = false;
 
@@ -1595,6 +1599,7 @@ export class BLELivemapPanel extends LitElement {
       floor_id: floorId,
       timestamp: Date.now(),
       readings,
+      device_id: this._debugFollowDevice,
     };
 
     const samples = [...(this._config.calibration_samples || []), sample];
@@ -1602,6 +1607,11 @@ export class BLELivemapPanel extends LitElement {
 
     this._calibrationToast = `\u2705 Sample #${samples.length} recorded (${Object.keys(readings).length} proxies)`;
     setTimeout(() => { this._calibrationToast = ""; }, 3000);
+
+    // Continuous learning: auto-recalibrate if enabled and enough samples
+    if (this._config.continuous_learning && samples.length >= 3) {
+      setTimeout(() => this._autoCalibrate(), 500);
+    }
   }
 
   /**
@@ -1611,9 +1621,12 @@ export class BLELivemapPanel extends LitElement {
    *   RSSI = ref_rssi - 10 * n * log10(d / ref_dist)
    *
    * Using least-squares regression on all samples where that proxy had a reading.
+   * Also computes R², detects outliers, and optionally syncs to Bermuda.
    */
   private _autoCalibrate(): void {
-    const samples = this._config.calibration_samples || [];
+    const allSamples = this._config.calibration_samples || [];
+    // Reset outlier flags
+    const samples = allSamples.map(s => ({ ...s, is_outlier: false }));
     if (samples.length < 2) {
       this._calibrationToast = "Need at least 2 samples to calibrate";
       setTimeout(() => { this._calibrationToast = ""; }, 3000);
@@ -1625,6 +1638,7 @@ export class BLELivemapPanel extends LitElement {
     const imageWidth = floor?.image_width || 20;
     const imageHeight = floor?.image_height || 15;
     let calibratedCount = 0;
+    const healthMap = new Map<string, CalibrationHealth>();
 
     for (let i = 0; i < proxies.length; i++) {
       const proxy = proxies[i];
@@ -1637,30 +1651,37 @@ export class BLELivemapPanel extends LitElement {
         .replace(/_proxy$/, "");
 
       // Collect all samples that have a reading for this proxy
-      const dataPoints: { distance: number; rssi: number }[] = [];
+      const dataPoints: { distance: number; rssi: number; sampleIdx: number }[] = [];
 
-      for (const sample of samples) {
+      for (let si = 0; si < samples.length; si++) {
+        const sample = samples[si];
         const rssi = sample.readings[proxySlug];
         if (rssi === undefined) continue;
         if (sample.floor_id && proxy.floor_id && sample.floor_id !== proxy.floor_id) continue;
 
-        // Calculate real distance from sample position to proxy position
         const dx = ((sample.x - proxy.x) / 100) * imageWidth;
         const dy = ((sample.y - proxy.y) / 100) * imageHeight;
         const distance = Math.sqrt(dx * dx + dy * dy);
 
-        if (distance > 0.1) { // Skip if too close (unreliable)
-          dataPoints.push({ distance, rssi });
+        if (distance > 0.1) {
+          dataPoints.push({ distance, rssi, sampleIdx: si });
         }
       }
 
-      if (dataPoints.length < 2) continue;
+      if (dataPoints.length < 2) {
+        healthMap.set(proxy.entity_id, {
+          level: dataPoints.length === 0 ? "uncalibrated" : "poor",
+          r_squared: 0,
+          sample_count: dataPoints.length,
+          outlier_count: 0,
+          message: dataPoints.length === 0
+            ? "No samples for this proxy"
+            : "Need at least 2 samples",
+        });
+        continue;
+      }
 
-      // Fit log-distance model: RSSI = A - 10*n*log10(d)
-      // where A = ref_rssi at 1m, n = path-loss exponent
-      // Using linear regression on: RSSI = A - B * log10(d)
-      // where B = 10*n
-
+      // --- Fit log-distance model: RSSI = A + B * log10(d) ---
       let sumLogD = 0, sumRssi = 0, sumLogD2 = 0, sumLogDRssi = 0;
       let count = 0;
 
@@ -1673,23 +1694,89 @@ export class BLELivemapPanel extends LitElement {
         count++;
       }
 
-      // Linear regression: RSSI = A + B * log10(d)
-      // B should be negative (RSSI decreases with distance)
       const denom = count * sumLogD2 - sumLogD * sumLogD;
       if (Math.abs(denom) < 1e-10) continue;
 
       const B = (count * sumLogDRssi - sumLogD * sumRssi) / denom;
       const A = (sumRssi - B * sumLogD) / count;
-
-      // B = -10*n, so n = -B/10
       const n = -B / 10;
 
-      // Sanity check: n should be between 1.5 and 5.0 for indoor BLE
-      if (n < 1.5 || n > 5.0 || isNaN(n)) continue;
+      // --- Compute R² ---
+      const meanRssi = sumRssi / count;
+      let ssTot = 0, ssRes = 0;
+      const residuals: { idx: number; residual: number }[] = [];
 
-      // A is the RSSI at 1 meter
+      for (const dp of dataPoints) {
+        const predicted = A + B * Math.log10(dp.distance);
+        const res = dp.rssi - predicted;
+        ssRes += res * res;
+        ssTot += (dp.rssi - meanRssi) * (dp.rssi - meanRssi);
+        residuals.push({ idx: dp.sampleIdx, residual: Math.abs(res) });
+      }
+
+      const rSquared = ssTot > 0 ? Math.max(0, 1 - ssRes / ssTot) : 0;
+
+      // --- Outlier detection: flag samples with residual > 2× stddev ---
+      const stdRes = Math.sqrt(ssRes / count);
+      let outlierCount = 0;
+      for (const r of residuals) {
+        if (r.residual > 2 * stdRes && stdRes > 2) {
+          samples[r.idx] = { ...samples[r.idx], is_outlier: true };
+          outlierCount++;
+        }
+      }
+
+      // --- Sanity check ---
+      if (n < 1.0 || n > 6.0 || isNaN(n)) {
+        healthMap.set(proxy.entity_id, {
+          level: "poor",
+          r_squared: rSquared,
+          sample_count: count,
+          outlier_count: outlierCount,
+          message: `Path-loss exponent out of range (n=${n.toFixed(1)}). Samples may be contradictory.`,
+        });
+        continue;
+      }
+
       const refRssi = Math.round(A);
-      if (refRssi > -20 || refRssi < -90) continue; // unreasonable
+      if (refRssi > -20 || refRssi < -95) {
+        healthMap.set(proxy.entity_id, {
+          level: "poor",
+          r_squared: rSquared,
+          sample_count: count,
+          outlier_count: outlierCount,
+          message: `Ref RSSI out of range (${refRssi} dBm). Check sample positions.`,
+        });
+        continue;
+      }
+
+      // --- Determine health level ---
+      let level: CalibrationHealthLevel;
+      let message: string;
+      if (rSquared >= 0.85 && count >= 5) {
+        level = "excellent";
+        message = `Excellent fit (R²=${rSquared.toFixed(2)}, ${count} samples)`;
+      } else if (rSquared >= 0.65 && count >= 3) {
+        level = "good";
+        message = `Good fit (R²=${rSquared.toFixed(2)}, ${count} samples)`;
+      } else if (rSquared >= 0.4) {
+        level = "fair";
+        message = `Fair fit (R²=${rSquared.toFixed(2)}). More samples at varied distances would help.`;
+      } else {
+        level = "poor";
+        message = `Poor fit (R²=${rSquared.toFixed(2)}). Samples may be contradictory or noisy.`;
+      }
+      if (outlierCount > 0) {
+        message += ` ${outlierCount} outlier(s) flagged.`;
+      }
+
+      healthMap.set(proxy.entity_id, {
+        level,
+        r_squared: rSquared,
+        sample_count: count,
+        outlier_count: outlierCount,
+        message,
+      });
 
       proxies[i] = {
         ...proxies[i],
@@ -1699,18 +1786,117 @@ export class BLELivemapPanel extends LitElement {
           ref_distance: 1.0,
           attenuation: Math.round(n * 100) / 100,
           calibrated_at: Date.now(),
+          r_squared: Math.round(rSquared * 1000) / 1000,
+          sample_count: count,
         },
       };
       calibratedCount++;
     }
 
+    this._calibrationHealthMap = healthMap;
+
     if (calibratedCount > 0) {
       this._updateConfig("proxies", proxies);
-      this._calibrationToast = `\u2705 Auto-calibrated ${calibratedCount} proxies from ${samples.length} samples`;
+      // Save updated outlier flags
+      this._updateConfig("calibration_samples", samples);
+      this._calibrationToast = `\u2705 Calibrated ${calibratedCount} proxies (R\u00b2 avg: ${this._avgR2(healthMap)})`;
+
+      // Bermuda sync if enabled
+      if (this._config.bermuda_sync_enabled) {
+        this._syncToBermuda(proxies);
+      }
     } else {
       this._calibrationToast = "\u26a0 Could not calibrate any proxies (need more diverse samples)";
     }
-    setTimeout(() => { this._calibrationToast = ""; }, 5000);
+    setTimeout(() => { this._calibrationToast = ""; }, 6000);
+  }
+
+  /** Compute average R² from health map */
+  private _avgR2(healthMap: Map<string, CalibrationHealth>): string {
+    let sum = 0, count = 0;
+    for (const h of healthMap.values()) {
+      if (h.r_squared > 0) { sum += h.r_squared; count++; }
+    }
+    return count > 0 ? (sum / count).toFixed(2) : "N/A";
+  }
+
+  /**
+   * Push learned ref_rssi to Bermuda's per-device Calibration Ref Power entities.
+   * Bermuda has number.bermuda_<device_id>_calibration_ref_power_at_1m_0_for_default
+   * for each tracked device. We compute a weighted average ref_power from our
+   * per-proxy calibrations and push it.
+   */
+  private async _syncToBermuda(proxies: ProxyConfig[]): Promise<void> {
+    if (!this.hass) return;
+
+    // Collect all calibrated ref_rssi values
+    const calibratedProxies = proxies.filter(p => p.calibration?.ref_rssi && p.calibration.calibrated_at);
+    if (calibratedProxies.length === 0) return;
+
+    // Compute weighted average ref_rssi (weighted by R²)
+    let weightedSum = 0, weightTotal = 0;
+    for (const p of calibratedProxies) {
+      const weight = p.calibration!.r_squared || 0.5;
+      weightedSum += p.calibration!.ref_rssi * weight;
+      weightTotal += weight;
+    }
+    const avgRefPower = Math.round(weightedSum / weightTotal);
+
+    // Find Bermuda number entities for tracked devices
+    const devices = this._config.tracked_devices || [];
+    let syncCount = 0;
+
+    for (const device of devices) {
+      // Find the Bermuda calibration number entity
+      const prefix = device.entity_prefix || "";
+      // Extract the bermuda device slug from entity_prefix
+      // e.g. "sensor.bermuda_3959c5fb..." → "bermuda_3959c5fb..."
+      const match = prefix.match(/sensor\.(bermuda_[^_]+.*?)_/);
+      if (!match) continue;
+
+      // Search for the number entity
+      const numberEntityBase = `number.${match[1]}`;
+      const candidates = Object.keys(this.hass.states).filter(
+        eid => eid.startsWith(numberEntityBase) && eid.includes("calibration_ref_power")
+      );
+
+      for (const entityId of candidates) {
+        try {
+          await this.hass.callService("number", "set_value", {
+            entity_id: entityId,
+            value: avgRefPower,
+          });
+          syncCount++;
+        } catch (e) {
+          console.warn(`[BLE Livemap] Failed to sync to Bermuda entity ${entityId}:`, e);
+        }
+      }
+    }
+
+    if (syncCount > 0) {
+      this._calibrationToast += ` | Synced ref_power=${avgRefPower} to ${syncCount} Bermuda device(s)`;
+    }
+  }
+
+  /**
+   * Remove a specific calibration sample by ID.
+   */
+  private _removeCalibrationSample(sampleId: string): void {
+    const samples = (this._config.calibration_samples || []).filter(s => s.id !== sampleId);
+    this._updateConfig("calibration_samples", samples);
+    this._calibrationToast = "Sample removed";
+    setTimeout(() => { this._calibrationToast = ""; }, 2000);
+  }
+
+  /**
+   * Remove all outlier-flagged samples.
+   */
+  private _removeOutlierSamples(): void {
+    const samples = (this._config.calibration_samples || []).filter(s => !s.is_outlier);
+    const removed = (this._config.calibration_samples || []).length - samples.length;
+    this._updateConfig("calibration_samples", samples);
+    this._calibrationToast = `Removed ${removed} outlier sample(s)`;
+    setTimeout(() => { this._calibrationToast = ""; }, 3000);
   }
 
   /**
@@ -1718,6 +1904,7 @@ export class BLELivemapPanel extends LitElement {
    */
   private _clearCalibrationSamples(): void {
     this._updateConfig("calibration_samples", []);
+    this._calibrationHealthMap = new Map();
     this._calibrationToast = "All calibration samples cleared";
     setTimeout(() => { this._calibrationToast = ""; }, 3000);
   }
@@ -2532,6 +2719,88 @@ export class BLELivemapPanel extends LitElement {
         border-color: #2196F3;
       }
 
+      /* Calibration toggles */
+      .calib-toggles {
+        display: flex;
+        gap: 12px;
+        padding: 4px 0;
+        font-size: 11px;
+      }
+      .calib-toggle {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        cursor: pointer;
+        color: var(--text-secondary, #aaa);
+      }
+      .calib-toggle input[type="checkbox"] {
+        width: 14px;
+        height: 14px;
+        accent-color: #2196F3;
+      }
+
+      /* Sample list */
+      .sample-details {
+        margin-top: 6px;
+        font-size: 11px;
+      }
+      .sample-details summary {
+        cursor: pointer;
+        color: var(--text-secondary, #aaa);
+        padding: 4px 0;
+        user-select: none;
+      }
+      .sample-details summary:hover {
+        color: var(--text-primary, #fff);
+      }
+      .sample-list {
+        max-height: 150px;
+        overflow-y: auto;
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 4px;
+        margin-top: 4px;
+      }
+      .sample-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 6px;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.05));
+        font-size: 10px;
+      }
+      .sample-item:last-child { border-bottom: none; }
+      .sample-outlier {
+        background: rgba(255, 152, 0, 0.1);
+        border-left: 2px solid #FF9800;
+      }
+      .sample-num {
+        font-weight: bold;
+        color: var(--text-secondary, #aaa);
+        min-width: 24px;
+      }
+      .sample-info {
+        flex: 1;
+        color: var(--text-primary, #fff);
+      }
+      .sample-time {
+        color: var(--text-secondary, #888);
+        font-size: 9px;
+      }
+      .sample-remove {
+        background: none;
+        border: none;
+        color: #F44336;
+        cursor: pointer;
+        font-size: 12px;
+        padding: 2px 4px;
+        border-radius: 3px;
+        opacity: 0.6;
+      }
+      .sample-remove:hover {
+        opacity: 1;
+        background: rgba(244, 67, 54, 0.15);
+      }
+
       /* Calibration sample markers on map */
       .calib-sample-marker {
         position: absolute;
@@ -3308,7 +3577,37 @@ export class BLELivemapPanel extends LitElement {
                     title="Remove all calibration samples"
                   >\ud83d\uddd1 Clear</button>
                 ` : nothing}
+                ${(this._config.calibration_samples || []).some(s => s.is_outlier) ? html`
+                  <button
+                    class="btn btn-small" style="background:#FF9800;color:#000;"
+                    @click=${() => this._removeOutlierSamples()}
+                    title="Remove samples flagged as outliers"
+                  >\u26a0 Remove Outliers (${(this._config.calibration_samples || []).filter(s => s.is_outlier).length})</button>
+                ` : nothing}
               </div>
+
+              <!-- Toggle options -->
+              <div class="calib-toggles">
+                <label class="calib-toggle">
+                  <input type="checkbox"
+                    .checked=${this._config.continuous_learning || false}
+                    @change=${(e: Event) => {
+                      this._updateConfig("continuous_learning", (e.target as HTMLInputElement).checked);
+                    }}
+                  />
+                  Auto-learn on new samples
+                </label>
+                <label class="calib-toggle">
+                  <input type="checkbox"
+                    .checked=${this._config.bermuda_sync_enabled || false}
+                    @change=${(e: Event) => {
+                      this._updateConfig("bermuda_sync_enabled", (e.target as HTMLInputElement).checked);
+                    }}
+                  />
+                  Sync to Bermuda
+                </label>
+              </div>
+
               ${this._calibrationMode ? html`
                 <div class="calib-hint">\ud83d\udc46 Click on the map where the device is RIGHT NOW to record a fingerprint</div>
               ` : nothing}
@@ -3316,15 +3615,16 @@ export class BLELivemapPanel extends LitElement {
                 <div class="calib-toast">${this._calibrationToast}</div>
               ` : nothing}
 
+              <!-- Proxy table with health -->
               ${this._liveDebugInfo.length > 0 ? html`
                 <table class="debug-table">
                   <thead>
                     <tr>
                       <th>Proxy</th>
-                      <th>Distance</th>
+                      <th>Dist</th>
                       <th>RSSI</th>
                       <th>Offset</th>
-                      <th>Status</th>
+                      <th>Health</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -3340,11 +3640,18 @@ export class BLELivemapPanel extends LitElement {
                         const proxyIdx = (this._config.proxies || []).findIndex(p => p.entity_id === d.proxyId);
                         const proxy = proxyIdx >= 0 ? (this._config.proxies || [])[proxyIdx] : null;
                         const offset = proxy?.calibration?.distance_offset || 0;
+                        const health = this._calibrationHealthMap.get(d.proxyId);
+                        const healthColor = health ? {
+                          excellent: '#4CAF50', good: '#8BC34A', fair: '#FF9800', poor: '#F44336', uncalibrated: '#666'
+                        }[health.level] : '#666';
+                        const healthIcon = health ? {
+                          excellent: '\u2705', good: '\ud83d\udfe2', fair: '\ud83d\udfe1', poor: '\ud83d\udd34', uncalibrated: '\u26aa'
+                        }[health.level] : '\u26aa';
                         return html`
                         <tr class="${d.distance !== null ? 'debug-active' : 'debug-inactive'}">
                           <td title="${d.sensorId}">${d.proxyName}</td>
-                          <td>${d.distance !== null ? d.distance.toFixed(2) + 'm' : '\u2014'}</td>
-                          <td>${d.rssi !== null ? d.rssi + ' dBm' : '\u2014'}</td>
+                          <td>${d.distance !== null ? d.distance.toFixed(1) + 'm' : '\u2014'}</td>
+                          <td>${d.rssi !== null ? d.rssi + '' : '\u2014'}</td>
                           <td>
                             ${proxyIdx >= 0 ? html`
                               <input
@@ -3358,21 +3665,49 @@ export class BLELivemapPanel extends LitElement {
                                   const val = parseFloat((e.target as HTMLInputElement).value) || 0;
                                   this._updateProxyDistanceOffset(proxyIdx, val);
                                 }}
-                                title="Distance offset in meters (positive = farther, negative = closer)"
+                                title="Distance offset in meters"
                               />
                             ` : '\u2014'}
                           </td>
-                          <td>${d.distance !== null && d.placed ? '\u2705' : d.distance !== null && !d.placed ? '\u26a0' : '\u274c'}</td>
+                          <td title="${health?.message || 'Not calibrated'}" style="color:${healthColor};cursor:help;">
+                            ${healthIcon}
+                            ${proxy?.calibration?.r_squared !== undefined
+                              ? html`<span style="font-size:9px;"> R\u00b2=${proxy.calibration.r_squared.toFixed(2)}</span>`
+                              : nothing}
+                          </td>
                         </tr>
                       `;
                       })}
                   </tbody>
                 </table>
                 <div class="debug-summary">
-                  Active: ${this._liveDebugInfo.filter(d => d.distance !== null).length} / ${this._liveDebugInfo.length} |
-                  Trilateration: ${this._liveDebugInfo.filter(d => d.distance !== null && d.placed).length} |
+                  Active: ${this._liveDebugInfo.filter(d => d.distance !== null).length}/${this._liveDebugInfo.length} |
+                  Trilat: ${this._liveDebugInfo.filter(d => d.distance !== null && d.placed).length} |
                   Samples: ${(this._config.calibration_samples || []).length}
+                  ${(this._config.calibration_samples || []).some(s => s.is_outlier)
+                    ? html` | <span style="color:#FF9800;">Outliers: ${(this._config.calibration_samples || []).filter(s => s.is_outlier).length}</span>`
+                    : nothing}
                 </div>
+
+                <!-- Sample list (collapsible) -->
+                ${(this._config.calibration_samples || []).length > 0 ? html`
+                  <details class="sample-details">
+                    <summary>\ud83d\udcca Calibration Samples (${(this._config.calibration_samples || []).length})</summary>
+                    <div class="sample-list">
+                      ${(this._config.calibration_samples || []).map((s, idx) => html`
+                        <div class="sample-item ${s.is_outlier ? 'sample-outlier' : ''}">
+                          <span class="sample-num">#${idx + 1}</span>
+                          <span class="sample-info">
+                            ${Object.keys(s.readings).length} proxies
+                            ${s.is_outlier ? html`<span style="color:#FF9800;"> \u26a0 outlier</span>` : nothing}
+                          </span>
+                          <span class="sample-time">${new Date(s.timestamp).toLocaleTimeString()}</span>
+                          <button class="sample-remove" @click=${() => this._removeCalibrationSample(s.id)} title="Remove this sample">\u2716</button>
+                        </div>
+                      `)}
+                    </div>
+                  </details>
+                ` : nothing}
               ` : html`<div style="padding:8px;color:var(--text-secondary);font-size:12px;">No debug data available for this device</div>`}
             </div>
           ` : nothing}

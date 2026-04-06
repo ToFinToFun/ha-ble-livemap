@@ -35,6 +35,10 @@ export interface BLELivemapConfig {
   floor_override_min_proxies?: number; // min proxies on new floor before soft override (default: 2)
   zone_override_timeout?: number; // seconds before soft zone override without door passage (default: 45)
   calibration_samples?: CalibrationSample[]; // fingerprint samples for self-calibration
+  /** Push calibration results to Bermuda's per-device ref_power entities */
+  bermuda_sync_enabled?: boolean;
+  /** Continuously re-calibrate when new samples are added */
+  continuous_learning?: boolean;
 }
 
 export interface FloorConfig {
@@ -57,6 +61,10 @@ export interface ProxyCalibration {
   attenuation?: number; // path-loss exponent (calculated, typically 2.0-4.0)
   calibrated_at?: number; // timestamp of last calibration
   distance_offset?: number; // manual distance correction in meters (additive)
+  /** R² goodness-of-fit from last auto-calibration (0-1, higher = better) */
+  r_squared?: number;
+  /** Number of samples used in last calibration */
+  sample_count?: number;
 }
 
 /** A calibration fingerprint sample: "the device was HERE and these were the RSSI values" */
@@ -67,6 +75,20 @@ export interface CalibrationSample {
   floor_id: string;
   timestamp: number;
   readings: { [proxyEntityId: string]: number }; // proxy_entity_id → RSSI (dBm)
+  device_id?: string; // which device was being tracked when this sample was taken
+  /** Outlier flag — set by auto-calibrate if this sample contradicts the model */
+  is_outlier?: boolean;
+}
+
+/** Calibration health status for a proxy */
+export type CalibrationHealthLevel = "excellent" | "good" | "fair" | "poor" | "uncalibrated";
+
+export interface CalibrationHealth {
+  level: CalibrationHealthLevel;
+  r_squared: number; // 0-1
+  sample_count: number;
+  outlier_count: number;
+  message: string;
 }
 
 export interface ProxyConfig {
