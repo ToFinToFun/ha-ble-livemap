@@ -1183,7 +1183,10 @@ export class BLELivemapPanel extends LitElement {
       // If we just finished dragging a door, don't re-handle click
       if (this._draggingDoor !== null) return;
       const doors = this._config.doors || [];
+      const activeFloor = this._getActiveFloor();
       for (let i = doors.length - 1; i >= 0; i--) {
+        // Skip doors on other floors
+        if (activeFloor && doors[i].floor_id && doors[i].floor_id !== activeFloor.id) continue;
         const dx = x - doors[i].x;
         const dy = y - doors[i].y;
         if (Math.sqrt(dx * dx + dy * dy) < 4) {
@@ -1200,7 +1203,10 @@ export class BLELivemapPanel extends LitElement {
     // Check if clicking on a zone (for editing)
     if (this._activeTab === "zones" && !this._drawingZone) {
       const zones = this._config.zones || [];
+      const activeFloor = this._getActiveFloor();
       for (let i = zones.length - 1; i >= 0; i--) {
+        // Skip zones on other floors
+        if (activeFloor && zones[i].floor_id && zones[i].floor_id !== activeFloor.id) continue;
         if (this._isPointInZone(x, y, zones[i])) {
           this._editingZoneIdx = i;
           this.requestUpdate();
@@ -1222,10 +1228,13 @@ export class BLELivemapPanel extends LitElement {
     const coords = this._getMapCoords(e);
     if (!coords) return;
     const { x, y } = coords;
+    const activeFloor = this._getActiveFloor();
 
-    // Check proxies
+    // Check proxies (only on active floor)
     const proxies = this._config.proxies || [];
     for (let i = 0; i < proxies.length; i++) {
+      // Skip proxies on other floors
+      if (activeFloor && proxies[i].floor_id && proxies[i].floor_id !== activeFloor.id) continue;
       if (Math.abs(x - proxies[i].x) < 3 && Math.abs(y - proxies[i].y) < 3) {
         this._draggingProxy = i;
         this._dragStarted = false;
@@ -1234,10 +1243,12 @@ export class BLELivemapPanel extends LitElement {
       }
     }
 
-    // Check doors (only in doors tab)
+    // Check doors (only in doors tab, only on active floor)
     if (this._activeTab === "doors") {
       const doors = this._config.doors || [];
       for (let i = 0; i < doors.length; i++) {
+        // Skip doors on other floors
+        if (activeFloor && doors[i].floor_id && doors[i].floor_id !== activeFloor.id) continue;
         const dx = x - doors[i].x;
         const dy = y - doors[i].y;
         if (Math.sqrt(dx * dx + dy * dy) < 4) {
