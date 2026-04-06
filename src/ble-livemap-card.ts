@@ -34,6 +34,8 @@ import {
   findZoneForArea,
   constrainToPolygon,
   isPointInPolygon,
+  resolveZoneAreaMap,
+  ZoneAreaMapping,
 } from "./bermuda-utils";
 
 // Register the card with HA
@@ -116,6 +118,10 @@ export class BLELivemapCard extends LitElement {
     candidateCount: number;          // consecutive readings of the candidate
     lastReading: number;             // timestamp of last area reading
   }> = new Map();
+
+  // Auto-resolved zone ↔ HA Area mapping (refreshed periodically)
+  private _zoneAreaMap: Map<string, ZoneAreaMapping> = new Map();
+  private _zoneAreaMapStamp = 0;
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -540,8 +546,15 @@ export class BLELivemapCard extends LitElement {
     const floors = this._getFloors();
     const zones = this._config.zones || [];
     const hasMultipleFloors = floors.length > 1;
-    // Check if any zone has ha_area_id or if zone names could match areas
     const hasZoneAreaMapping = zones.length > 0;
+
+    // Refresh the zone ↔ HA Area mapping every 30 seconds
+    // This uses the three-tier strategy: explicit > proxy-position > name-match
+    const now = Date.now();
+    if (hasZoneAreaMapping && (now - this._zoneAreaMapStamp > 30_000)) {
+      this._zoneAreaMap = resolveZoneAreaMap(zones, proxies, this.hass);
+      this._zoneAreaMapStamp = now;
+    }
 
     for (const deviceConfig of this._config.tracked_devices) {
       const distances = this._getDeviceDistances(deviceConfig, proxies);
@@ -564,11 +577,27 @@ export class BLELivemapCard extends LitElement {
           );
 
           if (confirmedAreaName) {
-            // Find the zone that matches this confirmed area
+            // Use the pre-resolved zone area map to find the matching zone.
+            // This leverages the three-tier strategy (explicit > proxy > name)
+            // instead of just name matching.
             const floorId = hasMultipleFloors
               ? this._resolveDeviceFloor(deviceId, distances, proxies)
               : null;
-            areaZone = findZoneForArea(zones, bermudaArea.areaId, confirmedAreaName, floorId);
+
+            // First try: find a zone whose resolved area matches the confirmed area
+            for (const zone of zones) {
+              if (floorId && zone.floor_id && zone.floor_id !== floorId) continue;
+              const mapping = this._zoneAreaMap.get(zone.id);
+              if (mapping && mapping.areaName.toLowerCase().trim() === confirmedAreaName.toLowerCase().trim()) {
+                areaZone = zone;
+                break;
+              }
+            }
+
+            // Fallback: use the original findZoneForArea (handles edge cases)
+            if (!areaZone) {
+              areaZone = findZoneForArea(zones, bermudaArea.areaId, confirmedAreaName, floorId);
+            }
           }
         }
       }

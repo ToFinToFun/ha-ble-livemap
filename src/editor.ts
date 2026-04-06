@@ -26,6 +26,8 @@ import { localize } from "./localize/localize";
 import {
   discoverDevicePrefixes,
   getPolygonCentroid,
+  resolveZoneAreaMap,
+  ZoneAreaMapping,
 } from "./bermuda-utils";
 
 @customElement(CARD_EDITOR_NAME)
@@ -43,9 +45,12 @@ export class BLELivemapCardEditor extends LitElement {
   @state() private _hoverPos: { x: number; y: number } | null = null;
   @state() private _draggingProxy: number | null = null;
   @state() private _autoPlaceResults: string[] = [];
+  @state() private _zoneAreaMap: Map<string, ZoneAreaMapping> = new Map();
 
   private _lang = "en";
   private _dragStarted = false;
+  private _areaRegistry: Map<string, string> = new Map(); // area_id → area_name
+  private _areaRegistryLoaded = false;
 
   setConfig(config: BLELivemapConfig): void {
     this._config = { ...DEFAULT_CONFIG, ...config };
@@ -83,6 +88,39 @@ export class BLELivemapCardEditor extends LitElement {
 
   private _getBermudaDevicePrefixes(): { prefix: string; name: string }[] {
     return discoverDevicePrefixes(this.hass);
+  }
+
+  // ─── Area Registry & Zone-Area Mapping ────────────────────
+
+  private async _loadAreaRegistry(): Promise<void> {
+    if (this._areaRegistryLoaded || !this.hass) return;
+    try {
+      const areas = await this.hass.callWS({ type: "config/area_registry/list" });
+      this._areaRegistry = new Map();
+      for (const area of areas as any[]) {
+        this._areaRegistry.set(area.area_id, area.name);
+      }
+      this._areaRegistryLoaded = true;
+      this._refreshZoneAreaMap();
+    } catch (e) {
+      console.warn("[BLE LiveMap Editor] Failed to load area registry:", e);
+    }
+  }
+
+  private _refreshZoneAreaMap(): void {
+    const zones = this._config.zones || [];
+    const proxies = this._config.proxies || [];
+    this._zoneAreaMap = resolveZoneAreaMap(
+      zones, proxies, this.hass,
+      this._areaRegistry.size > 0 ? this._areaRegistry : undefined
+    );
+  }
+
+  protected updated(changedProps: Map<string, unknown>): void {
+    super.updated(changedProps);
+    if (changedProps.has("hass") && this.hass && !this._areaRegistryLoaded) {
+      this._loadAreaRegistry();
+    }
   }
 
   // ─── Auto-Placement Logic ─────────────────────────────────
@@ -555,6 +593,32 @@ export class BLELivemapCardEditor extends LitElement {
                       @click=${() => this._startDrawingZone(idx)}>
                       ${this._t("editor.zone_redraw")}
                     </button>
+                  </div>
+                  <div class="inline-group">
+                    <span class="label-sm">${this._t("editor.zone_ha_area")}</span>
+                    <select @change=${(e: Event) => {
+                      const val = (e.target as HTMLSelectElement).value;
+                      this._updateZone(idx, "ha_area_id", val || undefined);
+                      setTimeout(() => this._refreshZoneAreaMap(), 50);
+                    }}>
+                      <option value="">${this._t("editor.zone_area_auto")}</option>
+                      ${Array.from(this._areaRegistry.entries()).map(
+                        ([areaId, areaName]) => html`
+                          <option value=${areaId} ?selected=${zone.ha_area_id === areaId}>${areaName}</option>
+                        `
+                      )}
+                    </select>
+                    ${(() => {
+                      const mapping = this._zoneAreaMap.get(zone.id);
+                      if (!mapping) return html`<span class="area-badge area-none">${this._t("editor.zone_area_none")}</span>`;
+                      const icon = mapping.source === "explicit" ? "✓" : mapping.source === "proxy" ? "◉" : "≡";
+                      const tip = mapping.source === "explicit"
+                        ? this._t("editor.zone_area_explicit")
+                        : mapping.source === "proxy"
+                          ? this._t("editor.zone_area_proxy")
+                          : this._t("editor.zone_area_name");
+                      return html`<span class="area-badge area-${mapping.source}" title=${tip}>${icon} ${mapping.areaName}</span>`;
+                    })()}
                   </div>
                 </div>
                 <button class="btn-icon btn-remove" @click=${() => this._removeZone(idx)}>✕</button>
@@ -1204,6 +1268,17 @@ export class BLELivemapCardEditor extends LitElement {
         color: var(--ed-text); cursor: pointer; white-space: nowrap;
       }
       .check input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--ed-accent); }
+
+      /* Area badges */
+      .area-badge {
+        display: inline-flex; align-items: center; gap: 3px;
+        padding: 2px 8px; border-radius: 10px; font-size: 10px;
+        font-weight: 500; white-space: nowrap;
+      }
+      .area-badge.area-explicit { background: rgba(66,165,245,0.2); color: #42A5F5; }
+      .area-badge.area-proxy { background: rgba(102,187,106,0.2); color: #66BB6A; }
+      .area-badge.area-name { background: rgba(255,167,38,0.2); color: #FFA726; }
+      .area-badge.area-none { background: rgba(158,158,158,0.15); color: var(--ed-text2); }
 
       .toggles { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 

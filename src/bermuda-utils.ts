@@ -485,3 +485,222 @@ export function applyRssiCalibration(
 
   return Math.round(distance * 100) / 100;
 }
+
+// ─── Proxy Area Resolution ─────────────────────────────────────────
+
+/**
+ * Resolve the HA Area for a proxy entity.
+ *
+ * Proxies are typically ESPHome or Shelly devices that Bermuda discovers.
+ * Their HA Area can be found via:
+ * 1. The device_tracker entity attributes (area_name / area_id)
+ * 2. Passed-in area registry data (from device registry → area_id lookup)
+ *
+ * This function uses approach 1 (entity attributes) so it works without
+ * loading the full device registry.
+ */
+export function readProxyArea(
+  hass: HomeAssistant,
+  proxyEntityId: string
+): { areaId: string; areaName: string } | null {
+  if (!hass?.states || !proxyEntityId) return null;
+
+  const proxySlug = extractProxySlug(proxyEntityId);
+
+  // Try device_tracker entity for this proxy
+  const dtCandidates = [
+    `device_tracker.${proxySlug}`,
+    `device_tracker.bermuda_${proxySlug}`,
+  ];
+
+  for (const dtId of dtCandidates) {
+    const state = hass.states[dtId];
+    if (state?.attributes?.area_name) {
+      return {
+        areaId: state.attributes.area_id || "",
+        areaName: state.attributes.area_name,
+      };
+    }
+  }
+
+  // Try sensor entities for area info
+  for (const entityId of Object.keys(hass.states)) {
+    if (entityId.includes(proxySlug) && entityId.includes("_area")) {
+      const state = hass.states[entityId];
+      if (state && state.state && state.state !== "unknown" && state.state !== "unavailable") {
+        return {
+          areaId: state.attributes?.area_id || "",
+          areaName: state.state,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+// ─── Zone ↔ Area Auto-Matching ─────────────────────────────────────
+
+export interface ZoneAreaMapping {
+  areaId: string;
+  areaName: string;
+  source: "explicit" | "proxy" | "name";
+}
+
+/**
+ * Resolve the HA Area for each zone using a three-tier strategy:
+ *
+ * **Tier 1 — Explicit:** Zone has `ha_area_id` set (manual override in editor).
+ *
+ * **Tier 2 — Proxy-based:** Find proxies whose (x,y) position falls inside
+ * the zone polygon. If those proxies belong to an HA Area, the zone inherits
+ * that Area. If multiple proxies are inside, majority vote wins.
+ *
+ * **Tier 3 — Name match:** Fall back to case-insensitive name matching between
+ * zone name and available HA Area names.
+ *
+ * @param zones - All configured zones
+ * @param proxies - All configured proxies (with x,y positions)
+ * @param hass - Home Assistant state object
+ * @param areaRegistry - Optional Map<area_id, area_name> from device/area registry.
+ *   If provided, used for Tier 1 area_id → name resolution and Tier 3 name matching.
+ *   If not provided, Tier 3 falls back to matching against Bermuda area sensor states.
+ * @param proxyAreaOverrides - Optional Map<proxy_entity_id, { areaId, areaName }>
+ *   from device registry enrichment (panel.ts already computes this).
+ */
+export function resolveZoneAreaMap(
+  zones: ZoneConfig[],
+  proxies: ProxyConfig[],
+  hass: HomeAssistant,
+  areaRegistry?: Map<string, string>,
+  proxyAreaOverrides?: Map<string, { areaId: string; areaName: string }>
+): Map<string, ZoneAreaMapping> {
+  const result = new Map<string, ZoneAreaMapping>();
+  if (!zones || zones.length === 0) return result;
+
+  // Collect all known HA Area names for Tier 3 matching
+  const allAreaNames = new Map<string, string>(); // lowercase name → original name
+  const allAreaIds = new Map<string, string>(); // area_id → area_name
+
+  if (areaRegistry) {
+    for (const [id, name] of areaRegistry) {
+      allAreaNames.set(name.toLowerCase().trim(), name);
+      allAreaIds.set(id, name);
+    }
+  }
+
+  // Pre-compute proxy areas
+  const proxyAreas = new Map<string, { areaId: string; areaName: string }>();
+  for (const proxy of proxies) {
+    if (proxyAreaOverrides?.has(proxy.entity_id)) {
+      proxyAreas.set(proxy.entity_id, proxyAreaOverrides.get(proxy.entity_id)!);
+    } else {
+      const area = readProxyArea(hass, proxy.entity_id);
+      if (area) proxyAreas.set(proxy.entity_id, area);
+    }
+  }
+
+  // Also collect area names from proxy areas (for Tier 3 when no registry)
+  if (!areaRegistry) {
+    for (const [, area] of proxyAreas) {
+      if (area.areaName) {
+        allAreaNames.set(area.areaName.toLowerCase().trim(), area.areaName);
+        if (area.areaId) allAreaIds.set(area.areaId, area.areaName);
+      }
+    }
+    // Also scan Bermuda area sensors for more area names
+    if (hass?.states) {
+      for (const [entityId, state] of Object.entries(hass.states)) {
+        if (entityId.includes("_area") && entityId.startsWith("sensor.bermuda_")) {
+          if (state.state && state.state !== "unknown" && state.state !== "unavailable") {
+            allAreaNames.set(state.state.toLowerCase().trim(), state.state);
+            if (state.attributes?.area_id) {
+              allAreaIds.set(state.attributes.area_id, state.state);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (const zone of zones) {
+    // ── Tier 1: Explicit ha_area_id ──
+    if (zone.ha_area_id) {
+      const areaName = allAreaIds.get(zone.ha_area_id) || zone.ha_area_id;
+      result.set(zone.id, {
+        areaId: zone.ha_area_id,
+        areaName,
+        source: "explicit",
+      });
+      continue;
+    }
+
+    // ── Tier 2: Proxy position inside zone polygon ──
+    if (zone.points && zone.points.length >= 3 && proxies.length > 0) {
+      const areasInZone = new Map<string, { areaId: string; areaName: string; count: number }>();
+
+      for (const proxy of proxies) {
+        // Filter by floor if both zone and proxy have floor_id
+        if (zone.floor_id && proxy.floor_id && zone.floor_id !== proxy.floor_id) continue;
+
+        if (isPointInPolygon(proxy.x, proxy.y, zone.points)) {
+          const proxyArea = proxyAreas.get(proxy.entity_id);
+          if (proxyArea && proxyArea.areaName) {
+            const key = proxyArea.areaName.toLowerCase().trim();
+            const existing = areasInZone.get(key);
+            if (existing) {
+              existing.count++;
+            } else {
+              areasInZone.set(key, {
+                areaId: proxyArea.areaId,
+                areaName: proxyArea.areaName,
+                count: 1,
+              });
+            }
+          }
+        }
+      }
+
+      // Majority vote: pick the area with the most proxies
+      if (areasInZone.size > 0) {
+        let bestArea: { areaId: string; areaName: string; count: number } | null = null;
+        for (const area of areasInZone.values()) {
+          if (!bestArea || area.count > bestArea.count) {
+            bestArea = area;
+          }
+        }
+        if (bestArea) {
+          result.set(zone.id, {
+            areaId: bestArea.areaId,
+            areaName: bestArea.areaName,
+            source: "proxy",
+          });
+          continue;
+        }
+      }
+    }
+
+    // ── Tier 3: Name matching ──
+    if (zone.name) {
+      const normalizedZoneName = zone.name.toLowerCase().trim();
+      const matchedAreaName = allAreaNames.get(normalizedZoneName);
+      if (matchedAreaName) {
+        // Find the area_id for this name
+        let matchedAreaId = "";
+        for (const [id, name] of allAreaIds) {
+          if (name.toLowerCase().trim() === normalizedZoneName) {
+            matchedAreaId = id;
+            break;
+          }
+        }
+        result.set(zone.id, {
+          areaId: matchedAreaId,
+          areaName: matchedAreaName,
+          source: "name",
+        });
+      }
+    }
+  }
+
+  return result;
+}
