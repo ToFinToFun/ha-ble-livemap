@@ -119,6 +119,9 @@ export function collectDeviceDistances(
         if (applyCalibrationFn && proxy.calibration?.ref_rssi !== undefined && state.attributes?.rssi) {
           const calibrated = applyCalibrationFn(state.attributes.rssi, proxy.calibration);
           if (calibrated !== null) dist = calibrated;
+        } else if (proxy.calibration?.distance_offset) {
+          // Apply manual distance offset even without full RSSI calibration
+          dist = Math.max(0.1, dist + proxy.calibration.distance_offset);
         }
 
         distances.push({
@@ -472,16 +475,25 @@ export function applyRssiCalibration(
   measuredRssi: number,
   calibration: ProxyCalibration
 ): number | null {
-  if (!calibration?.ref_rssi) return null;
+  if (!calibration?.ref_rssi) {
+    // Even without RSSI calibration, apply distance_offset if set
+    if (calibration?.distance_offset) return null; // handled in collectDeviceDistances
+    return null;
+  }
 
   const refRssi = calibration.ref_rssi;
   const refDist = calibration.ref_distance || 1.0;
   const n = calibration.attenuation || 2.5;
 
-  const distance = refDist * Math.pow(10, (refRssi - measuredRssi) / (10 * n));
+  let distance = refDist * Math.pow(10, (refRssi - measuredRssi) / (10 * n));
 
-  // Sanity check: BLE distances should be 0-50m
-  if (distance < 0 || distance > 50 || isNaN(distance)) return null;
+  // Apply manual distance offset if set
+  if (calibration.distance_offset) {
+    distance += calibration.distance_offset;
+  }
+
+  // Sanity check: BLE distances should be 0.1-50m
+  if (distance < 0.1 || distance > 50 || isNaN(distance)) return null;
 
   return Math.round(distance * 100) / 100;
 }

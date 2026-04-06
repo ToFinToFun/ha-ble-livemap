@@ -26,6 +26,7 @@ import {
   GATEWAY_TYPES,
   GatewayType,
   ProxyCalibration,
+  CalibrationSample,
   DOOR_TYPES,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
@@ -114,6 +115,9 @@ export class BLELivemapPanel extends LitElement {
   @state() private _showDebugPanel: boolean = false;
   /** Currently selected device for debug visualization (entity_prefix) */
   @state() private _debugFollowDevice: string = "";
+  /** "I Am Here" calibration mode */
+  @state() private _calibrationMode: boolean = false;
+  @state() private _calibrationToast: string = "";
   private _liveTrackingTimer: number | null = null;
   private _dragStarted = false;
 
@@ -1039,12 +1043,18 @@ export class BLELivemapPanel extends LitElement {
     if (!coords) return;
     const { x, y } = coords;
 
-    // Calibration mode
+    // Dimension calibration mode
     if (this._calibrating) {
       this._calibrationPoints = [...this._calibrationPoints, { x, y }];
       if (this._calibrationPoints.length >= 2) {
         this.requestUpdate();
       }
+      return;
+    }
+
+    // "I Am Here" fingerprint calibration mode
+    if (this._calibrationMode && this._debugFollowDevice) {
+      this._recordCalibrationSample(x, y);
       return;
     }
 
@@ -1549,6 +1559,183 @@ export class BLELivemapPanel extends LitElement {
 
     const { calibration, ...rest } = proxies[proxyIdx] as any;
     proxies[proxyIdx] = rest;
+    this._updateConfig("proxies", proxies);
+  }
+
+  // ─── Self-Calibration ("I Am Here" + Auto-Learn) ──────────────
+
+  /**
+   * Record a calibration fingerprint sample at the clicked position.
+   * Captures the current RSSI from every visible proxy for the followed device.
+   */
+  private _recordCalibrationSample(x: number, y: number): void {
+    if (!this._debugFollowDevice || !this.hass) return;
+
+    const floor = this._getActiveFloor();
+    const floorId = floor?.id || "default";
+
+    // Collect current RSSI readings from all proxies for this device
+    const readings: { [proxyId: string]: number } = {};
+    for (const info of this._liveDebugInfo) {
+      if (info.rssi !== null && info.distance !== null) {
+        readings[info.proxyId] = info.rssi;
+      }
+    }
+
+    if (Object.keys(readings).length === 0) {
+      this._calibrationToast = "No RSSI readings available!";
+      setTimeout(() => { this._calibrationToast = ""; }, 3000);
+      return;
+    }
+
+    const sample: CalibrationSample = {
+      id: `cal_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      x,
+      y,
+      floor_id: floorId,
+      timestamp: Date.now(),
+      readings,
+    };
+
+    const samples = [...(this._config.calibration_samples || []), sample];
+    this._updateConfig("calibration_samples", samples);
+
+    this._calibrationToast = `\u2705 Sample #${samples.length} recorded (${Object.keys(readings).length} proxies)`;
+    setTimeout(() => { this._calibrationToast = ""; }, 3000);
+  }
+
+  /**
+   * Auto-calibrate all proxies using collected fingerprint samples.
+   *
+   * For each proxy, fits the log-distance path-loss model:
+   *   RSSI = ref_rssi - 10 * n * log10(d / ref_dist)
+   *
+   * Using least-squares regression on all samples where that proxy had a reading.
+   */
+  private _autoCalibrate(): void {
+    const samples = this._config.calibration_samples || [];
+    if (samples.length < 2) {
+      this._calibrationToast = "Need at least 2 samples to calibrate";
+      setTimeout(() => { this._calibrationToast = ""; }, 3000);
+      return;
+    }
+
+    const proxies = [...(this._config.proxies || [])];
+    const floor = this._getActiveFloor();
+    const imageWidth = floor?.image_width || 20;
+    const imageHeight = floor?.image_height || 15;
+    let calibratedCount = 0;
+
+    for (let i = 0; i < proxies.length; i++) {
+      const proxy = proxies[i];
+      if (!proxy.x && !proxy.y) continue;
+
+      const proxySlug = proxy.entity_id
+        .replace(/^ble_proxy_/, "")
+        .replace(/^bermuda_proxy_/, "")
+        .replace(/^.*\./, "")
+        .replace(/_proxy$/, "");
+
+      // Collect all samples that have a reading for this proxy
+      const dataPoints: { distance: number; rssi: number }[] = [];
+
+      for (const sample of samples) {
+        const rssi = sample.readings[proxySlug];
+        if (rssi === undefined) continue;
+        if (sample.floor_id && proxy.floor_id && sample.floor_id !== proxy.floor_id) continue;
+
+        // Calculate real distance from sample position to proxy position
+        const dx = ((sample.x - proxy.x) / 100) * imageWidth;
+        const dy = ((sample.y - proxy.y) / 100) * imageHeight;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        if (distance > 0.1) { // Skip if too close (unreliable)
+          dataPoints.push({ distance, rssi });
+        }
+      }
+
+      if (dataPoints.length < 2) continue;
+
+      // Fit log-distance model: RSSI = A - 10*n*log10(d)
+      // where A = ref_rssi at 1m, n = path-loss exponent
+      // Using linear regression on: RSSI = A - B * log10(d)
+      // where B = 10*n
+
+      let sumLogD = 0, sumRssi = 0, sumLogD2 = 0, sumLogDRssi = 0;
+      let count = 0;
+
+      for (const dp of dataPoints) {
+        const logD = Math.log10(dp.distance);
+        sumLogD += logD;
+        sumRssi += dp.rssi;
+        sumLogD2 += logD * logD;
+        sumLogDRssi += logD * dp.rssi;
+        count++;
+      }
+
+      // Linear regression: RSSI = A + B * log10(d)
+      // B should be negative (RSSI decreases with distance)
+      const denom = count * sumLogD2 - sumLogD * sumLogD;
+      if (Math.abs(denom) < 1e-10) continue;
+
+      const B = (count * sumLogDRssi - sumLogD * sumRssi) / denom;
+      const A = (sumRssi - B * sumLogD) / count;
+
+      // B = -10*n, so n = -B/10
+      const n = -B / 10;
+
+      // Sanity check: n should be between 1.5 and 5.0 for indoor BLE
+      if (n < 1.5 || n > 5.0 || isNaN(n)) continue;
+
+      // A is the RSSI at 1 meter
+      const refRssi = Math.round(A);
+      if (refRssi > -20 || refRssi < -90) continue; // unreasonable
+
+      proxies[i] = {
+        ...proxies[i],
+        calibration: {
+          ...(proxies[i].calibration || {} as ProxyCalibration),
+          ref_rssi: refRssi,
+          ref_distance: 1.0,
+          attenuation: Math.round(n * 100) / 100,
+          calibrated_at: Date.now(),
+        },
+      };
+      calibratedCount++;
+    }
+
+    if (calibratedCount > 0) {
+      this._updateConfig("proxies", proxies);
+      this._calibrationToast = `\u2705 Auto-calibrated ${calibratedCount} proxies from ${samples.length} samples`;
+    } else {
+      this._calibrationToast = "\u26a0 Could not calibrate any proxies (need more diverse samples)";
+    }
+    setTimeout(() => { this._calibrationToast = ""; }, 5000);
+  }
+
+  /**
+   * Clear all calibration samples.
+   */
+  private _clearCalibrationSamples(): void {
+    this._updateConfig("calibration_samples", []);
+    this._calibrationToast = "All calibration samples cleared";
+    setTimeout(() => { this._calibrationToast = ""; }, 3000);
+  }
+
+  /**
+   * Update distance_offset for a specific proxy.
+   */
+  private _updateProxyDistanceOffset(proxyIdx: number, offset: number): void {
+    const proxies = [...(this._config.proxies || [])];
+    if (!proxies[proxyIdx]) return;
+
+    proxies[proxyIdx] = {
+      ...proxies[proxyIdx],
+      calibration: {
+        ...(proxies[proxyIdx].calibration || { ref_rssi: 0, ref_distance: 1.0 } as ProxyCalibration),
+        distance_offset: offset,
+      },
+    };
     this._updateConfig("proxies", proxies);
   }
 
@@ -2293,6 +2480,72 @@ export class BLELivemapPanel extends LitElement {
         opacity: 0.7;
       }
 
+      /* Calibration toolbar */
+      .calib-toolbar {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+      }
+
+      .calib-hint {
+        background: rgba(33, 150, 243, 0.15);
+        border: 1px solid rgba(33, 150, 243, 0.4);
+        border-radius: 6px;
+        padding: 8px 12px;
+        margin-bottom: 8px;
+        font-size: 11px;
+        color: #64B5F6;
+        animation: calib-hint-pulse 1.5s ease-in-out infinite;
+      }
+
+      @keyframes calib-hint-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+      }
+
+      .calib-toast {
+        background: rgba(76, 175, 80, 0.15);
+        border: 1px solid rgba(76, 175, 80, 0.4);
+        border-radius: 6px;
+        padding: 6px 12px;
+        margin-bottom: 8px;
+        font-size: 11px;
+        color: #81C784;
+      }
+
+      .offset-input {
+        width: 52px;
+        padding: 2px 4px;
+        font-size: 10px;
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.2));
+        border-radius: 3px;
+        background: var(--card-bg, #1e1e1e);
+        color: var(--text-primary, #fff);
+        text-align: center;
+      }
+
+      .offset-input:focus {
+        outline: none;
+        border-color: #2196F3;
+      }
+
+      /* Calibration sample markers on map */
+      .calib-sample-marker {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #FF9800;
+        border: 2px solid #fff;
+        pointer-events: none;
+        z-index: 22;
+        opacity: 0.7;
+      }
+
       /* Door markers */
       .door-marker {
         position: absolute;
@@ -3019,6 +3272,7 @@ export class BLELivemapPanel extends LitElement {
                   .value=${this._debugFollowDevice}
                   @change=${(e: Event) => {
                     this._debugFollowDevice = (e.target as HTMLSelectElement).value;
+                    this._calibrationMode = false;
                     this._liveDebugInfo = this._trackingEngine?.getDebugInfo(this._debugFollowDevice) || [];
                   }}
                 >
@@ -3029,6 +3283,39 @@ export class BLELivemapPanel extends LitElement {
                   `)}
                 </select>
               </div>
+
+              <!-- Calibration toolbar -->
+              <div class="calib-toolbar">
+                <button
+                  class="btn btn-small ${this._calibrationMode ? 'btn-danger' : 'btn-secondary'}"
+                  @click=${() => { this._calibrationMode = !this._calibrationMode; }}
+                  title="Click on the map to record RSSI fingerprint at that position"
+                >
+                  ${this._calibrationMode ? '\u2716 Cancel' : '\ud83d\udccd I Am Here'}
+                </button>
+                <button
+                  class="btn btn-small btn-primary"
+                  @click=${() => this._autoCalibrate()}
+                  title="Fit path-loss model from collected samples"
+                  ?disabled=${(this._config.calibration_samples || []).length < 2}
+                >
+                  \ud83e\uddee Auto-Calibrate (${(this._config.calibration_samples || []).length} samples)
+                </button>
+                ${(this._config.calibration_samples || []).length > 0 ? html`
+                  <button
+                    class="btn btn-small btn-danger"
+                    @click=${() => this._clearCalibrationSamples()}
+                    title="Remove all calibration samples"
+                  >\ud83d\uddd1 Clear</button>
+                ` : nothing}
+              </div>
+              ${this._calibrationMode ? html`
+                <div class="calib-hint">\ud83d\udc46 Click on the map where the device is RIGHT NOW to record a fingerprint</div>
+              ` : nothing}
+              ${this._calibrationToast ? html`
+                <div class="calib-toast">${this._calibrationToast}</div>
+              ` : nothing}
+
               ${this._liveDebugInfo.length > 0 ? html`
                 <table class="debug-table">
                   <thead>
@@ -3036,7 +3323,7 @@ export class BLELivemapPanel extends LitElement {
                       <th>Proxy</th>
                       <th>Distance</th>
                       <th>RSSI</th>
-                      <th>Placed</th>
+                      <th>Offset</th>
                       <th>Status</th>
                     </tr>
                   </thead>
@@ -3044,26 +3331,47 @@ export class BLELivemapPanel extends LitElement {
                     ${this._liveDebugInfo
                       .slice()
                       .sort((a, b) => {
-                        // Active proxies first, then by distance
                         if (a.distance !== null && b.distance === null) return -1;
                         if (a.distance === null && b.distance !== null) return 1;
                         if (a.distance !== null && b.distance !== null) return a.distance - b.distance;
                         return a.proxyName.localeCompare(b.proxyName);
                       })
-                      .map((d) => html`
-                      <tr class="${d.distance !== null ? 'debug-active' : 'debug-inactive'}">
-                        <td title="${d.sensorId}">${d.proxyName}</td>
-                        <td>${d.distance !== null ? d.distance.toFixed(2) + 'm' : '—'}</td>
-                        <td>${d.rssi !== null ? d.rssi + ' dBm' : '—'}</td>
-                        <td>${d.placed ? '✓' : '✗'}</td>
-                        <td>${d.distance !== null && d.placed ? '✅ Active' : d.distance !== null && !d.placed ? '⚠ Not placed' : '❌ No signal'}</td>
-                      </tr>
-                    `)}
+                      .map((d) => {
+                        const proxyIdx = (this._config.proxies || []).findIndex(p => p.entity_id === d.proxyId);
+                        const proxy = proxyIdx >= 0 ? (this._config.proxies || [])[proxyIdx] : null;
+                        const offset = proxy?.calibration?.distance_offset || 0;
+                        return html`
+                        <tr class="${d.distance !== null ? 'debug-active' : 'debug-inactive'}">
+                          <td title="${d.sensorId}">${d.proxyName}</td>
+                          <td>${d.distance !== null ? d.distance.toFixed(2) + 'm' : '\u2014'}</td>
+                          <td>${d.rssi !== null ? d.rssi + ' dBm' : '\u2014'}</td>
+                          <td>
+                            ${proxyIdx >= 0 ? html`
+                              <input
+                                type="number"
+                                class="offset-input"
+                                step="0.1"
+                                min="-10"
+                                max="10"
+                                .value=${String(offset)}
+                                @change=${(e: Event) => {
+                                  const val = parseFloat((e.target as HTMLInputElement).value) || 0;
+                                  this._updateProxyDistanceOffset(proxyIdx, val);
+                                }}
+                                title="Distance offset in meters (positive = farther, negative = closer)"
+                              />
+                            ` : '\u2014'}
+                          </td>
+                          <td>${d.distance !== null && d.placed ? '\u2705' : d.distance !== null && !d.placed ? '\u26a0' : '\u274c'}</td>
+                        </tr>
+                      `;
+                      })}
                   </tbody>
                 </table>
                 <div class="debug-summary">
                   Active: ${this._liveDebugInfo.filter(d => d.distance !== null).length} / ${this._liveDebugInfo.length} |
-                  Used for trilateration: ${this._liveDebugInfo.filter(d => d.distance !== null && d.placed).length}
+                  Trilateration: ${this._liveDebugInfo.filter(d => d.distance !== null && d.placed).length} |
+                  Samples: ${(this._config.calibration_samples || []).length}
                 </div>
               ` : html`<div style="padding:8px;color:var(--text-secondary);font-size:12px;">No debug data available for this device</div>`}
             </div>
@@ -3613,6 +3921,19 @@ export class BLELivemapPanel extends LitElement {
           </div>
         `);
       }
+    }
+
+    // Show calibration sample markers on the map
+    const samples = this._config.calibration_samples || [];
+    for (const sample of samples) {
+      if (sample.floor_id && sample.floor_id !== floorId) continue;
+      markers.push(html`
+        <div
+          class="calib-sample-marker"
+          style="left: ${sample.x}%; top: ${sample.y}%;"
+          title="Sample #${samples.indexOf(sample) + 1} — ${Object.keys(sample.readings).length} proxies — ${new Date(sample.timestamp).toLocaleTimeString()}"
+        ></div>
+      `);
     }
 
     return markers;

@@ -34,6 +34,7 @@ export interface BLELivemapConfig {
   floor_override_timeout?: number; // seconds before soft floor override without gateway (default: 60)
   floor_override_min_proxies?: number; // min proxies on new floor before soft override (default: 2)
   zone_override_timeout?: number; // seconds before soft zone override without door passage (default: 45)
+  calibration_samples?: CalibrationSample[]; // fingerprint samples for self-calibration
 }
 
 export interface FloorConfig {
@@ -55,6 +56,17 @@ export interface ProxyCalibration {
   ref_distance: number; // distance in meters where ref_rssi was measured (default: 1.0)
   attenuation?: number; // path-loss exponent (calculated, typically 2.0-4.0)
   calibrated_at?: number; // timestamp of last calibration
+  distance_offset?: number; // manual distance correction in meters (additive)
+}
+
+/** A calibration fingerprint sample: "the device was HERE and these were the RSSI values" */
+export interface CalibrationSample {
+  id: string; // unique ID
+  x: number; // % position on map
+  y: number; // % position on map
+  floor_id: string;
+  timestamp: number;
+  readings: { [proxyEntityId: string]: number }; // proxy_entity_id → RSSI (dBm)
 }
 
 export interface ProxyConfig {
