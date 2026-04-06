@@ -119,11 +119,12 @@ export class BLELivemapPanel extends LitElement {
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
+    this._stopLiveTracking();
+    this._removeGlobalDragListeners();
     if (this._calibWizardTimer) {
       clearInterval(this._calibWizardTimer);
       this._calibWizardTimer = null;
     }
-    this._stopLiveTracking();
   }
 
   protected updated(changedProperties: PropertyValues): void {
@@ -1091,6 +1092,7 @@ export class BLELivemapPanel extends LitElement {
       const py = proxies[i].y;
       if (Math.abs(x - px) < 3 && Math.abs(y - py) < 3) {
         this._draggingProxy = i;
+        this._addGlobalDragListeners();
         return;
       }
     }
@@ -1139,10 +1141,25 @@ export class BLELivemapPanel extends LitElement {
   private _handleMapMouseUp(): void {
     if (this._draggingProxy !== null) {
       this._draggingProxy = null;
+      this._removeGlobalDragListeners();
     }
     if (this._draggingDoor !== null) {
       this._draggingDoor = null;
+      this._removeGlobalDragListeners();
     }
+  }
+
+  private _globalMouseUpHandler = () => this._handleMapMouseUp();
+  private _globalMouseMoveHandler = (e: MouseEvent) => this._handleMapMouseMove(e);
+
+  private _addGlobalDragListeners(): void {
+    document.addEventListener("mouseup", this._globalMouseUpHandler);
+    document.addEventListener("mousemove", this._globalMouseMoveHandler);
+  }
+
+  private _removeGlobalDragListeners(): void {
+    document.removeEventListener("mouseup", this._globalMouseUpHandler);
+    document.removeEventListener("mousemove", this._globalMouseMoveHandler);
   }
 
   // ─── Live Device Tracking ─────────────────────────────────
@@ -2144,6 +2161,15 @@ export class BLELivemapPanel extends LitElement {
         -webkit-user-select: none;
       }
 
+      /* During active drag, disable pointer-events on all markers so mouse events reach map-inner */
+      .map-inner.dragging .proxy-marker,
+      .map-inner.dragging .door-marker,
+      .map-inner.dragging .proxy-label,
+      .map-inner.dragging .zone-label-overlay,
+      .map-inner.dragging .zone-polygon {
+        pointer-events: none !important;
+      }
+
       .proxy-marker:hover {
         transform: translate(-50%, -50%) scale(1.2);
       }
@@ -2314,13 +2340,28 @@ export class BLELivemapPanel extends LitElement {
       .draw-point {
         position: absolute;
         transform: translate(-50%, -50%);
-        width: 10px;
-        height: 10px;
+        width: 12px;
+        height: 12px;
         border-radius: 50%;
         background: #FF5722;
         border: 2px solid white;
         pointer-events: none;
         z-index: 20;
+        box-shadow: 0 0 6px rgba(255, 87, 34, 0.7);
+      }
+
+      .draw-point-first {
+        width: 16px;
+        height: 16px;
+        background: #4CAF50;
+        border: 3px solid white;
+        box-shadow: 0 0 10px rgba(76, 175, 80, 0.8);
+        animation: pulse-point 1.5s ease-in-out infinite;
+      }
+
+      @keyframes pulse-point {
+        0%, 100% { transform: translate(-50%, -50%) scale(1); }
+        50% { transform: translate(-50%, -50%) scale(1.3); }
       }
 
       .rect-preview, .cal-line {
@@ -3325,7 +3366,7 @@ export class BLELivemapPanel extends LitElement {
           class="door-marker ${isEditing ? 'editing' : ''} ${isDoorTab ? 'clickable' : ''}"
           style="left: ${door.x}%; top: ${door.y}%; --door-color: ${color}; cursor: ${isDoorTab ? 'grab' : 'pointer'};"
           title="${door.name || `Door ${idx + 1}`}\n${door.type}"
-          @mousedown=${isDoorTab ? (e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingDoor = idx; this._editingDoorIdx = idx; this.requestUpdate(); } : undefined}
+          @mousedown=${isDoorTab ? (e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingDoor = idx; this._editingDoorIdx = idx; this._addGlobalDragListeners(); this.requestUpdate(); } : undefined}
         >
           <span class="door-icon">${icon}</span>
         </div>
@@ -3351,7 +3392,7 @@ export class BLELivemapPanel extends LitElement {
         <div
           class="proxy-marker"
           style="left: ${proxy.x}%; top: ${proxy.y}%;"
-          @mousedown=${(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingProxy = idx; }}
+          @mousedown=${(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingProxy = idx; this._addGlobalDragListeners(); }}
           title="${proxy.name || proxy.entity_id}\n${proxy.entity_id}\nPosition: ${proxy.x.toFixed(1)}%, ${proxy.y.toFixed(1)}%"
         >${idx + 1}</div>
         <div class="proxy-label" style="left: ${proxy.x}%; top: ${proxy.y + 2}%;">
@@ -3432,16 +3473,31 @@ export class BLELivemapPanel extends LitElement {
 
   private _renderDrawingPoints() {
     if (!this._drawingZone || this._drawingMode !== "polygon") return nothing;
+    const zones = this._config.zones || [];
+    const nextColor = ZONE_COLORS[zones.length % ZONE_COLORS.length];
+    // Show filled preview polygon when 3+ points
+    const showFill = this._drawingPoints.length >= 3;
+    const pointsStr = this._drawingPoints.map((p) => `${p.x}%,${p.y}%`).join(" ");
     return html`
-      ${this._drawingPoints.map((p) => html`
-        <div class="draw-point" style="left: ${p.x}%; top: ${p.y}%;"></div>
+      ${this._drawingPoints.map((p, i) => html`
+        <div class="draw-point ${i === 0 ? 'draw-point-first' : ''}" style="left: ${p.x}%; top: ${p.y}%;"></div>
       `)}
       ${this._drawingPoints.length >= 2 ? html`
         <svg class="zone-polygon" viewBox="0 0 100 100" preserveAspectRatio="none">
+          ${showFill ? html`
+            <polygon
+              points=${pointsStr}
+              fill="${nextColor}"
+              fill-opacity="0.4"
+              stroke="${nextColor}"
+              stroke-width="0.6"
+              stroke-opacity="0.9"
+            />
+          ` : nothing}
           ${this._drawingPoints.map((p, i) => {
             if (i === 0) return nothing;
             const prev = this._drawingPoints[i - 1];
-            return html`<line x1="${prev.x}" y1="${prev.y}" x2="${p.x}" y2="${p.y}" stroke="#FF5722" stroke-width="0.3" stroke-dasharray="1,0.5" />`;
+            return html`<line x1="${prev.x}" y1="${prev.y}" x2="${p.x}" y2="${p.y}" stroke="${nextColor}" stroke-width="0.6" stroke-opacity="0.9" />`;
           })}
         </svg>
       ` : nothing}
@@ -3450,8 +3506,10 @@ export class BLELivemapPanel extends LitElement {
 
   private _renderRectPreview() {
     if (!this._drawingZone || this._drawingMode !== "rectangle" || !this._rectStart) return nothing;
+    const zones = this._config.zones || [];
+    const nextColor = ZONE_COLORS[zones.length % ZONE_COLORS.length];
 
-    const startHtml = html`<div class="draw-point" style="left: ${this._rectStart.x}%; top: ${this._rectStart.y}%;"></div>`;
+    const startHtml = html`<div class="draw-point draw-point-first" style="left: ${this._rectStart.x}%; top: ${this._rectStart.y}%;"></div>`;
 
     if (!this._rectPreview) return startHtml;
 
@@ -3468,10 +3526,11 @@ export class BLELivemapPanel extends LitElement {
         <rect
           x="${minX}" y="${minY}"
           width="${maxX - minX}" height="${maxY - minY}"
-          fill="rgba(255, 87, 34, 0.15)"
-          stroke="#FF5722"
-          stroke-width="0.3"
-          stroke-dasharray="1,0.5"
+          fill="${nextColor}"
+          fill-opacity="0.4"
+          stroke="${nextColor}"
+          stroke-width="0.6"
+          stroke-opacity="0.9"
         />
       </svg>
     `;
