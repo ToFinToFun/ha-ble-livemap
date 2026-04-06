@@ -2,7 +2,7 @@
 
 [![HACS Badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.8.1-blue.svg)](https://github.com/ToFinToFun/ha-ble-livemap/releases)
+[![Version](https://img.shields.io/badge/version-1.9.10-blue.svg)](https://github.com/ToFinToFun/ha-ble-livemap/releases)
 
 **Real-time BLE device position tracking on your floor plan for Home Assistant.**
 
@@ -56,11 +56,11 @@ Track phones, watches, tags, and any Bluetooth device on an interactive floor pl
 
 ### Manual
 
-1. Download `ble-livemap-card.js` from the [latest release](https://github.com/ToFinToFun/ha-ble-livemap/releases)
-2. Copy it to `<config>/www/ble-livemap-card.js`
+1. Download `ble-livemap-loader.js` and `ble-livemap-core.js` from the [latest release](https://github.com/ToFinToFun/ha-ble-livemap/releases)
+2. Copy both files to `<config>/www/`
 3. Add a resource in **Settings → Dashboards → Resources**:
    ```yaml
-   url: /local/ble-livemap-card.js
+   url: /local/ble-livemap-loader.js
    type: module
    ```
 4. Restart Home Assistant
@@ -82,14 +82,14 @@ panel_custom:
     sidebar_title: BLE LiveMap
     sidebar_icon: mdi:map-marker-radius
     url_path: ble-livemap
-    module_url: /hacsfiles/ha-ble-livemap/ble-livemap-card.js
+    module_url: /hacsfiles/ha-ble-livemap/ble-livemap-loader.js
     trust_external_script: true
 ```
 
 3. Restart Home Assistant
 4. You will now see **BLE LiveMap** in your sidebar!
 
-**Important:** Do NOT add `?v=X.X.X` or any query parameters to `module_url`. This prevents automatic updates from working.
+**Important:** Do NOT add `?v=X.X.X` or any query parameters to `module_url`. The loader handles cache-busting automatically.
 
 ---
 
@@ -227,7 +227,7 @@ pnpm install
 pnpm build
 ```
 
-The built file will be at `dist/ble-livemap-card.js`.
+The built files will be at `dist/ble-livemap-loader.js` and `dist/ble-livemap-core.js`.
 
 ---
 

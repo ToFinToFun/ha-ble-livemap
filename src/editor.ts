@@ -23,6 +23,10 @@ import {
 } from "./types";
 import { CARD_EDITOR_NAME } from "./const";
 import { localize } from "./localize/localize";
+import {
+  discoverDevicePrefixes,
+  getPolygonCentroid,
+} from "./bermuda-utils";
 
 @customElement(CARD_EDITOR_NAME)
 export class BLELivemapCardEditor extends LitElement {
@@ -77,41 +81,8 @@ export class BLELivemapCardEditor extends LitElement {
       .sort((a, b) => a.entity_id.localeCompare(b.entity_id));
   }
 
-  private _getBermudaEntities(): { entity_id: string; name: string }[] {
-    if (!this.hass?.states) return [];
-    return Object.keys(this.hass.states)
-      .filter((eid) =>
-        eid.includes("bermuda") ||
-        eid.includes("ble_proxy") ||
-        eid.includes("bluetooth_proxy") ||
-        eid.includes("esphome")
-      )
-      .map((eid) => ({
-        entity_id: eid,
-        name: this.hass.states[eid]?.attributes?.friendly_name || eid,
-      }))
-      .sort((a, b) => a.entity_id.localeCompare(b.entity_id));
-  }
-
   private _getBermudaDevicePrefixes(): { prefix: string; name: string }[] {
-    if (!this.hass?.states) return [];
-    const prefixes = new Map<string, string>();
-    Object.keys(this.hass.states)
-      .filter((eid) => eid.includes("bermuda"))
-      .forEach((eid) => {
-        const parts = eid.split("_");
-        const lastPart = parts[parts.length - 1];
-        const suffixes = ["distance", "area", "rssi", "power", "scanner"];
-        if (suffixes.includes(lastPart)) {
-          const prefix = parts.slice(0, -1).join("_");
-          if (!prefixes.has(prefix)) {
-            const name = this.hass.states[eid]?.attributes?.friendly_name || prefix;
-            const cleanName = name.replace(/ (Distance|Area|RSSI|Power|Scanner)$/i, "");
-            prefixes.set(prefix, cleanName);
-          }
-        }
-      });
-    return Array.from(prefixes.entries()).map(([prefix, name]) => ({ prefix, name }));
+    return discoverDevicePrefixes(this.hass);
   }
 
   // ─── Auto-Placement Logic ─────────────────────────────────
@@ -946,10 +917,7 @@ export class BLELivemapCardEditor extends LitElement {
   }
 
   private _getZoneCentroid(points: { x: number; y: number }[]): { x: number; y: number } {
-    if (points.length === 0) return { x: 50, y: 50 };
-    let cx = 0, cy = 0;
-    for (const p of points) { cx += p.x; cy += p.y; }
-    return { x: cx / points.length, y: cy / points.length };
+    return getPolygonCentroid(points);
   }
 
   // ─── Calibration ────────────────────────────────────────────

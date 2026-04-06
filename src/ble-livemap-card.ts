@@ -4,7 +4,7 @@
  *
  * Author: Jerry Paasovaara
  * License: MIT
- * Version: 1.7.0
+ * Version: see const.ts CARD_VERSION
  */
 
 import { LitElement, html, css, PropertyValues, nothing, CSSResultGroup } from "lit";
@@ -27,6 +27,10 @@ import { trilaterate, smoothPosition } from "./trilateration";
 import { render as renderCanvas, cleanupAnimations } from "./renderer";
 import { HistoryStore } from "./history-store";
 import { localize } from "./localize/localize";
+import {
+  collectDeviceDistances,
+  applyRssiCalibration,
+} from "./bermuda-utils";
 
 // Register the card with HA
 (window as any).customCards = (window as any).customCards || [];
@@ -674,144 +678,18 @@ export class BLELivemapCard extends LitElement {
     cleanupAnimations(devices.map((d) => d.device_id));
   }
 
-  private _getDeviceDistances(deviceConfig: any, proxies: ProxyConfig[]): ProxyDistance[] {
-    if (!this.hass) return [];
-
-    const prefix = deviceConfig.entity_prefix;
-    const distances: ProxyDistance[] = [];
-
-    // Extract the Bermuda device slug from the entity prefix.
-    // device_tracker.bermuda_XXXX_bermuda_tracker → XXXX
-    // sensor.bermuda_XXXX_distance → XXXX
-    const rawSlug = prefix
-      ? prefix
-          .replace(/^device_tracker\.bermuda_/, "")
-          .replace(/^sensor\.bermuda_/, "")
-          .replace(/^bermuda_/, "")
-          .replace(/_bermuda_tracker$/, "")
-          .replace(/_distance$/, "")
-      : "";
-
-    // Strategy 1: Individual distance sensors per proxy
-    if (prefix) {
-      for (const proxy of proxies) {
-        // Strip synthetic prefixes (ble_proxy_, bermuda_proxy_) to get the raw proxy slug
-        const proxyName = proxy.entity_id
-          .replace(/^ble_proxy_/, "")
-          .replace(/^bermuda_proxy_/, "")
-          .replace(/^.*\./, "")
-          .replace(/_proxy$/, "");
-        const possibleEntities = [
-          `sensor.bermuda_${rawSlug}_distance_to_${proxyName}`,
-          `${prefix}_${proxyName}_distance`,
-          `${prefix}_distance_${proxyName}`,
-          `sensor.bermuda_${prefix.replace(/^.*\.bermuda_/, "").replace(/^sensor\.bermuda_/, "")}_distance_to_${proxyName}`,
-        ];
-
-        for (const entityId of possibleEntities) {
-          const state = this.hass.states[entityId];
-          if (state && !isNaN(parseFloat(state.state))) {
-            let dist = parseFloat(state.state);
-
-            // Apply RSSI calibration if available
-            if (proxy.calibration?.ref_rssi !== undefined && state.attributes?.rssi) {
-              const calibratedDist = this._applyCalibration(
-                state.attributes.rssi,
-                proxy.calibration
-              );
-              if (calibratedDist !== null) {
-                dist = calibratedDist;
-              }
-            }
-
-            const attrs = state.attributes || {};
-            distances.push({
-              proxy_entity_id: proxy.entity_id,
-              distance: dist,
-              rssi: attrs.rssi || -80,
-              timestamp: new Date(state.last_updated).getTime(),
-            });
-            break;
-          }
-        }
-      }
-    }
-
-    // Strategy 2: Use the main distance sensor attributes
-    if (distances.length === 0 && prefix) {
-      const mainEntity = `${prefix}_distance`;
-      const mainState = this.hass.states[mainEntity];
-      if (mainState) {
-        const attrs = mainState.attributes || {};
-        if (attrs.scanners) {
-          for (const [scannerId, scannerData] of Object.entries(attrs.scanners as Record<string, any>)) {
-            const scannerSlug = scannerId.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-            const matchingProxy = proxies.find(
-              (p) => {
-                const pSlug = p.entity_id.replace(/^ble_proxy_/, "").replace(/^bermuda_proxy_/, "");
-                return p.entity_id === scannerId || pSlug === scannerSlug || p.name === scannerData?.name;
-              }
-            );
-            if (matchingProxy && scannerData?.distance) {
-              distances.push({
-                proxy_entity_id: matchingProxy.entity_id,
-                distance: scannerData.distance,
-                rssi: scannerData.rssi || -80,
-                timestamp: Date.now(),
-              });
-            }
-          }
-        }
-      }
-    }
-
-    // Strategy 3: Device tracker entity attributes
-    if (distances.length === 0 && prefix) {
-      const dtEntity = prefix.replace("sensor.bermuda_", "device_tracker.bermuda_");
-      const dtState = this.hass.states[dtEntity];
-      if (dtState?.attributes?.scanners) {
-        for (const [scannerId, scannerData] of Object.entries(dtState.attributes.scanners as Record<string, any>)) {
-          const scannerSlug = scannerId.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-          const matchingProxy = proxies.find((p) => {
-            const pSlug = p.entity_id.replace(/^ble_proxy_/, "").replace(/^bermuda_proxy_/, "");
-            return p.entity_id === scannerId || pSlug === scannerSlug || p.name === scannerData?.name;
-          });
-          if (matchingProxy && scannerData?.distance) {
-            distances.push({
-              proxy_entity_id: matchingProxy.entity_id,
-              distance: scannerData.distance,
-              rssi: scannerData.rssi || -80,
-              timestamp: Date.now(),
-            });
-          }
-        }
-      }
-    }
-
-    return distances;
-  }
-
   /**
-   * Apply per-proxy RSSI calibration to convert RSSI to distance.
-   * Uses the log-distance path loss model:
-   *   distance = 10^((ref_rssi - measured_rssi) / (10 * n))
+   * Get distances from Bermuda sensors for a tracked device.
+   * Delegates to the shared bermuda-utils module.
    */
-  private _applyCalibration(
-    measuredRssi: number,
-    calibration: { ref_rssi: number; ref_distance: number; attenuation?: number }
-  ): number | null {
-    if (!calibration || calibration.ref_rssi === undefined) return null;
-
-    const refRssi = calibration.ref_rssi;
-    const refDist = calibration.ref_distance || 1.0;
-    const n = calibration.attenuation || 2.5; // default path-loss exponent
-
-    // Log-distance path loss model
-    const exponent = (refRssi - measuredRssi) / (10 * n);
-    const distance = refDist * Math.pow(10, exponent);
-
-    // Clamp to reasonable range
-    return Math.max(0.1, Math.min(distance, 50));
+  private _getDeviceDistances(deviceConfig: any, proxies: ProxyConfig[]): ProxyDistance[] {
+    if (!this.hass || !deviceConfig.entity_prefix) return [];
+    return collectDeviceDistances(
+      this.hass,
+      deviceConfig.entity_prefix,
+      proxies,
+      applyRssiCalibration
+    );
   }
 
   private _findEntity(deviceConfig: any, suffix: string): string | null {

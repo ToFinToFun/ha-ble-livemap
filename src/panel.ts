@@ -33,6 +33,16 @@ import {
 import { CARD_VERSION, CARD_NAME } from "./const";
 import { localize } from "./localize/localize";
 import { trilaterate, smoothPosition } from "./trilateration";
+import {
+  extractDeviceSlug,
+  extractProxySlug,
+  collectDeviceDistances,
+  discoverProxySlugs,
+  discoverTrackableDevices,
+  getPolygonCentroid,
+  isPointInPolygon,
+  applyRssiCalibration,
+} from "./bermuda-utils";
 
 import "./editor";
 
@@ -581,38 +591,21 @@ export class BLELivemapPanel extends LitElement {
   }
   /**
    * Discover BLE proxies from Bermuda distance sensors.
-   * Primary source: sensor.bermuda_*_distance_to_PROXYNAME entities.
-   * These are the actual BLE scanners/proxies that Bermuda uses for trilateration.
-   * Device registry is used only to enrich with friendly names, areas, and MAC addresses.
+   * Uses shared utility for primary discovery, then enriches with device registry data.
    */
   private _discoverBLEProxies(): Map<string, { id: string; friendly_name: string; area: string; mac: string; entity_ids: string[] }> {
+    // Primary discovery via shared utility
+    const rawProxies = discoverProxySlugs(this.hass);
     const proxyMap = new Map<string, { id: string; friendly_name: string; area: string; mac: string; entity_ids: string[] }>();
 
-    // Primary source: Bermuda distance sensors — these define the actual proxy list.
-    // Only include "distance_to" sensors (not "unfiltered_distance_to").
-    if (this.hass?.states) {
-      for (const [entityId] of Object.entries(this.hass.states)) {
-        const eid = entityId.toLowerCase();
-        // Match sensor.bermuda_*_distance_to_* but NOT *_unfiltered_distance_to_*
-        if (eid.startsWith("sensor.bermuda_") && eid.includes("_distance_to_") && !eid.includes("_unfiltered_distance_to_")) {
-          const parts = eid.split("_distance_to_");
-          if (parts.length >= 2) {
-            const proxyId = parts[parts.length - 1];
-            if (proxyMap.has(proxyId)) {
-              proxyMap.get(proxyId)!.entity_ids.push(entityId);
-            } else {
-              const friendlyName = proxyId.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-              proxyMap.set(proxyId, {
-                id: proxyId,
-                friendly_name: friendlyName,
-                area: "",
-                mac: "",
-                entity_ids: [entityId],
-              });
-            }
-          }
-        }
-      }
+    for (const [slug, info] of rawProxies) {
+      proxyMap.set(slug, {
+        id: slug,
+        friendly_name: info.friendlyName,
+        area: "",
+        mac: "",
+        entity_ids: info.entityIds,
+      });
     }
 
     // Enrich proxy entries with device registry data (friendly names, areas, MACs)
@@ -623,11 +616,9 @@ export class BLELivemapPanel extends LitElement {
 
         const slug = deviceName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
 
-        // Check if this device matches any discovered proxy
         const matchingProxy = proxyMap.get(slug);
         if (!matchingProxy) continue;
 
-        // Enrich with device registry data
         matchingProxy.friendly_name = deviceName;
 
         if (device.area_id && this._areaRegistryCache) {
@@ -1215,82 +1206,11 @@ export class BLELivemapPanel extends LitElement {
   }
 
   /**
-   * Get device distances from Bermuda sensors — mirrors the card's _getDeviceDistances logic.
+   * Get device distances using the shared Bermuda utility.
    */
   private _getDeviceDistancesForPanel(deviceConfig: TrackedDeviceConfig, proxies: ProxyConfig[]): ProxyDistance[] {
-    if (!this.hass?.states) return [];
-
-    const prefix = deviceConfig.entity_prefix;
-    const distances: ProxyDistance[] = [];
-
-    if (!prefix) return distances;
-
-    // Extract the Bermuda device slug from the entity prefix.
-    // device_tracker.bermuda_XXXX_bermuda_tracker → XXXX
-    // sensor.bermuda_XXXX_distance → XXXX
-    const rawSlug = prefix
-      .replace(/^device_tracker\.bermuda_/, "")
-      .replace(/^sensor\.bermuda_/, "")
-      .replace(/^bermuda_/, "")
-      .replace(/_bermuda_tracker$/, "")
-      .replace(/_distance$/, "");
-
-    // Strategy 1: Individual distance sensors per proxy
-    for (const proxy of proxies) {
-      const proxyName = proxy.entity_id
-        .replace(/^ble_proxy_/, "")
-        .replace(/^bermuda_proxy_/, "")
-        .replace(/^.*\./, "")
-        .replace(/_proxy$/, "");
-
-      // Try multiple sensor naming patterns
-      const possibleEntities = [
-        `sensor.bermuda_${rawSlug}_distance_to_${proxyName}`,
-        `${prefix}_${proxyName}_distance`,
-        `${prefix}_distance_${proxyName}`,
-        `sensor.bermuda_${prefix.replace(/^.*\.bermuda_/, "").replace(/^sensor\.bermuda_/, "")}_distance_to_${proxyName}`,
-      ];
-
-      for (const entityId of possibleEntities) {
-        const state = this.hass.states[entityId];
-        if (state && !isNaN(parseFloat(state.state))) {
-          const dist = parseFloat(state.state);
-          const attrs = state.attributes || {};
-          distances.push({
-            proxy_entity_id: proxy.entity_id,
-            distance: dist,
-            rssi: attrs.rssi || -80,
-            timestamp: new Date(state.last_updated).getTime(),
-          });
-          break;
-        }
-      }
-    }
-
-    // Strategy 2: Device tracker attributes
-    if (distances.length === 0) {
-      const dtEntity = prefix.replace("sensor.bermuda_", "device_tracker.bermuda_");
-      const dtState = this.hass.states[dtEntity];
-      if (dtState?.attributes?.scanners) {
-        for (const [scannerId, scannerData] of Object.entries(dtState.attributes.scanners as Record<string, any>)) {
-          const scannerSlug = scannerId.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-          const matchingProxy = proxies.find((p) => {
-            const pSlug = p.entity_id.replace(/^ble_proxy_/, "").replace(/^bermuda_proxy_/, "");
-            return p.entity_id === scannerId || pSlug === scannerSlug || p.name === (scannerData as any)?.name;
-          });
-          if (matchingProxy && (scannerData as any)?.distance) {
-            distances.push({
-              proxy_entity_id: matchingProxy.entity_id,
-              distance: (scannerData as any).distance,
-              rssi: (scannerData as any).rssi || -80,
-              timestamp: Date.now(),
-            });
-          }
-        }
-      }
-    }
-
-    return distances;
+    if (!this.hass || !deviceConfig.entity_prefix) return [];
+    return collectDeviceDistances(this.hass, deviceConfig.entity_prefix, proxies);
   }
 
   /**
@@ -1316,21 +1236,12 @@ export class BLELivemapPanel extends LitElement {
       const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
       if (!deviceId) continue;
 
-      // Extract raw slug for sensor matching
-      const rawSlug = deviceId
-        .replace(/^device_tracker\.bermuda_/, "")
-        .replace(/^sensor\.bermuda_/, "")
-        .replace(/^bermuda_/, "")
-        .replace(/_bermuda_tracker$/, "")
-        .replace(/_distance$/, "");
+      // Extract raw slug for sensor matching using shared utility
+      const rawSlug = extractDeviceSlug(deviceId);
 
       // Collect debug info for ALL proxies (placed and unplaced)
       for (const proxy of allProxies) {
-        const proxyName = proxy.entity_id
-          .replace(/^ble_proxy_/, "")
-          .replace(/^bermuda_proxy_/, "")
-          .replace(/^.*\./, "")
-          .replace(/_proxy$/, "");
+        const proxyName = extractProxySlug(proxy.entity_id);
         const sensorId = `sensor.bermuda_${rawSlug}_distance_to_${proxyName}`;
         const state = this.hass!.states[sensorId];
         const dist = state && !isNaN(parseFloat(state.state)) ? parseFloat(state.state) : null;
@@ -1385,17 +1296,7 @@ export class BLELivemapPanel extends LitElement {
   // ─── Zone Helpers ─────────────────────────────────────────
 
   private _isPointInZone(x: number, y: number, zone: ZoneConfig): boolean {
-    const points = zone.points || [];
-    if (points.length < 3) return false;
-    let inside = false;
-    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
-      const xi = points[i].x, yi = points[i].y;
-      const xj = points[j].x, yj = points[j].y;
-      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
-        inside = !inside;
-      }
-    }
-    return inside;
+    return isPointInPolygon(x, y, zone.points || []);
   }
 
   private _startDrawingZone(mode: "polygon" | "rectangle"): void {
@@ -1615,8 +1516,8 @@ export class BLELivemapPanel extends LitElement {
     const proxy = proxies[proxyIdx];
     if (!proxy) return null;
 
-    // Extract proxy slug from entity_id
-    const proxySlug = proxy.entity_id.replace(/^bermuda_proxy_/, "").replace(/^.*\./, "");
+    // Extract proxy slug from entity_id using shared utility
+    const proxySlug = extractProxySlug(proxy.entity_id);
 
     // Search for any distance sensor that targets this proxy
     for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
@@ -1713,7 +1614,7 @@ export class BLELivemapPanel extends LitElement {
   private _getProxyAreaName(proxy: ProxyConfig): string {
     if (!this._deviceRegistryCache || !this._areaRegistryCache) return "";
 
-    const proxySlug = proxy.entity_id.replace(/^bermuda_proxy_/, "").replace(/^.*\./, "").toLowerCase();
+    const proxySlug = extractProxySlug(proxy.entity_id).toLowerCase();
 
     for (const device of this._deviceRegistryCache) {
       const deviceName = (device.name || "").toLowerCase().replace(/[\s-]+/g, "_");
