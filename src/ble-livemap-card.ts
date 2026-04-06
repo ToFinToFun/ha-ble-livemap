@@ -5,6 +5,9 @@
  * Author: Jerry Paasovaara
  * License: MIT
  * Version: see const.ts CARD_VERSION
+ *
+ * This is a thin Lovelace card viewer. All tracking logic lives in
+ * tracking-engine.ts so that the panel and card produce identical results.
  */
 
 import { LitElement, html, css, PropertyValues, nothing, CSSResultGroup } from "lit";
@@ -16,27 +19,14 @@ import {
   ProxyConfig,
   ZoneConfig,
   DoorConfig,
-  ProxyDistance,
-  DevicePosition,
   FloorConfig,
   DEFAULT_CONFIG,
   DEVICE_COLORS,
 } from "./types";
 import { CARD_VERSION, CARD_NAME, CARD_EDITOR_NAME } from "./const";
-import { trilaterate, smoothPosition, cleanupKalmanStates } from "./trilateration";
 import { render as renderCanvas, cleanupAnimations } from "./renderer";
-import { HistoryStore } from "./history-store";
 import { localize } from "./localize/localize";
-import {
-  collectDeviceDistances,
-  applyRssiCalibration,
-  readDeviceArea,
-  findZoneForArea,
-  constrainToPolygon,
-  isPointInPolygon,
-  resolveZoneAreaMap,
-  ZoneAreaMapping,
-} from "./bermuda-utils";
+import { TrackingEngine } from "./tracking-engine";
 
 // Register the card with HA
 (window as any).customCards = (window as any).customCards || [];
@@ -54,30 +44,6 @@ console.info(
   "color: #4FC3F7; background: #263238; font-weight: bold; padding: 2px 6px; border-radius: 0 4px 4px 0;"
 );
 
-// Cache-busting is handled by the loader (ble-livemap-card.js).
-// The loader always imports this file with a unique timestamp,
-// so this code is always fresh from disk.
-
-/** Per-device floor tracking state for gateway logic */
-interface DeviceFloorState {
-  current_floor_id: string;
-  last_gateway_passage: number; // timestamp of last gateway detection
-  last_gateway_floor: string | null; // floor the gateway connects to
-  override_start: number; // timestamp when soft override started counting
-  override_candidate_floor: string | null; // floor being considered for soft override
-}
-
-/** Per-device zone tracking state for room connectivity */
-interface DeviceZoneState {
-  current_zone_id: string | null;
-  last_door_passage: number; // timestamp of last door approach detection
-  last_door_target_zone: string | null; // zone the door connects to
-  override_start: number; // timestamp when soft zone override started
-  override_candidate_zone: string | null; // zone being considered for soft override
-  approaching_door: string | null; // door_id being approached
-  prev_distance_to_door: number | null; // previous distance to the approaching door's nearest proxy
-}
-
 @customElement(CARD_NAME)
 export class BLELivemapCard extends LitElement {
   @property({ attribute: false }) public hass!: HomeAssistant;
@@ -91,39 +57,18 @@ export class BLELivemapCard extends LitElement {
   @state() private _runtimeShowProxies: boolean | null = null;
   @state() private _runtimeShowZones: boolean | null = null;
   @state() private _runtimeShowZoneLabels: boolean | null = null;
+  @state() private _runtimeShowDoors: boolean | null = null;
   @state() private _showSetupDialog = false;
 
   private _canvases: Map<string, HTMLCanvasElement> = new Map();
   private _images: Map<string, HTMLImageElement> = new Map();
-  private _historyStore: HistoryStore | null = null;
   private _animationFrame: number | null = null;
   private _updateTimer: number | null = null;
-  private _previousPositions: Map<string, DevicePosition> = new Map();
   private _lang = "en";
   private _resizeObserver: ResizeObserver | null = null;
 
-  // Gateway transition state per device
-  private _deviceFloorState: Map<string, DeviceFloorState> = new Map();
-
-  // Zone connectivity state per device
-  private _deviceZoneState: Map<string, DeviceZoneState> = new Map();
-  @state() private _runtimeShowDoors: boolean | null = null;
-
-  // Bermuda Area debounce state per device
-  // Tracks consecutive area readings to prevent flickering between rooms
-  private _deviceAreaState: Map<string, {
-    confirmedArea: string | null;    // currently confirmed area name
-    confirmedZoneId: string | null;  // zone ID for the confirmed area
-    candidateArea: string | null;    // new area being debounced
-    candidateCount: number;          // consecutive readings of the candidate
-    lastReading: number;             // timestamp of last area reading
-  }> = new Map();
-
-  // Auto-resolved zone ↔ HA Area mapping (refreshed periodically)
-  private _zoneAreaMap: Map<string, ZoneAreaMapping> = new Map();
-  private _zoneAreaMapStamp = 0;
-  private _areaRegistry: Map<string, string> = new Map(); // area_id → area_name
-  private _areaRegistryLoaded = false;
+  /** Shared tracking engine — single source of truth for positions */
+  private _engine: TrackingEngine | null = null;
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -143,12 +88,13 @@ export class BLELivemapCard extends LitElement {
   setConfig(config: BLELivemapConfig): void {
     this._config = { ...DEFAULT_CONFIG, ...config };
 
-    if (this._config.history_enabled) {
-      this._historyStore = new HistoryStore(
-        this._config.history_retention || 60,
-        this._config.history_trail_length || 50
-      );
-    }
+    // (Re)create the tracking engine with current settings
+    this._engine?.destroy();
+    this._engine = new TrackingEngine({
+      enableHistory: this._config.history_enabled ?? false,
+      historyRetention: this._config.history_retention ?? 60,
+      historyTrailLength: this._config.history_trail_length ?? 50,
+    });
 
     const floors = this._getFloors();
     if (floors.length > 0 && !this._activeFloor) {
@@ -166,6 +112,7 @@ export class BLELivemapCard extends LitElement {
     this._stopUpdateLoop();
     this._stopRenderLoop();
     this._resizeObserver?.disconnect();
+    this._engine?.destroy();
   }
 
   protected firstUpdated(_changedProperties: PropertyValues): void {
@@ -181,7 +128,6 @@ export class BLELivemapCard extends LitElement {
       this._lang = this.hass.selectedLanguage || this.hass.language || "en";
     }
 
-    // Update canvas/image references after render
     this._updateCanvasRefs();
   }
 
@@ -189,343 +135,7 @@ export class BLELivemapCard extends LitElement {
     return 6;
   }
 
-  // ─── Gateway Transition Logic ─────────────────────────────
-
-  /**
-   * Determine which floor a device should be on based on gateway logic.
-   * 
-   * Rules:
-   * 1. If device passes through a gateway proxy → immediate floor transition
-   * 2. If no gateway passage but consistent signals from another floor for
-   *    floor_override_timeout seconds → soft override (allow transition)
-   * 3. Manual reset always available
-   */
-  private _resolveDeviceFloor(
-    deviceId: string,
-    distances: ProxyDistance[],
-    proxies: ProxyConfig[]
-  ): string | null {
-    const floors = this._getFloors();
-    if (floors.length <= 1) return floors[0]?.id || null;
-
-    const now = Date.now();
-    const gatewayTimeout = (this._config.gateway_timeout || 30) * 1000;
-    const overrideTimeout = (this._config.floor_override_timeout || 60) * 1000;
-    const overrideMinProxies = this._config.floor_override_min_proxies || 2;
-
-    // Get or create floor state for this device
-    let floorState = this._deviceFloorState.get(deviceId);
-    if (!floorState) {
-      floorState = {
-        current_floor_id: floors[0].id,
-        last_gateway_passage: 0,
-        last_gateway_floor: null,
-        override_start: 0,
-        override_candidate_floor: null,
-      };
-      this._deviceFloorState.set(deviceId, floorState);
-    }
-
-    // Count how many proxies on each floor see this device
-    const floorProxyCounts: Map<string, number> = new Map();
-    const floorMinDistances: Map<string, number> = new Map();
-
-    for (const dist of distances) {
-      const proxy = proxies.find((p) => p.entity_id === dist.proxy_entity_id);
-      if (!proxy || !proxy.floor_id) continue;
-
-      const floorId = proxy.floor_id;
-      floorProxyCounts.set(floorId, (floorProxyCounts.get(floorId) || 0) + 1);
-
-      const currentMin = floorMinDistances.get(floorId) || Infinity;
-      if (dist.distance < currentMin) {
-        floorMinDistances.set(floorId, dist.distance);
-      }
-
-      // Check if this is a gateway proxy that sees the device
-      if (proxy.is_gateway && proxy.gateway_connects && proxy.gateway_connects.length > 0) {
-        // Gateway detected! Check if it connects to a different floor
-        for (const connectedFloor of proxy.gateway_connects) {
-          if (connectedFloor !== floorState.current_floor_id) {
-            floorState.last_gateway_passage = now;
-            floorState.last_gateway_floor = connectedFloor;
-          }
-        }
-      }
-    }
-
-    // Rule 1: Gateway passage → immediate transition
-    if (
-      floorState.last_gateway_floor &&
-      (now - floorState.last_gateway_passage) < gatewayTimeout
-    ) {
-      const targetFloor = floorState.last_gateway_floor;
-      // Verify the target floor actually exists
-      if (floors.some((f) => f.id === targetFloor)) {
-        floorState.current_floor_id = targetFloor;
-        floorState.last_gateway_floor = null; // consumed
-        floorState.override_start = 0;
-        floorState.override_candidate_floor = null;
-        return targetFloor;
-      }
-    }
-
-    // Rule 2: Soft override — check if signals consistently point to another floor
-    // Find the floor with the most proxies seeing the device
-    let bestFloor = floorState.current_floor_id;
-    let bestCount = floorProxyCounts.get(bestFloor) || 0;
-
-    for (const [floorId, count] of floorProxyCounts) {
-      if (floorId !== floorState.current_floor_id && count > bestCount) {
-        bestFloor = floorId;
-        bestCount = count;
-      }
-    }
-
-    // If a different floor has more proxies seeing the device (and meets minimum)
-    if (bestFloor !== floorState.current_floor_id && bestCount >= overrideMinProxies) {
-      // Check if current floor has fewer or zero proxies seeing the device
-      const currentFloorCount = floorProxyCounts.get(floorState.current_floor_id) || 0;
-
-      if (bestCount > currentFloorCount) {
-        // Start or continue override timer
-        if (floorState.override_candidate_floor === bestFloor) {
-          // Same candidate — check if timeout has elapsed
-          if ((now - floorState.override_start) >= overrideTimeout) {
-            // Soft override: transition without gateway
-            floorState.current_floor_id = bestFloor;
-            floorState.override_start = 0;
-            floorState.override_candidate_floor = null;
-            return bestFloor;
-          }
-        } else {
-          // New candidate — start timer
-          floorState.override_candidate_floor = bestFloor;
-          floorState.override_start = now;
-        }
-      }
-    } else {
-      // Reset override timer if signals no longer point elsewhere
-      floorState.override_start = 0;
-      floorState.override_candidate_floor = null;
-    }
-
-    return floorState.current_floor_id;
-  }
-
-  // ─── Zone Connectivity Logic ─────────────────────────────
-
-  /**
-   * Find which zone a position falls into.
-   * Uses shared isPointInPolygon from bermuda-utils.
-   */
-  private _findZoneForPosition(x: number, y: number, floorId: string | null): string | null {
-    const zones = this._config.zones || [];
-    for (const zone of zones) {
-      if (floorId && zone.floor_id && zone.floor_id !== floorId) continue;
-      if (isPointInPolygon(x, y, zone.points)) return zone.id;
-    }
-    return null;
-  }
-
-  /**
-   * Get all doors that connect to a given zone.
-   */
-  private _getDoorsForZone(zoneId: string): DoorConfig[] {
-    return (this._config.doors || []).filter(
-      (d) => d.zone_a === zoneId || d.zone_b === zoneId
-    );
-  }
-
-  /**
-   * Check if two zones are directly connected by a door.
-   */
-  private _zonesConnected(zoneA: string, zoneB: string): DoorConfig | null {
-    return (this._config.doors || []).find(
-      (d) =>
-        (d.zone_a === zoneA && d.zone_b === zoneB) ||
-        (d.zone_a === zoneB && d.zone_b === zoneA)
-    ) || null;
-  }
-
-  /**
-   * BFS to check if there's any path from zoneA to zoneB through doors.
-   * Returns the path length (number of doors to traverse), or -1 if unreachable.
-   */
-  private _findZonePath(zoneA: string, zoneB: string): number {
-    if (zoneA === zoneB) return 0;
-    const doors = this._config.doors || [];
-    if (doors.length === 0) return -1;
-
-    // Build adjacency list
-    const adj: Map<string, Set<string>> = new Map();
-    for (const door of doors) {
-      if (!door.zone_a || !door.zone_b) continue;
-      if (!adj.has(door.zone_a)) adj.set(door.zone_a, new Set());
-      if (!adj.has(door.zone_b)) adj.set(door.zone_b, new Set());
-      adj.get(door.zone_a)!.add(door.zone_b);
-      adj.get(door.zone_b)!.add(door.zone_a);
-    }
-
-    // BFS
-    const visited = new Set<string>([zoneA]);
-    const queue: { zone: string; dist: number }[] = [{ zone: zoneA, dist: 0 }];
-    while (queue.length > 0) {
-      const { zone, dist } = queue.shift()!;
-      const neighbors = adj.get(zone);
-      if (!neighbors) continue;
-      for (const next of neighbors) {
-        if (next === zoneB) return dist + 1;
-        if (!visited.has(next)) {
-          visited.add(next);
-          queue.push({ zone: next, dist: dist + 1 });
-        }
-      }
-    }
-    return -1; // unreachable
-  }
-
-  /**
-   * Resolve which zone a device should be in, respecting door connectivity.
-   *
-   * Rules:
-   * 1. If the device's trilateral position is in a zone directly connected
-   *    to the current zone via a door → allow transition
-   * 2. If the position is in a non-adjacent zone, block the transition
-   *    unless the soft override timeout has elapsed
-   * 3. If no doors are configured, fall back to simple zone detection
-   */
-  private _resolveDeviceZone(
-    deviceId: string,
-    position: { x: number; y: number },
-    floorId: string | null
-  ): string | null {
-    const zones = this._config.zones || [];
-    const doors = this._config.doors || [];
-    if (zones.length === 0) return null;
-
-    // If no doors configured, just return the zone the position is in
-    if (doors.length === 0) {
-      return this._findZoneForPosition(position.x, position.y, floorId);
-    }
-
-    const now = Date.now();
-    const overrideTimeout = (this._config.zone_override_timeout || 45) * 1000;
-
-    // Get or create zone state
-    let zoneState = this._deviceZoneState.get(deviceId);
-    if (!zoneState) {
-      // Initialize: find current zone from position
-      const initialZone = this._findZoneForPosition(position.x, position.y, floorId);
-      zoneState = {
-        current_zone_id: initialZone,
-        last_door_passage: 0,
-        last_door_target_zone: null,
-        override_start: 0,
-        override_candidate_zone: null,
-        approaching_door: null,
-        prev_distance_to_door: null,
-      };
-      this._deviceZoneState.set(deviceId, zoneState);
-      return initialZone;
-    }
-
-    // Find which zone the trilateral position is in
-    const positionZone = this._findZoneForPosition(position.x, position.y, floorId);
-
-    // If position is in the current zone, no transition needed
-    if (!positionZone || positionZone === zoneState.current_zone_id) {
-      zoneState.override_start = 0;
-      zoneState.override_candidate_zone = null;
-      return zoneState.current_zone_id;
-    }
-
-    // Position is in a different zone — check if transition is allowed
-    const currentZone = zoneState.current_zone_id;
-
-    if (!currentZone) {
-      // No current zone — just accept the new one
-      zoneState.current_zone_id = positionZone;
-      return positionZone;
-    }
-
-    // Check if the zones are directly connected by a door
-    const connectingDoor = this._zonesConnected(currentZone, positionZone);
-
-    if (connectingDoor) {
-      // Direct connection exists — allow transition
-      // Check if device is near the door (within reasonable distance)
-      const doorDist = Math.sqrt(
-        Math.pow(position.x - connectingDoor.x, 2) +
-        Math.pow(position.y - connectingDoor.y, 2)
-      );
-
-      // If device is within 15% of map size from the door, or has been
-      // consistently in the new zone, allow transition
-      if (doorDist < 15 || (now - (zoneState.override_start || now)) > 5000) {
-        zoneState.current_zone_id = positionZone;
-        zoneState.override_start = 0;
-        zoneState.override_candidate_zone = null;
-        zoneState.approaching_door = null;
-        return positionZone;
-      }
-
-      // Start approach timer
-      if (zoneState.override_candidate_zone !== positionZone) {
-        zoneState.override_candidate_zone = positionZone;
-        zoneState.override_start = now;
-      }
-      return zoneState.current_zone_id;
-    }
-
-    // Zones are NOT directly connected — check for path
-    const pathLen = this._findZonePath(currentZone, positionZone);
-
-    if (pathLen > 0 && pathLen <= 3) {
-      // Reachable through a short path — use longer timeout
-      // (device might be passing through intermediate rooms quickly)
-      if (zoneState.override_candidate_zone === positionZone) {
-        if ((now - zoneState.override_start) >= overrideTimeout * 0.5) {
-          // Allow after half the timeout for short paths
-          zoneState.current_zone_id = positionZone;
-          zoneState.override_start = 0;
-          zoneState.override_candidate_zone = null;
-          return positionZone;
-        }
-      } else {
-        zoneState.override_candidate_zone = positionZone;
-        zoneState.override_start = now;
-      }
-    } else {
-      // Not connected or very long path — use full timeout (wall blocking)
-      if (zoneState.override_candidate_zone === positionZone) {
-        if ((now - zoneState.override_start) >= overrideTimeout) {
-          // Soft override: allow after full timeout
-          zoneState.current_zone_id = positionZone;
-          zoneState.override_start = 0;
-          zoneState.override_candidate_zone = null;
-          return positionZone;
-        }
-      } else {
-        zoneState.override_candidate_zone = positionZone;
-        zoneState.override_start = now;
-      }
-    }
-
-    // Block transition — stay in current zone
-    return zoneState.current_zone_id;
-  }
-
-  /**
-   * Get doors for a specific floor.
-   */
-  private _getDoorsForFloor(floorId: string): DoorConfig[] {
-    return (this._config.doors || []).filter(
-      (d) => !d.floor_id || d.floor_id === floorId
-    );
-  }
-
-  // ─── Data Update ───────────────────────────────────────────
+  // ─── Data Update (delegates to TrackingEngine) ─────────────
 
   private _startUpdateLoop(): void {
     const interval = (this._config?.update_interval || 2) * 1000;
@@ -541,299 +151,15 @@ export class BLELivemapCard extends LitElement {
   }
 
   private _updateDevices(): void {
-    if (!this.hass || !this._config?.tracked_devices) return;
-
-    const devices: DeviceState[] = [];
-    const proxies = this._getAllProxies();
-    const floors = this._getFloors();
-    const zones = this._config.zones || [];
-    const hasMultipleFloors = floors.length > 1;
-    const hasZoneAreaMapping = zones.length > 0;
-
-    // Load area registry once for zone name sync
-    const now = Date.now();
-    if (!this._areaRegistryLoaded && this.hass) {
-      this._areaRegistryLoaded = true;
-      this.hass.callWS({ type: "config/area_registry/list" }).then((areas: any) => {
-        for (const area of areas as any[]) {
-          this._areaRegistry.set(area.area_id, area.name);
-        }
-        // Force a zone area map refresh with the registry
-        this._zoneAreaMapStamp = 0;
-      }).catch(() => { /* non-critical */ });
-    }
-
-    // Refresh the zone ↔ HA Area mapping every 30 seconds
-    // This uses the three-tier strategy: explicit > proxy-position > name-match
-    if (hasZoneAreaMapping && (now - this._zoneAreaMapStamp > 30_000)) {
-      this._zoneAreaMap = resolveZoneAreaMap(
-        zones, proxies, this.hass,
-        this._areaRegistry.size > 0 ? this._areaRegistry : undefined
-      );
-      this._zoneAreaMapStamp = now;
-    }
-
-    for (const deviceConfig of this._config.tracked_devices) {
-      const distances = this._getDeviceDistances(deviceConfig, proxies);
-      let position: DevicePosition | null = null;
-
-      const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
-
-      // ── Layer 1: Read Bermuda Area (room determination) ──
-      let bermudaArea: { areaId: string; areaName: string } | null = null;
-      let areaZone: ZoneConfig | null = null;
-      let confirmedAreaName: string | null = null;
-
-      if (hasZoneAreaMapping && deviceConfig.entity_prefix) {
-        bermudaArea = readDeviceArea(this.hass, deviceConfig.entity_prefix);
-
-        if (bermudaArea) {
-          // Debounce area changes to prevent flickering
-          confirmedAreaName = this._debounceAreaChange(
-            deviceId, bermudaArea.areaName
-          );
-
-          if (confirmedAreaName) {
-            // Use the pre-resolved zone area map to find the matching zone.
-            // This leverages the three-tier strategy (explicit > proxy > name)
-            // instead of just name matching.
-            const floorId = hasMultipleFloors
-              ? this._resolveDeviceFloor(deviceId, distances, proxies)
-              : null;
-
-            // First try: find a zone whose resolved area matches the confirmed area
-            for (const zone of zones) {
-              if (floorId && zone.floor_id && zone.floor_id !== floorId) continue;
-              const mapping = this._zoneAreaMap.get(zone.id);
-              if (mapping && mapping.areaName.toLowerCase().trim() === confirmedAreaName.toLowerCase().trim()) {
-                areaZone = zone;
-                break;
-              }
-            }
-
-            // Fallback: use the original findZoneForArea (handles edge cases)
-            if (!areaZone) {
-              areaZone = findZoneForArea(zones, bermudaArea.areaId, confirmedAreaName, floorId);
-            }
-          }
-        }
-      }
-
-      // ── Layer 2: Trilateration (intra-room positioning) ──
-      if (distances.length >= 1) {
-        const proxyMap = new Map<string, { x: number; y: number }>();
-
-        // Resolve which floor this device should be on
-        let resolvedFloorId: string | null = null;
-
-        if (hasMultipleFloors) {
-          resolvedFloorId = this._resolveDeviceFloor(deviceId, distances, proxies);
-        }
-
-        // Only use proxies on the resolved floor for trilateration
-        for (const d of distances) {
-          const proxy = proxies.find((p) => p.entity_id === d.proxy_entity_id);
-          if (proxy) {
-            if (resolvedFloorId && proxy.floor_id && proxy.floor_id !== resolvedFloorId) {
-              continue;
-            }
-            proxyMap.set(d.proxy_entity_id, { x: proxy.x, y: proxy.y });
-          }
-        }
-
-        if (proxyMap.size >= 1) {
-          // Use the resolved floor's dimensions
-          let imageWidth = 20;
-          let imageHeight = 15;
-          if (resolvedFloorId) {
-            const floor = floors.find((f) => f.id === resolvedFloorId);
-            if (floor) {
-              imageWidth = floor.image_width || 20;
-              imageHeight = floor.image_height || 15;
-            }
-          } else {
-            const floor = floors[0];
-            imageWidth = floor?.image_width || 20;
-            imageHeight = floor?.image_height || 15;
-          }
-
-          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight, deviceId);
-
-          if (result) {
-            const prevKey = deviceConfig.entity_prefix || "";
-            const prevPos = this._previousPositions.get(prevKey);
-            const prevResult = prevPos
-              ? { x: prevPos.x, y: prevPos.y, accuracy: prevPos.accuracy, confidence: prevPos.confidence }
-              : null;
-            const smoothed = smoothPosition(result, prevResult, 0.3);
-
-            if (smoothed) {
-              let finalX = smoothed.x;
-              let finalY = smoothed.y;
-
-              // ── Zone Constraint: If Bermuda says the device is in a specific
-              //    room, constrain the trilaterated position to that zone polygon.
-              //    This prevents "wall jumping" while still allowing movement
-              //    within the room. ──
-              if (areaZone && areaZone.points?.length >= 3) {
-                const constrained = constrainToPolygon(finalX, finalY, areaZone.points);
-                finalX = constrained.x;
-                finalY = constrained.y;
-              }
-
-              position = {
-                x: finalX,
-                y: finalY,
-                accuracy: smoothed.accuracy,
-                confidence: smoothed.confidence,
-                timestamp: Date.now(),
-                floor_id: resolvedFloorId || undefined,
-              };
-
-              this._previousPositions.set(prevKey, position);
-            }
-          }
-        }
-      }
-
-      // Resolve zone using door connectivity (fallback when no Bermuda Area data)
-      if (position && !areaZone && (this._config.doors?.length || 0) > 0) {
-        const resolvedZone = this._resolveDeviceZone(
-          deviceId,
-          { x: position.x, y: position.y },
-          position.floor_id || null
-        );
-        if (resolvedZone) {
-          const posZone = this._findZoneForPosition(
-            position.x, position.y, position.floor_id || null
-          );
-          if (posZone && posZone !== resolvedZone) {
-            const prevKey = deviceConfig.entity_prefix || "";
-            const prevPos = this._previousPositions.get(prevKey);
-            if (prevPos) {
-              position = { ...position, x: prevPos.x, y: prevPos.y };
-              this._previousPositions.set(prevKey, position);
-            }
-          }
-        }
-      }
-
-      // Find nearest proxy
-      let nearestProxy: string | null = null;
-      if (distances.length > 0) {
-        const nearest = distances.reduce((a, b) => (a.distance < b.distance ? a : b));
-        const proxy = proxies.find((p) => p.entity_id === nearest.proxy_entity_id);
-        nearestProxy = proxy?.name || proxy?.entity_id || null;
-      }
-
-      // Get history
-      let history = this._historyStore?.getTrail(deviceId) || [];
-      if (position && this._historyStore) {
-        this._historyStore.addPoint(deviceId, {
-          x: position.x,
-          y: position.y,
-          timestamp: position.timestamp,
-          floor_id: position.floor_id,
-        });
-        history = this._historyStore.getTrail(deviceId);
-      }
-
-      // Get current floor from floor state
-      const floorState = this._deviceFloorState.get(deviceId);
-
-      devices.push({
-        device_id: deviceId,
-        name: deviceConfig.name,
-        position,
-        history,
-        distances,
-        nearest_proxy: nearestProxy,
-        area: confirmedAreaName || null,
-        last_seen: position ? Date.now() : 0,
-        config: deviceConfig,
-        current_floor_id: floorState?.current_floor_id || undefined,
-      });
-    }
-
-    this._devices = devices;
-    const activeIds = devices.map((d) => d.device_id);
-    cleanupAnimations(activeIds);
-    cleanupKalmanStates(activeIds);
+    if (!this.hass || !this._config || !this._engine) return;
+    this._devices = this._engine.update(this.hass, this._config);
   }
 
-  /**
-   * Debounce Bermuda Area changes to prevent flickering.
-   * Requires 3 consecutive readings of the same new area before confirming.
-   */
-  private _debounceAreaChange(deviceId: string, newAreaName: string): string | null {
-    const REQUIRED_READINGS = 3;
-
-    let state = this._deviceAreaState.get(deviceId);
-    if (!state) {
-      state = {
-        confirmedArea: null,
-        confirmedZoneId: null,
-        candidateArea: null,
-        candidateCount: 0,
-        lastReading: 0,
-      };
-      this._deviceAreaState.set(deviceId, state);
-    }
-
-    state.lastReading = Date.now();
-
-    // If the area hasn't changed from confirmed, return it
-    if (newAreaName === state.confirmedArea) {
-      state.candidateArea = null;
-      state.candidateCount = 0;
-      return state.confirmedArea;
-    }
-
-    // New area detected — start or continue debouncing
-    if (newAreaName === state.candidateArea) {
-      state.candidateCount++;
-    } else {
-      state.candidateArea = newAreaName;
-      state.candidateCount = 1;
-    }
-
-    // Confirm after enough consecutive readings
-    if (state.candidateCount >= REQUIRED_READINGS) {
-      state.confirmedArea = newAreaName;
-      state.confirmedZoneId = null; // will be resolved by findZoneForArea
-      state.candidateArea = null;
-      state.candidateCount = 0;
-      return state.confirmedArea;
-    }
-
-    // Still debouncing — return the previously confirmed area (or null if first time)
-    return state.confirmedArea;
-  }
-
-  /**
-   * Get distances from Bermuda sensors for a tracked device.
-   * Delegates to the shared bermuda-utils module.
-   */
-  private _getDeviceDistances(deviceConfig: any, proxies: ProxyConfig[]): ProxyDistance[] {
-    if (!this.hass || !deviceConfig.entity_prefix) return [];
-    return collectDeviceDistances(
-      this.hass,
-      deviceConfig.entity_prefix,
-      proxies,
-      applyRssiCalibration
-    );
-  }
-
-  private _findEntity(deviceConfig: any, suffix: string): string | null {
-    if (!this.hass || !deviceConfig.entity_prefix) return null;
-    const entityId = `${deviceConfig.entity_prefix}_${suffix}`;
-    return this.hass.states[entityId] ? entityId : null;
-  }
+  // ─── Config Helpers ────────────────────────────────────────
 
   private _getAllProxies(): ProxyConfig[] {
     if (!this._config) return [];
     const globalProxies = this._config.proxies || [];
-    // In stacked mode, combine all floor proxies too
     const floorProxies: ProxyConfig[] = [];
     for (const floor of this._getFloors()) {
       if (floor.proxies) {
@@ -846,7 +172,7 @@ export class BLELivemapCard extends LitElement {
   private _getProxiesForFloor(floorId: string): ProxyConfig[] {
     if (!this._config) return [];
     const globalProxies = (this._config.proxies || []).filter(
-      (p) => !p.floor_id || p.floor_id === floorId
+      (p) => !p.floor_id || p.floor_id === floorId,
     );
     const floor = this._getFloors().find((f) => f.id === floorId);
     const floorProxies = floor?.proxies || [];
@@ -855,20 +181,25 @@ export class BLELivemapCard extends LitElement {
 
   private _getZonesForFloor(floorId: string): ZoneConfig[] {
     return (this._config.zones || []).filter(
-      (z) => !z.floor_id || z.floor_id === floorId
+      (z) => !z.floor_id || z.floor_id === floorId,
+    );
+  }
+
+  private _getDoorsForFloor(floorId: string): DoorConfig[] {
+    return (this._config.doors || []).filter(
+      (d) => !d.floor_id || d.floor_id === floorId,
     );
   }
 
   private _getFloors(): FloorConfig[] {
     const floors = this._config?.floors || [];
-    // If no floors defined but floorplan_image exists, create a virtual floor
     if (floors.length === 0 && this._config?.floorplan_image) {
       return [{
         id: "default",
         name: "Floor 1",
         image: this._config.floorplan_image,
-        image_width: 20,
-        image_height: 15,
+        image_width: this._config.image_width || 20,
+        image_height: this._config.image_height || 15,
       }];
     }
     return floors;
@@ -877,11 +208,6 @@ export class BLELivemapCard extends LitElement {
   private _getActiveFloor(): FloorConfig | null {
     const floors = this._getFloors();
     return floors.find((f) => f.id === this._activeFloor) || floors[0] || null;
-  }
-
-  private _getFloorplanImage(): string {
-    const floor = this._getActiveFloor();
-    return floor?.image || this._config?.floorplan_image || "";
   }
 
   private _isStackedMode(): boolean {
@@ -894,7 +220,6 @@ export class BLELivemapCard extends LitElement {
     const root = this.shadowRoot;
     if (!root) return;
 
-    // Collect all canvas and image elements
     const canvasElements = root.querySelectorAll<HTMLCanvasElement>("canvas[data-floor-id]");
     const imgElements = root.querySelectorAll<HTMLImageElement>("img[data-floor-id]");
 
@@ -968,12 +293,10 @@ export class BLELivemapCard extends LitElement {
     };
 
     if (this._isStackedMode()) {
-      // Render each floor's canvas
       for (const floor of this._getFloors()) {
         this._renderFloorCanvas(floor.id, effectiveConfig, isDark);
       }
     } else {
-      // Single floor mode
       const activeFloor = this._getActiveFloor();
       if (activeFloor) {
         this._renderFloorCanvas(activeFloor.id, effectiveConfig, isDark);
@@ -1005,7 +328,7 @@ export class BLELivemapCard extends LitElement {
       zones,
       doors,
       config,
-      floorId
+      floorId,
     );
   }
 
@@ -1020,11 +343,9 @@ export class BLELivemapCard extends LitElement {
   private _handleImageLoad(floorId: string): void {
     this._imageLoaded = { ...this._imageLoaded, [floorId]: true };
     this._imageError = { ...this._imageError, [floorId]: false };
-    // Re-setup resize observer and resize canvases
     requestAnimationFrame(() => {
       this._updateCanvasRefs();
       this._resizeAllCanvases();
-      // Re-observe new containers
       this._resizeObserver?.disconnect();
       this._setupResizeObserver();
     });
@@ -1075,9 +396,8 @@ export class BLELivemapCard extends LitElement {
 
   private _openSetupDialog(): void {
     this._showSetupDialog = true;
-    // After render, set config on the editor element
     this.updateComplete.then(() => {
-      const editor = this.shadowRoot?.querySelector('ble-livemap-card-editor') as any;
+      const editor = this.shadowRoot?.querySelector("ble-livemap-card-editor") as any;
       if (editor && editor.setConfig) {
         editor.setConfig(this._config);
       }
@@ -1091,14 +411,12 @@ export class BLELivemapCard extends LitElement {
   private _handleSetupConfigChanged(e: CustomEvent): void {
     if (e.detail?.config) {
       this._config = { ...e.detail.config };
-      // Fire event to persist config in Lovelace
       const event = new CustomEvent("config-changed", {
         detail: { config: this._config },
         bubbles: true,
         composed: true,
       });
       this.dispatchEvent(event);
-      // Re-init if needed
       this.setConfig(this._config);
     }
   }
@@ -1108,11 +426,11 @@ export class BLELivemapCard extends LitElement {
     const t = (key: string) => localize(key, this._lang);
     return html`
       <div class="setup-overlay" @click=${(e: Event) => {
-        if ((e.target as HTMLElement).classList.contains('setup-overlay')) this._closeSetupDialog();
+        if ((e.target as HTMLElement).classList.contains("setup-overlay")) this._closeSetupDialog();
       }}>
         <div class="setup-dialog">
           <div class="setup-header">
-            <h2>${t('editor.title')}</h2>
+            <h2>${t("editor.title")}</h2>
             <button class="setup-close" @click=${this._closeSetupDialog}>
               <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
                 <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
@@ -1501,16 +819,16 @@ export class BLELivemapCard extends LitElement {
                         <option value=${f.id} ?selected=${f.id === this._activeFloor}>
                           ${f.name}
                         </option>
-                      `
+                      `,
                     )}
                   </select>
                 `
               : nothing}
             <!-- Toggle proxies -->
             <button
-              class="header-btn ${(this._runtimeShowProxies ?? this._config.show_proxies ?? true) ? '' : 'off'}"
+              class="header-btn ${(this._runtimeShowProxies ?? this._config.show_proxies ?? true) ? "" : "off"}"
               @click=${this._toggleProxies}
-              title="${t('card.toggle_proxies')}"
+              title="${t("card.toggle_proxies")}"
             >
               <svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/>
@@ -1520,9 +838,9 @@ export class BLELivemapCard extends LitElement {
             ${(this._config.zones?.length || 0) > 0
               ? html`
                   <button
-                    class="header-btn ${(this._runtimeShowZones ?? this._config.show_zones ?? true) ? '' : 'off'}"
+                    class="header-btn ${(this._runtimeShowZones ?? this._config.show_zones ?? true) ? "" : "off"}"
                     @click=${this._toggleZones}
-                    title="${t('card.toggle_zones')}"
+                    title="${t("card.toggle_zones")}"
                   >
                     <svg viewBox="0 0 24 24" fill="currentColor">
                       <path d="M12 7V3H2v18h20V7H12zM6 19H4v-2h2v2zm0-4H4v-2h2v2zm0-4H4V9h2v2zm0-4H4V5h2v2zm4 12H8v-2h2v2zm0-4H8v-2h2v2zm0-4H8V9h2v2zm0-4H8V5h2v2zm10 12h-8v-2h2v-2h-2v-2h2v-2h-2V9h8v10zm-2-8h-2v2h2v-2zm0 4h-2v2h2v-2z"/>
@@ -1534,7 +852,7 @@ export class BLELivemapCard extends LitElement {
             ${(this._config.doors?.length || 0) > 0
               ? html`
                   <button
-                    class="header-btn ${(this._runtimeShowDoors ?? this._config.show_doors ?? true) ? '' : 'off'}"
+                    class="header-btn ${(this._runtimeShowDoors ?? this._config.show_doors ?? true) ? "" : "off"}"
                     @click=${this._toggleDoors}
                     title="Doors"
                   >
@@ -1545,14 +863,14 @@ export class BLELivemapCard extends LitElement {
                 `
               : nothing}
             <!-- Setup button -->
-            <button class="header-btn" @click=${this._openSetupDialog} title="${t('common.configure')}">
+            <button class="header-btn" @click=${this._openSetupDialog} title="${t("common.configure")}">
               <svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z"/>
               </svg>
             </button>
             <button class="header-btn" @click=${this._toggleDevicePanel} title="Devices">
               <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
+                <path d="M15.5 1h-8A2.5 2.5 0 005 3.5v17A2.5 2.5 0 007.5 23h8a2.5 2.5 0 002.5-2.5v-17A2.5 2.5 0 0015.5 1zm-4 21c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm4.5-4H7V4h9v14z"/>
               </svg>
             </button>
             ${this._config.fullscreen_enabled
@@ -1576,7 +894,7 @@ export class BLELivemapCard extends LitElement {
                       (floor, idx) => html`
                         ${idx > 0 ? html`<div class="floor-divider"></div>` : nothing}
                         ${this._renderFloorMap(floor)}
-                      `
+                      `,
                     )
                   : this._getActiveFloor()
                     ? this._renderFloorMap(this._getActiveFloor()!)
@@ -1603,7 +921,7 @@ export class BLELivemapCard extends LitElement {
                   <div class="device-detail">
                     ${device.area || device.nearest_proxy || t("common.unknown")}
                     ${device.current_floor_id
-                      ? html` <span style="opacity:0.6;">| ${this._getFloors().find(f => f.id === device.current_floor_id)?.name || device.current_floor_id}</span>`
+                      ? html` <span style="opacity:0.6;">| ${this._getFloors().find((f) => f.id === device.current_floor_id)?.name || device.current_floor_id}</span>`
                       : nothing}
                   </div>
                 </div>
@@ -1616,7 +934,7 @@ export class BLELivemapCard extends LitElement {
                     : html`<div>--</div>`}
                 </div>
               </div>
-            `
+            `,
           )}
         </div>
 

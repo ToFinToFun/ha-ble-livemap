@@ -14,11 +14,11 @@ import {
   BLELivemapConfig,
   HomeAssistant,
   ProxyConfig,
-  TrackedDeviceConfig,
   FloorConfig,
   ZoneConfig,
   DoorConfig,
   DoorType,
+  DeviceState,
   DEFAULT_CONFIG,
   DEVICE_COLORS,
   DEVICE_ICONS,
@@ -26,22 +26,17 @@ import {
   GATEWAY_TYPES,
   GatewayType,
   ProxyCalibration,
-  ProxyDistance,
-  TrilaterationResult,
   DOOR_TYPES,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
 import { localize } from "./localize/localize";
-import { trilaterate, smoothPosition } from "./trilateration";
+import { TrackingEngine, ProxyDebugInfo } from "./tracking-engine";
 import {
-  extractDeviceSlug,
   extractProxySlug,
-  collectDeviceDistances,
   discoverProxySlugs,
   discoverTrackableDevices,
   getPolygonCentroid,
   isPointInPolygon,
-  applyRssiCalibration,
 } from "./bermuda-utils";
 
 import "./editor";
@@ -112,29 +107,45 @@ export class BLELivemapPanel extends LitElement {
   private _registryCacheStamp = 0;
   private _registryLoadPromise: Promise<void> | null = null;
 
-  // Live device tracking in editor
-  @state() private _liveDevicePositions: Map<string, { x: number; y: number; color: string; name: string; accuracy: number; confidence: number }> = new Map();
-  @state() private _liveDebugInfo: Array<{ proxyName: string; proxyId: string; distance: number | null; sensorId: string; placed: boolean }> = [];
+  // Live device tracking via shared TrackingEngine
+  private _trackingEngine: TrackingEngine | null = null;
+  @state() private _trackedDevices: DeviceState[] = [];
+  @state() private _liveDebugInfo: ProxyDebugInfo[] = [];
   @state() private _showDebugPanel: boolean = false;
   private _liveTrackingTimer: number | null = null;
-  private _previousPositions: Map<string, TrilaterationResult> = new Map();
   private _dragStarted = false;
+
+  // Full area registry for zone-area dropdown (area_id → {area_id, name})
+  @state() private _fullAreaRegistry: Array<{area_id: string; name: string}> = [];
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
   connectedCallback(): void {
     super.connectedCallback();
     this._loadConfig();
+    this._ensureTrackingEngine();
     this._startLiveTracking();
   }
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
     this._stopLiveTracking();
+    this._trackingEngine?.destroy();
+    this._trackingEngine = null;
     this._removeGlobalDragListeners();
     if (this._calibWizardTimer) {
       clearInterval(this._calibWizardTimer);
       this._calibWizardTimer = null;
+    }
+  }
+
+  private _ensureTrackingEngine(): void {
+    if (!this._trackingEngine) {
+      this._trackingEngine = new TrackingEngine({
+        enableHistory: this._config.history_enabled ?? false,
+        historyRetention: this._config.history_retention ?? 60,
+        historyTrailLength: this._config.history_trail_length ?? 50,
+      });
     }
   }
 
@@ -167,9 +178,12 @@ export class BLELivemapPanel extends LitElement {
         // Load area registry
         const areas = await this.hass.callWS({ type: "config/area_registry/list" });
         this._areaRegistryCache = new Map();
+        const fullAreas: Array<{area_id: string; name: string}> = [];
         for (const area of areas as any[]) {
           this._areaRegistryCache.set(area.area_id, area.name);
+          fullAreas.push({ area_id: area.area_id, name: area.name });
         }
+        this._fullAreaRegistry = fullAreas.sort((a, b) => a.name.localeCompare(b.name));
 
         this._registryCacheStamp = now;
       } catch (e) {
@@ -379,6 +393,10 @@ export class BLELivemapPanel extends LitElement {
         "panel.zone_edit": "Edit zone",
         "panel.zone_editing": "Editing zone",
         "panel.zone_done_editing": "Done editing",
+        "panel.zone_ha_area": "HA Area",
+        "panel.zone_no_area": "— No area linked —",
+        "panel.zone_area_linked": "Linked to HA",
+        "panel.zone_create_in_ha": "Create in HA",
         "panel.auto_place": "Auto-place all",
         "panel.auto_place_help": "Match proxy/device names to zone names and place at zone centers",
         "panel.remove": "Remove",
@@ -509,6 +527,10 @@ export class BLELivemapPanel extends LitElement {
         "panel.zone_edit": "Redigera zon",
         "panel.zone_editing": "Redigerar zon",
         "panel.zone_done_editing": "Klar med redigering",
+        "panel.zone_ha_area": "HA-område",
+        "panel.zone_no_area": "— Inget område kopplat —",
+        "panel.zone_area_linked": "Kopplat till HA",
+        "panel.zone_create_in_ha": "Skapa i HA",
         "panel.auto_place": "Auto-placera alla",
         "panel.auto_place_help": "Matchar proxy-/enhetsnamn mot zonnamn och placerar i zonens mitt",
         "panel.remove": "Ta bort",
@@ -962,6 +984,36 @@ export class BLELivemapPanel extends LitElement {
     if (this._editingZoneIdx === idx) this._editingZoneIdx = null;
   }
 
+  /**
+   * Create a new HA Area from a zone's name, then link the zone to it.
+   */
+  private async _createHaAreaFromZone(idx: number): Promise<void> {
+    if (!this.hass) return;
+    const zones = this._config.zones || [];
+    const zone = zones[idx];
+    if (!zone?.name) return;
+
+    try {
+      const result = await this.hass.callWS({
+        type: "config/area_registry/create",
+        name: zone.name,
+      }) as any;
+
+      if (result?.area_id) {
+        // Link the zone to the newly created area
+        const z = [...zones];
+        z[idx] = { ...z[idx], ha_area_id: result.area_id };
+        this._updateConfig("zones", z);
+
+        // Refresh area registry cache
+        this._registryCacheStamp = 0;
+        await this._ensureRegistryLoaded();
+      }
+    } catch (e) {
+      console.error("[BLE LiveMap Panel] Failed to create HA Area:", e);
+    }
+  }
+
   // ─── Map Click Handler ─────────────────────────────────────
 
   private _getMapCoords(e: MouseEvent): { x: number; y: number } | null {
@@ -1191,7 +1243,7 @@ export class BLELivemapPanel extends LitElement {
     document.removeEventListener("mousemove", this._globalMouseMoveHandler);
   }
 
-  // ─── Live Device Tracking ─────────────────────────────────
+  // ─── Live Device Tracking (via shared TrackingEngine) ──────
 
   private _startLiveTracking(): void {
     if (this._liveTrackingTimer) return;
@@ -1206,91 +1258,16 @@ export class BLELivemapPanel extends LitElement {
   }
 
   /**
-   * Get device distances using the shared Bermuda utility.
-   */
-  private _getDeviceDistancesForPanel(deviceConfig: TrackedDeviceConfig, proxies: ProxyConfig[]): ProxyDistance[] {
-    if (!this.hass || !deviceConfig.entity_prefix) return [];
-    return collectDeviceDistances(this.hass, deviceConfig.entity_prefix, proxies);
-  }
-
-  /**
-   * Update live device positions using trilateration.
-   * Runs every 2 seconds to show real-time device positions in the editor.
+   * Update live device positions using the shared TrackingEngine.
+   * This ensures panel and card produce identical tracking results.
    */
   private _updateLiveDevices(): void {
-    if (!this.hass?.states) return;
-    const devices = this._config.tracked_devices || [];
-    const allProxies = this._config.proxies || [];
-    const placedProxies = allProxies.filter((p) => p.x > 0 || p.y > 0);
-    if (devices.length === 0 || placedProxies.length === 0) return;
+    if (!this.hass?.states || !this._trackingEngine) return;
+    this._ensureTrackingEngine();
 
-    const floor = this._getActiveFloor();
-    if (!floor) return;
-
-    const imageWidth = floor.image_width || 20;
-    const imageHeight = floor.image_height || 15;
-    const newPositions = new Map<string, { x: number; y: number; color: string; name: string; accuracy: number; confidence: number }>();
-    const debugInfo: Array<{ proxyName: string; proxyId: string; distance: number | null; sensorId: string; placed: boolean }> = [];
-
-    for (const deviceConfig of devices) {
-      const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
-      if (!deviceId) continue;
-
-      // Extract raw slug for sensor matching using shared utility
-      const rawSlug = extractDeviceSlug(deviceId);
-
-      // Collect debug info for ALL proxies (placed and unplaced)
-      for (const proxy of allProxies) {
-        const proxyName = extractProxySlug(proxy.entity_id);
-        const sensorId = `sensor.bermuda_${rawSlug}_distance_to_${proxyName}`;
-        const state = this.hass!.states[sensorId];
-        const dist = state && !isNaN(parseFloat(state.state)) ? parseFloat(state.state) : null;
-        const isPlaced = (proxy.x > 0 || proxy.y > 0) && (!proxy.floor_id || proxy.floor_id === floor.id);
-        debugInfo.push({
-          proxyName: proxy.name || proxyName,
-          proxyId: proxyName,
-          distance: dist,
-          sensorId,
-          placed: isPlaced,
-        });
-      }
-
-      // Only use proxies on the active floor
-      const floorProxies = placedProxies.filter((p) => !p.floor_id || p.floor_id === floor.id);
-      const distances = this._getDeviceDistancesForPanel(deviceConfig, floorProxies);
-
-      if (distances.length >= 1) {
-        const proxyMap = new Map<string, { x: number; y: number }>();
-        for (const d of distances) {
-          const proxy = floorProxies.find((p) => p.entity_id === d.proxy_entity_id);
-          if (proxy) {
-            proxyMap.set(d.proxy_entity_id, { x: proxy.x, y: proxy.y });
-          }
-        }
-
-        if (proxyMap.size >= 1) {
-          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight, deviceId);
-          if (result) {
-            const prevResult = this._previousPositions.get(deviceId) || null;
-            const smoothed = smoothPosition(result, prevResult, 0.3);
-            if (smoothed) {
-              this._previousPositions.set(deviceId, smoothed);
-              newPositions.set(deviceId, {
-                x: smoothed.x,
-                y: smoothed.y,
-                color: deviceConfig.color || DEVICE_COLORS[0],
-                name: deviceConfig.name || deviceId,
-                accuracy: smoothed.accuracy,
-                confidence: smoothed.confidence,
-              });
-            }
-          }
-        }
-      }
-    }
-
-    this._liveDevicePositions = newPositions;
-    this._liveDebugInfo = debugInfo;
+    // Delegate all tracking to the shared engine
+    this._trackedDevices = this._trackingEngine!.update(this.hass, this._config);
+    this._liveDebugInfo = this._trackingEngine!.getDebugInfo();
   }
 
   // ─── Zone Helpers ─────────────────────────────────────────
@@ -2398,6 +2375,45 @@ export class BLELivemapPanel extends LitElement {
         height: 16px;
       }
 
+      .area-select {
+        flex: 1;
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 13px;
+      }
+
+      .area-badge {
+        font-size: 10px;
+        padding: 2px 8px;
+        border-radius: 10px;
+        white-space: nowrap;
+        font-weight: 600;
+      }
+
+      .area-badge-linked {
+        background: rgba(76, 175, 80, 0.2);
+        color: #4caf50;
+      }
+
+      .btn-create-area {
+        padding: 4px 10px;
+        font-size: 11px;
+        border-radius: 6px;
+        border: 1px dashed var(--accent);
+        background: transparent;
+        color: var(--accent);
+        cursor: pointer;
+        white-space: nowrap;
+        font-weight: 600;
+      }
+
+      .btn-create-area:hover {
+        background: rgba(var(--accent-rgb, 66, 133, 244), 0.1);
+      }
+
       /* Config panels */
       .config-panel {
         padding: 16px;
@@ -3127,16 +3143,61 @@ export class BLELivemapPanel extends LitElement {
     if (!zone) return nothing;
     const idx = this._editingZoneIdx!;
 
+    const hasAreaLink = !!zone.ha_area_id;
+    const linkedAreaName = hasAreaLink
+      ? (this._fullAreaRegistry.find(a => a.area_id === zone.ha_area_id)?.name || zone.ha_area_id)
+      : "";
+    const zoneName = hasAreaLink ? linkedAreaName : (zone.name || "");
+
     return html`
       <div class="zone-edit-panel">
-        <h4>${this._t("panel.zone_editing")}: ${zone.name || `Zone ${idx + 1}`}</h4>
+        <h4>${this._t("panel.zone_editing")}: ${zoneName || `Zone ${idx + 1}`}</h4>
+
+        <!-- HA Area link -->
+        <div class="zone-edit-row">
+          <label>${this._t("panel.zone_ha_area")}</label>
+          <select class="area-select" @change=${(e: Event) => {
+            const val = (e.target as HTMLSelectElement).value;
+            const z = [...zones];
+            if (val === "__none__") {
+              z[idx] = { ...z[idx], ha_area_id: undefined };
+            } else {
+              const area = this._fullAreaRegistry.find(a => a.area_id === val);
+              z[idx] = { ...z[idx], ha_area_id: val, name: area?.name || z[idx].name };
+            }
+            this._updateConfig("zones", z);
+          }}>
+            <option value="__none__" ?selected=${!zone.ha_area_id}>
+              ${this._t("panel.zone_no_area")}
+            </option>
+            ${this._fullAreaRegistry.map(area => html`
+              <option value=${area.area_id} ?selected=${zone.ha_area_id === area.area_id}>
+                ${area.name}
+              </option>
+            `)}
+          </select>
+        </div>
+
+        <!-- Zone name: read-only if linked to HA Area, editable otherwise -->
         <div class="zone-edit-row">
           <label>${this._t("panel.zone_name")}</label>
-          <input type="text" .value=${zone.name || ""} @change=${(e: Event) => {
-            const z = [...zones]; z[idx] = { ...z[idx], name: (e.target as HTMLInputElement).value };
-            this._updateConfig("zones", z);
-          }} />
+          ${hasAreaLink ? html`
+            <input type="text" .value=${linkedAreaName} disabled
+              style="opacity:0.7; cursor:not-allowed;" />
+            <span class="area-badge area-badge-linked" title="${this._t('panel.zone_area_linked')}">✓ ${this._t('panel.zone_area_linked')}</span>
+          ` : html`
+            <input type="text" .value=${zone.name || ""} @change=${(e: Event) => {
+              const z = [...zones]; z[idx] = { ...z[idx], name: (e.target as HTMLInputElement).value };
+              this._updateConfig("zones", z);
+            }} />
+            ${zone.name && !zone.ha_area_id && !this._fullAreaRegistry.find(a => a.name.toLowerCase() === (zone.name || "").toLowerCase()) ? html`
+              <button class="btn-create-area" @click=${() => this._createHaAreaFromZone(idx)}>
+                + ${this._t("panel.zone_create_in_ha")}
+              </button>
+            ` : nothing}
+          `}
         </div>
+
         <div class="zone-edit-row">
           <label>${this._t("panel.zone_color")}</label>
           <input type="color" .value=${zone.color || ZONE_COLORS[0]} @input=${(e: Event) => {
@@ -3344,24 +3405,33 @@ export class BLELivemapPanel extends LitElement {
   }
 
   private _renderLiveDeviceMarkers() {
-    if (this._liveDevicePositions.size === 0) return nothing;
+    const floor = this._getActiveFloor();
+    const floorId = floor?.id || "default";
+    // Filter devices to those on the active floor
+    const devicesOnFloor = this._trackedDevices.filter(d =>
+      d.position && (!d.current_floor_id || d.current_floor_id === floorId)
+    );
+    if (devicesOnFloor.length === 0) return nothing;
 
     const markers: any[] = [];
-    this._liveDevicePositions.forEach((pos, deviceId) => {
+    for (const device of devicesOnFloor) {
+      const pos = device.position!;
+      const color = device.config.color || DEVICE_COLORS[0];
+      const name = device.name || device.device_id;
       markers.push(html`
         <div
           class="live-device-marker"
-          style="left: ${pos.x}%; top: ${pos.y}%; --device-color: ${pos.color};"
-          title="${pos.name}\nConfidence: ${(pos.confidence * 100).toFixed(0)}%\nAccuracy: ${pos.accuracy.toFixed(1)}m"
+          style="left: ${pos.x}%; top: ${pos.y}%; --device-color: ${color};"
+          title="${name}\nConfidence: ${(pos.confidence * 100).toFixed(0)}%\nAccuracy: ${pos.accuracy.toFixed(1)}m${device.area ? `\nArea: ${device.area}` : ''}"
         >
           <div class="live-device-pulse"></div>
           <div class="live-device-dot"></div>
         </div>
         <div class="live-device-label" style="left: ${pos.x}%; top: ${pos.y + 2.5}%;">
-          ${pos.name}
+          ${name}
         </div>
       `);
-    });
+    }
     return markers;
   }
 
