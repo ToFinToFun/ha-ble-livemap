@@ -5,9 +5,23 @@
  *
  * High-performance Canvas2D renderer for device positions,
  * gradient accuracy circles, history trails, zones, and proxy indicators.
+ *
+ * Optimizations:
+ * - Static elements (zones, doors) are rendered to an offscreen canvas
+ *   and only redrawn when configuration changes.
+ * - A shared `frameTime` is computed once per frame instead of calling
+ *   Date.now() multiple times.
+ * - Font strings are defined as constants to avoid repeated allocation.
  */
 
 import { DeviceState, ProxyConfig, ZoneConfig, DoorConfig, BLELivemapConfig } from "./types";
+
+// ─── Constants ────────────────────────────────────────────────────
+
+const FONT_LABEL = `500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+const FONT_DEVICE = `600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+const FONT_PROXY = `10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+const FONT_DOOR = `9px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
 
 interface RenderContext {
   ctx: CanvasRenderingContext2D;
@@ -15,11 +29,108 @@ interface RenderContext {
   height: number;
   dpr: number;
   isDark: boolean;
+  frameTime: number; // shared timestamp for all animations this frame
 }
 
-// Animation state for smooth transitions
+// ─── Animation State ──────────────────────────────────────────────
+
 const animatedPositions: Map<string, { x: number; y: number; accuracy: number }> = new Map();
 const ANIMATION_SPEED = 0.08;
+
+// ─── Offscreen Canvas Cache ───────────────────────────────────────
+
+/**
+ * Cache for static layer (zones + doors).
+ * Invalidated when config fingerprint changes.
+ */
+let staticCanvas: OffscreenCanvas | HTMLCanvasElement | null = null;
+let staticFingerprint = "";
+let staticWidth = 0;
+let staticHeight = 0;
+let staticDpr = 1;
+
+/**
+ * Generate a fingerprint for the static layer configuration.
+ * If this changes, we need to re-render the offscreen canvas.
+ */
+function getStaticFingerprint(
+  zones: ZoneConfig[],
+  doors: DoorConfig[],
+  config: BLELivemapConfig,
+  activeFloor: string | null,
+  width: number,
+  height: number,
+  dpr: number,
+  isDark: boolean
+): string {
+  // Include dimensions, theme, floor, and a hash of zone/door config
+  const zoneHash = zones.map(z =>
+    `${z.id}:${z.color}:${z.border_color}:${z.opacity}:${z.show_label}:${z.floor_id}:${z.points.map(p => `${p.x},${p.y}`).join(";")}`
+  ).join("|");
+  const doorHash = doors.map(d =>
+    `${d.id}:${d.x}:${d.y}:${d.type}:${d.name}:${d.floor_id}`
+  ).join("|");
+  return `${width}x${height}@${dpr}:${isDark}:${activeFloor}:${config.show_zones}:${config.show_zone_labels}:${config.show_doors}:${zoneHash}:${doorHash}`;
+}
+
+/**
+ * Render static elements (zones, doors) to the offscreen canvas.
+ */
+function renderStaticLayer(
+  zones: ZoneConfig[],
+  doors: DoorConfig[],
+  config: BLELivemapConfig,
+  activeFloor: string | null,
+  width: number,
+  height: number,
+  dpr: number,
+  isDark: boolean
+): void {
+  // Create or resize offscreen canvas
+  const pixelWidth = Math.ceil(width * dpr);
+  const pixelHeight = Math.ceil(height * dpr);
+
+  if (typeof OffscreenCanvas !== "undefined") {
+    staticCanvas = new OffscreenCanvas(pixelWidth, pixelHeight);
+  } else {
+    staticCanvas = document.createElement("canvas");
+    staticCanvas.width = pixelWidth;
+    staticCanvas.height = pixelHeight;
+  }
+
+  staticWidth = width;
+  staticHeight = height;
+  staticDpr = dpr;
+
+  const ctx = staticCanvas.getContext("2d") as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+  if (!ctx) return;
+
+  ctx.clearRect(0, 0, pixelWidth, pixelHeight);
+  ctx.save();
+  ctx.scale(dpr, dpr);
+
+  const rc: RenderContext = { ctx: ctx as CanvasRenderingContext2D, width, height, dpr, isDark, frameTime: Date.now() };
+
+  // Draw zones
+  if (config.show_zones !== false && zones.length > 0) {
+    for (const zone of zones) {
+      if (activeFloor && zone.floor_id && zone.floor_id !== activeFloor) continue;
+      drawZone(rc, zone, config.show_zone_labels !== false);
+    }
+  }
+
+  // Draw doors
+  if (config.show_doors !== false && doors.length > 0) {
+    for (const door of doors) {
+      if (activeFloor && door.floor_id && door.floor_id !== activeFloor) continue;
+      drawDoor(rc, door);
+    }
+  }
+
+  ctx.restore();
+}
+
+// ─── Main Render Function ─────────────────────────────────────────
 
 /**
  * Main render function - called on every animation frame.
@@ -35,33 +146,35 @@ export function render(
 ): void {
   const { ctx, width, height, dpr } = rc;
 
+  // Compute shared frame timestamp once
+  rc.frameTime = Date.now();
+
   // Clear canvas
   ctx.clearRect(0, 0, width * dpr, height * dpr);
   ctx.save();
   ctx.scale(dpr, dpr);
 
-  // Draw zones (below everything else)
-  if (config.show_zones !== false && zones.length > 0) {
-    for (const zone of zones) {
-      if (activeFloor && zone.floor_id && zone.floor_id !== activeFloor) continue;
-      drawZone(rc, zone, config.show_zone_labels !== false);
-    }
+  // ── Static layer (zones + doors) via offscreen canvas ──
+  const fp = getStaticFingerprint(zones, doors, config, activeFloor, width, height, dpr, rc.isDark);
+  if (fp !== staticFingerprint || !staticCanvas) {
+    renderStaticLayer(zones, doors, config, activeFloor, width, height, dpr, rc.isDark);
+    staticFingerprint = fp;
   }
 
-  // Draw doors (between zones and proxies)
-  if (config.show_doors !== false && doors.length > 0) {
-    for (const door of doors) {
-      if (activeFloor && door.floor_id && door.floor_id !== activeFloor) continue;
-      drawDoor(rc, door);
-    }
+  // Blit the static layer onto the main canvas
+  if (staticCanvas && staticWidth === width && staticHeight === height) {
+    ctx.save();
+    ctx.scale(1 / dpr, 1 / dpr); // undo the dpr scale for the blit
+    ctx.drawImage(staticCanvas as any, 0, 0);
+    ctx.restore();
   }
 
-  // Draw signal coverage overlay
+  // Draw signal coverage overlay (semi-static but cheap)
   if (config.show_signal_overlay) {
     drawSignalOverlay(rc, proxies, activeFloor);
   }
 
-  // Draw proxy indicators
+  // Draw proxy indicators (dynamic: gateway pulse animation)
   if (config.show_proxies) {
     for (const proxy of proxies) {
       if (activeFloor && proxy.floor_id && proxy.floor_id !== activeFloor) continue;
@@ -74,13 +187,11 @@ export function render(
     if (!device.position) continue;
     if (activeFloor && device.position.floor_id && device.position.floor_id !== activeFloor) continue;
 
-    // Draw history trail
     if (device.config.show_trail !== false && device.history.length > 1) {
       drawTrail(rc, device, width, height);
     }
   }
 
-  // Draw device positions on top of trails
   for (const device of devices) {
     if (!device.position) continue;
     if (activeFloor && device.position.floor_id && device.position.floor_id !== activeFloor) continue;
@@ -90,6 +201,8 @@ export function render(
 
   ctx.restore();
 }
+
+// ─── Drawing Functions ────────────────────────────────────────────
 
 /**
  * Draw a zone polygon on the map.
@@ -130,11 +243,10 @@ function drawZone(rc: RenderContext, zone: ZoneConfig, showLabel: boolean): void
     const cx = (centroid.x / 100) * width;
     const cy = (centroid.y / 100) * height;
 
-    ctx.font = `500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.font = FONT_LABEL;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
-    // Label background
     const metrics = ctx.measureText(zone.name);
     const padding = 5;
     const bgX = cx - metrics.width / 2 - padding;
@@ -177,7 +289,7 @@ const GATEWAY_ICONS: Record<string, string> = {
  * Gateway proxies get a distinct visual treatment with colored ring and icon.
  */
 function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
-  const { ctx, width, height, isDark } = rc;
+  const { ctx, width, height, isDark, frameTime } = rc;
   const x = (proxy.x / 100) * width;
   const y = (proxy.y / 100) * height;
   const radius = 6;
@@ -185,12 +297,11 @@ function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
   const isCalibrated = proxy.calibration?.ref_rssi !== undefined;
 
   if (isGateway) {
-    // Gateway proxy: larger, colored ring with gateway icon
     const gwRadius = 9;
-    const gwColor = proxy.color || "#FF9800"; // Orange for gateways
+    const gwColor = proxy.color || "#FF9800";
 
     // Pulsing outer ring for gateways
-    const pulsePhase = (Date.now() % 4000) / 4000;
+    const pulsePhase = (frameTime % 4000) / 4000;
     const pulseAlpha = 0.15 + Math.sin(pulsePhase * Math.PI * 2) * 0.1;
     ctx.beginPath();
     ctx.arc(x, y, gwRadius + 4, 0, Math.PI * 2);
@@ -221,20 +332,17 @@ function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
     ctx.fillText(icon, x, y);
   } else {
     // Standard proxy rendering
-    // Outer ring
     ctx.beginPath();
     ctx.arc(x, y, radius + 2, 0, Math.PI * 2);
     ctx.fillStyle = isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.05)";
     ctx.fill();
 
-    // Inner dot
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
     const color = proxy.color || (isDark ? "#546E7A" : "#90A4AE");
     ctx.fillStyle = color;
     ctx.fill();
 
-    // Bluetooth icon (simplified)
     ctx.fillStyle = "#fff";
     ctx.font = `bold ${radius}px sans-serif`;
     ctx.textAlign = "center";
@@ -259,7 +367,7 @@ function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
   const fullLabel = labelText + gatewayLabel;
 
   if (fullLabel) {
-    ctx.font = `10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.font = FONT_PROXY;
     ctx.fillStyle = isDark ? "rgba(255,255,255,0.5)" : "rgba(0,0,0,0.4)";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
@@ -271,7 +379,7 @@ function drawProxy(rc: RenderContext, proxy: ProxyConfig): void {
  * Draw a door/opening/portal marker on the map.
  */
 function drawDoor(rc: RenderContext, door: DoorConfig): void {
-  const { ctx, width, height, isDark } = rc;
+  const { ctx, width, height, isDark, frameTime } = rc;
   const x = (door.x / 100) * width;
   const y = (door.y / 100) * height;
 
@@ -279,21 +387,18 @@ function drawDoor(rc: RenderContext, door: DoorConfig): void {
   const isDoor = door.type === "door";
   const size = isPortal ? 10 : 8;
 
-  // Color based on type
   const color = isPortal ? "#E040FB" : isDoor ? "#FF9800" : "#78909C";
   const rgb = hexToRgb(color);
 
-  if (isPortal) {    // Portal: stairway icon with glow
-    const pulsePhase = (Date.now() % 3000) / 3000;
+  if (isPortal) {
+    const pulsePhase = (frameTime % 3000) / 3000;
     const pulseAlpha = 0.1 + Math.sin(pulsePhase * Math.PI * 2) * 0.08;
 
-    // Glow
     ctx.beginPath();
     ctx.arc(x, y, size + 5, 0, Math.PI * 2);
     ctx.fillStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${pulseAlpha})`;
     ctx.fill();
 
-    // Rounded square background
     const bgSize = size * 1.8;
     roundRect(ctx, x - bgSize / 2, y - bgSize / 2, bgSize, bgSize, 4);
     ctx.fillStyle = color;
@@ -311,19 +416,15 @@ function drawDoor(rc: RenderContext, door: DoorConfig): void {
     const startX = x - size * 0.45;
     const startY = y + size * 0.45;
     ctx.beginPath();
-    // Step 1 (bottom)
     ctx.moveTo(startX, startY);
     ctx.lineTo(startX + stepW, startY);
     ctx.lineTo(startX + stepW, startY - stepH);
-    // Step 2 (middle)
     ctx.lineTo(startX + stepW * 2, startY - stepH);
     ctx.lineTo(startX + stepW * 2, startY - stepH * 2);
-    // Step 3 (top)
     ctx.lineTo(startX + stepW * 3, startY - stepH * 2);
     ctx.stroke();
     ctx.lineCap = "butt";
   } else if (isDoor) {
-    // Door: rounded rectangle
     const w = size * 2;
     const h = size * 1.5;
     roundRect(ctx, x - w / 2, y - h / 2, w, h, 3);
@@ -333,25 +434,22 @@ function drawDoor(rc: RenderContext, door: DoorConfig): void {
     ctx.lineWidth = 1;
     ctx.stroke();
 
-    // Door icon
     ctx.fillStyle = "#fff";
     ctx.font = `bold ${size - 1}px sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText("D", x, y);
   } else {
-    // Opening: simple gap indicator (two short lines)
+    // Opening: simple gap indicator
     ctx.strokeStyle = color;
     ctx.lineWidth = 3;
     ctx.lineCap = "round";
 
-    // Left bracket
     ctx.beginPath();
     ctx.moveTo(x - size, y - size * 0.6);
     ctx.lineTo(x - size, y + size * 0.6);
     ctx.stroke();
 
-    // Right bracket
     ctx.beginPath();
     ctx.moveTo(x + size, y - size * 0.6);
     ctx.lineTo(x + size, y + size * 0.6);
@@ -362,7 +460,7 @@ function drawDoor(rc: RenderContext, door: DoorConfig): void {
 
   // Label
   if (door.name) {
-    ctx.font = `9px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.font = FONT_DOOR;
     ctx.fillStyle = isDark ? "rgba(255,255,255,0.5)" : "rgba(0,0,0,0.4)";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
@@ -380,7 +478,7 @@ function drawDevice(
   canvasHeight: number,
   config: BLELivemapConfig
 ): void {
-  const { ctx, isDark } = rc;
+  const { ctx, isDark, frameTime } = rc;
   const pos = device.position!;
   const color = device.config.color || "#4FC3F7";
 
@@ -404,10 +502,9 @@ function drawDevice(
   const y = anim.y;
   const accRadius = anim.accuracy;
 
-  // Parse color to RGB
   const rgb = hexToRgb(color);
 
-  // Gradient accuracy circle (faded)
+  // Gradient accuracy circle
   const gradient = ctx.createRadialGradient(x, y, 0, x, y, accRadius);
   gradient.addColorStop(0, `rgba(${rgb.r},${rgb.g},${rgb.b},0.35)`);
   gradient.addColorStop(0.5, `rgba(${rgb.r},${rgb.g},${rgb.b},0.15)`);
@@ -429,8 +526,8 @@ function drawDevice(
     ctx.setLineDash([]);
   }
 
-  // Pulsing outer ring
-  const pulsePhase = (Date.now() % 3000) / 3000;
+  // Pulsing outer ring (using shared frameTime)
+  const pulsePhase = (frameTime % 3000) / 3000;
   const pulseRadius = 10 + Math.sin(pulsePhase * Math.PI * 2) * 3;
   const pulseAlpha = 0.3 + Math.sin(pulsePhase * Math.PI * 2) * 0.15;
 
@@ -455,11 +552,10 @@ function drawDevice(
   // Device label
   if (device.config.show_label !== false) {
     const label = device.config.name || device.name;
-    ctx.font = `600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.font = FONT_DEVICE;
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
 
-    // Label background
     const metrics = ctx.measureText(label);
     const labelX = x;
     const labelY = y + 14;
@@ -546,7 +642,6 @@ function drawSignalOverlay(
 
   if (floorProxies.length === 0) return;
 
-  // Create coverage gradient for each proxy
   for (const proxy of floorProxies) {
     const x = (proxy.x / 100) * width;
     const y = (proxy.y / 100) * height;
@@ -563,6 +658,8 @@ function drawSignalOverlay(
     ctx.fill();
   }
 }
+
+// ─── Utility Functions ────────────────────────────────────────────
 
 /**
  * Draw a rounded rectangle.

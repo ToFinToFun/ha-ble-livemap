@@ -5,9 +5,13 @@
  *
  * Calculates device position from distances to known proxy positions
  * using weighted least-squares trilateration.
+ *
+ * Includes a 1D Kalman filter for RSSI/distance smoothing per proxy,
+ * which dramatically reduces the noise inherent in BLE signals before
+ * the trilateration step.
  */
 
-import { TrilaterationResult, ProxyConfig, ProxyDistance } from "./types";
+import { TrilaterationResult, ProxyDistance } from "./types";
 
 interface Point {
   x: number;
@@ -20,10 +24,99 @@ interface Circle {
   r: number;
 }
 
+// ─── 1D Kalman Filter for Distance Smoothing ──────────────────────
+
+/**
+ * Per-proxy Kalman filter state.
+ * Tracks estimated distance and uncertainty for a single proxy-device pair.
+ */
+interface KalmanState {
+  estimate: number;     // current estimated distance (meters)
+  errorCovariance: number; // estimation uncertainty
+  lastUpdate: number;   // timestamp of last update
+}
+
+/**
+ * Global store of Kalman filter states.
+ * Key format: `${deviceSlug}::${proxyEntityId}`
+ */
+const kalmanStates = new Map<string, KalmanState>();
+
+/**
+ * Kalman filter tuning parameters.
+ *
+ * - processNoise: How much we expect the real distance to change between
+ *   readings. Higher = more responsive but noisier. BLE devices typically
+ *   move at walking speed (~1.5 m/s), and we update every ~2s.
+ * - measurementNoise: How noisy BLE distance measurements are.
+ *   BLE RSSI can easily fluctuate ±6 dBm which translates to ~2x distance error.
+ */
+const KALMAN_PROCESS_NOISE = 0.5;      // meters² per update
+const KALMAN_MEASUREMENT_NOISE = 2.0;  // meters² per measurement
+const KALMAN_MAX_AGE = 60_000;         // reset filter if no update for 60s
+
+/**
+ * Apply 1D Kalman filter to a distance measurement.
+ *
+ * Returns the filtered (smoothed) distance.
+ */
+export function kalmanFilterDistance(
+  key: string,
+  measuredDistance: number,
+  timestamp: number = Date.now()
+): number {
+  let state = kalmanStates.get(key);
+
+  // Initialize or reset if too old
+  if (!state || (timestamp - state.lastUpdate) > KALMAN_MAX_AGE) {
+    state = {
+      estimate: measuredDistance,
+      errorCovariance: KALMAN_MEASUREMENT_NOISE,
+      lastUpdate: timestamp,
+    };
+    kalmanStates.set(key, state);
+    return measuredDistance;
+  }
+
+  // Predict step: increase uncertainty over time
+  const dt = (timestamp - state.lastUpdate) / 1000; // seconds since last update
+  const predictedEstimate = state.estimate;
+  const predictedCovariance = state.errorCovariance + KALMAN_PROCESS_NOISE * dt;
+
+  // Update step: incorporate new measurement
+  const kalmanGain = predictedCovariance / (predictedCovariance + KALMAN_MEASUREMENT_NOISE);
+  const newEstimate = predictedEstimate + kalmanGain * (measuredDistance - predictedEstimate);
+  const newCovariance = (1 - kalmanGain) * predictedCovariance;
+
+  state.estimate = newEstimate;
+  state.errorCovariance = newCovariance;
+  state.lastUpdate = timestamp;
+
+  return Math.max(0.1, newEstimate); // distance can't be negative
+}
+
+/**
+ * Clean up Kalman states for devices that are no longer tracked.
+ */
+export function cleanupKalmanStates(activeDeviceIds: string[]): void {
+  const activeSet = new Set(activeDeviceIds);
+  for (const key of kalmanStates.keys()) {
+    const deviceId = key.split("::")[0];
+    if (!activeSet.has(deviceId)) {
+      kalmanStates.delete(key);
+    }
+  }
+}
+
+// ─── Trilateration ────────────────────────────────────────────────
+
 /**
  * Weighted least-squares trilateration.
  * Uses inverse-distance weighting so closer (more reliable) proxies
  * have greater influence on the result.
+ *
+ * When `deviceKey` is provided, distances are pre-smoothed through
+ * the Kalman filter before trilateration.
  */
 export function trilaterate(
   proxyPositions: Map<string, Point>,
@@ -31,7 +124,8 @@ export function trilaterate(
   imageWidth: number,
   imageHeight: number,
   realWidth: number,
-  realHeight: number
+  realHeight: number,
+  deviceKey?: string
 ): TrilaterationResult | null {
   // Filter to only proxies we have positions for and valid distances
   const circles: Circle[] = [];
@@ -41,15 +135,22 @@ export function trilaterate(
     const pos = proxyPositions.get(d.proxy_entity_id);
     if (!pos || d.distance <= 0 || d.distance > 50) continue;
 
+    // Apply Kalman filter to smooth the distance if we have a device key
+    let smoothedDistance = d.distance;
+    if (deviceKey) {
+      const kalmanKey = `${deviceKey}::${d.proxy_entity_id}`;
+      smoothedDistance = kalmanFilterDistance(kalmanKey, d.distance, d.timestamp);
+    }
+
     // Convert proxy position from percentage to real-world meters
     const realX = (pos.x / 100) * realWidth;
     const realY = (pos.y / 100) * realHeight;
 
-    circles.push({ x: realX, y: realY, r: d.distance });
+    circles.push({ x: realX, y: realY, r: smoothedDistance });
 
     // Weight: closer distances are more reliable
     // Use inverse square of distance for weighting
-    const weight = 1 / (d.distance * d.distance + 0.1);
+    const weight = 1 / (smoothedDistance * smoothedDistance + 0.1);
     weights.push(weight);
   }
 
@@ -186,6 +287,7 @@ function weightedCentroid(circles: Circle[], weights: number[]): Point {
 
 /**
  * Smooth position using exponential moving average.
+ * Applied after trilateration for additional position-level smoothing.
  */
 export function smoothPosition(
   current: TrilaterationResult | null,

@@ -11,7 +11,7 @@
  * import from this module instead of duplicating regex chains.
  */
 
-import { HomeAssistant, ProxyConfig, ProxyDistance, ProxyCalibration } from "./types";
+import { HomeAssistant, ProxyConfig, ProxyDistance, ProxyCalibration, ZoneConfig } from "./types";
 
 // ─── Slug Extraction ────────────────────────────────────────────────
 
@@ -313,6 +313,149 @@ export function isPointInPolygon(
     }
   }
   return inside;
+}
+
+// ─── Area & Zone-Constrained Positioning ──────────────────────────
+
+/**
+ * Read the Bermuda Area sensor for a tracked device.
+ *
+ * Bermuda creates `sensor.bermuda_{deviceSlug}_area` whose state is the
+ * HA Area name (e.g. "Kitchen", "Living Room").
+ * It also exposes `area_id` and `area_name` as attributes.
+ *
+ * Returns `{ areaId, areaName }` or null if unavailable.
+ */
+export function readDeviceArea(
+  hass: HomeAssistant,
+  entityPrefix: string
+): { areaId: string; areaName: string } | null {
+  if (!hass?.states || !entityPrefix) return null;
+
+  const deviceSlug = extractDeviceSlug(entityPrefix);
+
+  // Try the standard Bermuda area sensor
+  const candidates = [
+    `sensor.bermuda_${deviceSlug}_area`,
+    `${entityPrefix}_area`,
+  ];
+
+  for (const sensorId of candidates) {
+    const state = hass.states[sensorId];
+    if (state && state.state && state.state !== "unknown" && state.state !== "unavailable") {
+      return {
+        areaId: state.attributes?.area_id || "",
+        areaName: state.state,
+      };
+    }
+  }
+
+  // Fallback: check device_tracker attributes
+  const dtEntity = entityPrefix.replace("sensor.bermuda_", "device_tracker.bermuda_");
+  const dtState = hass.states[dtEntity];
+  if (dtState?.attributes?.area_name) {
+    return {
+      areaId: dtState.attributes.area_id || "",
+      areaName: dtState.attributes.area_name,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Find the zone that matches a Bermuda Area.
+ *
+ * Matching priority:
+ * 1. Zone has `ha_area_id` set and it matches the Bermuda area_id
+ * 2. Zone name matches the Bermuda area name (case-insensitive)
+ */
+export function findZoneForArea(
+  zones: ZoneConfig[],
+  areaId: string,
+  areaName: string,
+  floorId?: string | null
+): ZoneConfig | null {
+  if (!zones || zones.length === 0) return null;
+
+  // Priority 1: Explicit ha_area_id match
+  for (const zone of zones) {
+    if (floorId && zone.floor_id && zone.floor_id !== floorId) continue;
+    if (zone.ha_area_id && zone.ha_area_id === areaId) return zone;
+  }
+
+  // Priority 2: Name match (case-insensitive)
+  const normalizedAreaName = areaName.toLowerCase().trim();
+  for (const zone of zones) {
+    if (floorId && zone.floor_id && zone.floor_id !== floorId) continue;
+    if (zone.name && zone.name.toLowerCase().trim() === normalizedAreaName) return zone;
+  }
+
+  return null;
+}
+
+/**
+ * Constrain a point to lie inside a polygon.
+ *
+ * If the point is already inside, returns it unchanged.
+ * Otherwise, finds the nearest point on the polygon boundary.
+ *
+ * All coordinates are in percentage (0-100) space.
+ */
+export function constrainToPolygon(
+  x: number,
+  y: number,
+  points: { x: number; y: number }[]
+): { x: number; y: number } {
+  if (points.length < 3) return { x, y };
+  if (isPointInPolygon(x, y, points)) return { x, y };
+
+  // Find the nearest point on any edge of the polygon
+  let nearestX = x;
+  let nearestY = y;
+  let minDist = Infinity;
+
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const closest = nearestPointOnSegment(
+      x, y,
+      points[j].x, points[j].y,
+      points[i].x, points[i].y
+    );
+    const dx = x - closest.x;
+    const dy = y - closest.y;
+    const dist = dx * dx + dy * dy;
+    if (dist < minDist) {
+      minDist = dist;
+      nearestX = closest.x;
+      nearestY = closest.y;
+    }
+  }
+
+  return { x: nearestX, y: nearestY };
+}
+
+/**
+ * Find the nearest point on a line segment to a given point.
+ */
+function nearestPointOnSegment(
+  px: number, py: number,
+  ax: number, ay: number,
+  bx: number, by: number
+): { x: number; y: number } {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+
+  if (lenSq === 0) return { x: ax, y: ay }; // degenerate segment
+
+  // Project point onto the line, clamped to [0, 1]
+  let t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+
+  return {
+    x: ax + t * dx,
+    y: ay + t * dy,
+  };
 }
 
 // ─── RSSI Calibration ───────────────────────────────────────────────

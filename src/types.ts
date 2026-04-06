@@ -82,6 +82,7 @@ export interface ZoneConfig {
   opacity?: number; // fill opacity 0-1
   show_label?: boolean;
   floor_id?: string;
+  ha_area_id?: string; // Home Assistant Area ID — links this zone to a Bermuda Area sensor
 }
 
 /** Door/portal connecting two zones or floors */

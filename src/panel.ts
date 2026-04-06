@@ -1269,7 +1269,7 @@ export class BLELivemapPanel extends LitElement {
         }
 
         if (proxyMap.size >= 1) {
-          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight);
+          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight, deviceId);
           if (result) {
             const prevResult = this._previousPositions.get(deviceId) || null;
             const smoothed = smoothPosition(result, prevResult, 0.3);

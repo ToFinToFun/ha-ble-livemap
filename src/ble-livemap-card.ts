@@ -23,13 +23,17 @@ import {
   DEVICE_COLORS,
 } from "./types";
 import { CARD_VERSION, CARD_NAME, CARD_EDITOR_NAME } from "./const";
-import { trilaterate, smoothPosition } from "./trilateration";
+import { trilaterate, smoothPosition, cleanupKalmanStates } from "./trilateration";
 import { render as renderCanvas, cleanupAnimations } from "./renderer";
 import { HistoryStore } from "./history-store";
 import { localize } from "./localize/localize";
 import {
   collectDeviceDistances,
   applyRssiCalibration,
+  readDeviceArea,
+  findZoneForArea,
+  constrainToPolygon,
+  isPointInPolygon,
 } from "./bermuda-utils";
 
 // Register the card with HA
@@ -102,6 +106,16 @@ export class BLELivemapCard extends LitElement {
   // Zone connectivity state per device
   private _deviceZoneState: Map<string, DeviceZoneState> = new Map();
   @state() private _runtimeShowDoors: boolean | null = null;
+
+  // Bermuda Area debounce state per device
+  // Tracks consecutive area readings to prevent flickering between rooms
+  private _deviceAreaState: Map<string, {
+    confirmedArea: string | null;    // currently confirmed area name
+    confirmedZoneId: string | null;  // zone ID for the confirmed area
+    candidateArea: string | null;    // new area being debounced
+    candidateCount: number;          // consecutive readings of the candidate
+    lastReading: number;             // timestamp of last area reading
+  }> = new Map();
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -294,30 +308,14 @@ export class BLELivemapCard extends LitElement {
   // ─── Zone Connectivity Logic ─────────────────────────────
 
   /**
-   * Check if a point (in % coords) is inside a zone polygon.
-   */
-  private _pointInZone(px: number, py: number, zone: ZoneConfig): boolean {
-    const pts = zone.points;
-    if (!pts || pts.length < 3) return false;
-    let inside = false;
-    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-      const xi = pts[i].x, yi = pts[i].y;
-      const xj = pts[j].x, yj = pts[j].y;
-      if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
-        inside = !inside;
-      }
-    }
-    return inside;
-  }
-
-  /**
    * Find which zone a position falls into.
+   * Uses shared isPointInPolygon from bermuda-utils.
    */
   private _findZoneForPosition(x: number, y: number, floorId: string | null): string | null {
     const zones = this._config.zones || [];
     for (const zone of zones) {
       if (floorId && zone.floor_id && zone.floor_id !== floorId) continue;
-      if (this._pointInZone(x, y, zone)) return zone.id;
+      if (isPointInPolygon(x, y, zone.points)) return zone.id;
     }
     return null;
   }
@@ -540,7 +538,10 @@ export class BLELivemapCard extends LitElement {
     const devices: DeviceState[] = [];
     const proxies = this._getAllProxies();
     const floors = this._getFloors();
+    const zones = this._config.zones || [];
     const hasMultipleFloors = floors.length > 1;
+    // Check if any zone has ha_area_id or if zone names could match areas
+    const hasZoneAreaMapping = zones.length > 0;
 
     for (const deviceConfig of this._config.tracked_devices) {
       const distances = this._getDeviceDistances(deviceConfig, proxies);
@@ -548,6 +549,31 @@ export class BLELivemapCard extends LitElement {
 
       const deviceId = deviceConfig.entity_prefix || deviceConfig.bermuda_device_id || "";
 
+      // ── Layer 1: Read Bermuda Area (room determination) ──
+      let bermudaArea: { areaId: string; areaName: string } | null = null;
+      let areaZone: ZoneConfig | null = null;
+      let confirmedAreaName: string | null = null;
+
+      if (hasZoneAreaMapping && deviceConfig.entity_prefix) {
+        bermudaArea = readDeviceArea(this.hass, deviceConfig.entity_prefix);
+
+        if (bermudaArea) {
+          // Debounce area changes to prevent flickering
+          confirmedAreaName = this._debounceAreaChange(
+            deviceId, bermudaArea.areaName
+          );
+
+          if (confirmedAreaName) {
+            // Find the zone that matches this confirmed area
+            const floorId = hasMultipleFloors
+              ? this._resolveDeviceFloor(deviceId, distances, proxies)
+              : null;
+            areaZone = findZoneForArea(zones, bermudaArea.areaId, confirmedAreaName, floorId);
+          }
+        }
+      }
+
+      // ── Layer 2: Trilateration (intra-room positioning) ──
       if (distances.length >= 1) {
         const proxyMap = new Map<string, { x: number; y: number }>();
 
@@ -562,7 +588,6 @@ export class BLELivemapCard extends LitElement {
         for (const d of distances) {
           const proxy = proxies.find((p) => p.entity_id === d.proxy_entity_id);
           if (proxy) {
-            // If we have a resolved floor, only use proxies on that floor
             if (resolvedFloorId && proxy.floor_id && proxy.floor_id !== resolvedFloorId) {
               continue;
             }
@@ -586,7 +611,7 @@ export class BLELivemapCard extends LitElement {
             imageHeight = floor?.image_height || 15;
           }
 
-          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight);
+          const result = trilaterate(proxyMap, distances, 100, 100, imageWidth, imageHeight, deviceId);
 
           if (result) {
             const prevKey = deviceConfig.entity_prefix || "";
@@ -597,9 +622,22 @@ export class BLELivemapCard extends LitElement {
             const smoothed = smoothPosition(result, prevResult, 0.3);
 
             if (smoothed) {
+              let finalX = smoothed.x;
+              let finalY = smoothed.y;
+
+              // ── Zone Constraint: If Bermuda says the device is in a specific
+              //    room, constrain the trilaterated position to that zone polygon.
+              //    This prevents "wall jumping" while still allowing movement
+              //    within the room. ──
+              if (areaZone && areaZone.points?.length >= 3) {
+                const constrained = constrainToPolygon(finalX, finalY, areaZone.points);
+                finalX = constrained.x;
+                finalY = constrained.y;
+              }
+
               position = {
-                x: smoothed.x,
-                y: smoothed.y,
+                x: finalX,
+                y: finalY,
                 accuracy: smoothed.accuracy,
                 confidence: smoothed.confidence,
                 timestamp: Date.now(),
@@ -612,21 +650,18 @@ export class BLELivemapCard extends LitElement {
         }
       }
 
-      // Resolve zone using door connectivity
-      if (position && (this._config.doors?.length || 0) > 0) {
+      // Resolve zone using door connectivity (fallback when no Bermuda Area data)
+      if (position && !areaZone && (this._config.doors?.length || 0) > 0) {
         const resolvedZone = this._resolveDeviceZone(
           deviceId,
           { x: position.x, y: position.y },
           position.floor_id || null
         );
-        // If zone connectivity blocks the move, constrain position
-        // to the nearest point inside the allowed zone
         if (resolvedZone) {
           const posZone = this._findZoneForPosition(
             position.x, position.y, position.floor_id || null
           );
           if (posZone && posZone !== resolvedZone) {
-            // Position is in a blocked zone - keep the previous position
             const prevKey = deviceConfig.entity_prefix || "";
             const prevPos = this._previousPositions.get(prevKey);
             if (prevPos) {
@@ -667,7 +702,7 @@ export class BLELivemapCard extends LitElement {
         history,
         distances,
         nearest_proxy: nearestProxy,
-        area: null,
+        area: confirmedAreaName || null,
         last_seen: position ? Date.now() : 0,
         config: deviceConfig,
         current_floor_id: floorState?.current_floor_id || undefined,
@@ -675,7 +710,58 @@ export class BLELivemapCard extends LitElement {
     }
 
     this._devices = devices;
-    cleanupAnimations(devices.map((d) => d.device_id));
+    const activeIds = devices.map((d) => d.device_id);
+    cleanupAnimations(activeIds);
+    cleanupKalmanStates(activeIds);
+  }
+
+  /**
+   * Debounce Bermuda Area changes to prevent flickering.
+   * Requires 3 consecutive readings of the same new area before confirming.
+   */
+  private _debounceAreaChange(deviceId: string, newAreaName: string): string | null {
+    const REQUIRED_READINGS = 3;
+
+    let state = this._deviceAreaState.get(deviceId);
+    if (!state) {
+      state = {
+        confirmedArea: null,
+        confirmedZoneId: null,
+        candidateArea: null,
+        candidateCount: 0,
+        lastReading: 0,
+      };
+      this._deviceAreaState.set(deviceId, state);
+    }
+
+    state.lastReading = Date.now();
+
+    // If the area hasn't changed from confirmed, return it
+    if (newAreaName === state.confirmedArea) {
+      state.candidateArea = null;
+      state.candidateCount = 0;
+      return state.confirmedArea;
+    }
+
+    // New area detected — start or continue debouncing
+    if (newAreaName === state.candidateArea) {
+      state.candidateCount++;
+    } else {
+      state.candidateArea = newAreaName;
+      state.candidateCount = 1;
+    }
+
+    // Confirm after enough consecutive readings
+    if (state.candidateCount >= REQUIRED_READINGS) {
+      state.confirmedArea = newAreaName;
+      state.confirmedZoneId = null; // will be resolved by findZoneForArea
+      state.candidateArea = null;
+      state.candidateCount = 0;
+      return state.confirmedArea;
+    }
+
+    // Still debouncing — return the previously confirmed area (or null if first time)
+    return state.confirmedArea;
   }
 
   /**
@@ -867,7 +953,7 @@ export class BLELivemapCard extends LitElement {
     const doors = this._getDoorsForFloor(floorId);
 
     renderCanvas(
-      { ctx, width, height, dpr, isDark },
+      { ctx, width, height, dpr, isDark, frameTime: Date.now() },
       this._devices,
       proxies,
       zones,

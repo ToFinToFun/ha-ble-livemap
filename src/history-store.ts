@@ -5,6 +5,12 @@
  *
  * Stores position history in IndexedDB to avoid filling the HA database.
  * Automatically purges old entries based on retention settings.
+ *
+ * Optimizations:
+ * - Batch writes: points are buffered in memory and flushed to IndexedDB
+ *   every FLUSH_INTERVAL_MS to reduce transaction overhead.
+ * - Periodic purge: old entries are cleaned up every PURGE_INTERVAL_MS
+ *   (not just on init) to prevent unbounded growth during long sessions.
  */
 
 import { HistoryPoint } from "./types";
@@ -13,11 +19,22 @@ const DB_NAME = "ble-livemap-history";
 const DB_VERSION = 1;
 const STORE_NAME = "positions";
 
+/** How often to flush buffered points to IndexedDB (ms) */
+const FLUSH_INTERVAL_MS = 10_000; // 10 seconds
+
+/** How often to purge old entries from IndexedDB (ms) */
+const PURGE_INTERVAL_MS = 3_600_000; // 1 hour
+
 export class HistoryStore {
   private db: IDBDatabase | null = null;
   private memoryCache: Map<string, HistoryPoint[]> = new Map();
   private maxRetentionMs: number;
   private maxTrailLength: number;
+
+  // Batch write buffer
+  private writeBuffer: { deviceId: string; point: HistoryPoint }[] = [];
+  private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private purgeTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(retentionMinutes: number = 60, maxTrailLength: number = 50) {
     this.maxRetentionMs = retentionMinutes * 60 * 1000;
@@ -42,6 +59,7 @@ export class HistoryStore {
         request.onsuccess = (event) => {
           this.db = (event.target as IDBOpenDBRequest).result;
           this.purgeOldEntries();
+          this.startTimers();
           resolve();
         };
 
@@ -57,28 +75,79 @@ export class HistoryStore {
     });
   }
 
-  async addPoint(deviceId: string, point: HistoryPoint): Promise<void> {
-    // Always update memory cache
+  /**
+   * Start periodic flush and purge timers.
+   */
+  private startTimers(): void {
+    // Periodic flush of write buffer to IndexedDB
+    if (!this.flushTimer) {
+      this.flushTimer = setInterval(() => this.flushBuffer(), FLUSH_INTERVAL_MS);
+    }
+
+    // Periodic purge of old entries
+    if (!this.purgeTimer) {
+      this.purgeTimer = setInterval(() => this.purgeOldEntries(), PURGE_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Stop timers (call when the store is no longer needed).
+   */
+  destroy(): void {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.purgeTimer) {
+      clearInterval(this.purgeTimer);
+      this.purgeTimer = null;
+    }
+    // Final flush
+    this.flushBuffer();
+  }
+
+  /**
+   * Add a point to the history.
+   * The point is immediately added to the in-memory cache and buffered
+   * for batch writing to IndexedDB.
+   */
+  addPoint(deviceId: string, point: HistoryPoint): void {
+    // Always update memory cache immediately
     if (!this.memoryCache.has(deviceId)) {
       this.memoryCache.set(deviceId, []);
     }
     const cache = this.memoryCache.get(deviceId)!;
     cache.push(point);
 
-    // Trim memory cache
+    // Trim memory cache to max trail length
     while (cache.length > this.maxTrailLength) {
       cache.shift();
     }
 
-    // Persist to IndexedDB if available
+    // Buffer for batch write to IndexedDB
     if (this.db) {
-      try {
-        const tx = this.db.transaction(STORE_NAME, "readwrite");
-        const store = tx.objectStore(STORE_NAME);
+      this.writeBuffer.push({ deviceId, point });
+    }
+  }
+
+  /**
+   * Flush the write buffer to IndexedDB in a single transaction.
+   */
+  private flushBuffer(): void {
+    if (!this.db || this.writeBuffer.length === 0) return;
+
+    try {
+      const tx = this.db.transaction(STORE_NAME, "readwrite");
+      const store = tx.objectStore(STORE_NAME);
+
+      for (const { deviceId, point } of this.writeBuffer) {
         store.add({ deviceId, ...point });
-      } catch {
-        // Silently fail - memory cache is the fallback
       }
+
+      this.writeBuffer = [];
+    } catch {
+      // Silently fail - memory cache is the fallback
+      // Don't clear the buffer so we can retry next flush
     }
   }
 
@@ -152,6 +221,7 @@ export class HistoryStore {
 
   async clear(): Promise<void> {
     this.memoryCache.clear();
+    this.writeBuffer = [];
     if (this.db) {
       try {
         const tx = this.db.transaction(STORE_NAME, "readwrite");
