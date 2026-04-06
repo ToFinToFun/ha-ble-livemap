@@ -112,6 +112,8 @@ export class BLELivemapPanel extends LitElement {
   @state() private _trackedDevices: DeviceState[] = [];
   @state() private _liveDebugInfo: ProxyDebugInfo[] = [];
   @state() private _showDebugPanel: boolean = false;
+  /** Currently selected device for debug visualization (entity_prefix) */
+  @state() private _debugFollowDevice: string = "";
   private _liveTrackingTimer: number | null = null;
   private _dragStarted = false;
 
@@ -1267,7 +1269,14 @@ export class BLELivemapPanel extends LitElement {
 
     // Delegate all tracking to the shared engine
     this._trackedDevices = this._trackingEngine!.update(this.hass, this._config);
-    this._liveDebugInfo = this._trackingEngine!.getDebugInfo();
+
+    // Get debug info for the selected device (or first device as fallback)
+    this._liveDebugInfo = this._trackingEngine!.getDebugInfo(this._debugFollowDevice || undefined);
+
+    // Auto-select first device if none selected and devices exist
+    if (!this._debugFollowDevice && this._trackedDevices.length > 0) {
+      this._debugFollowDevice = this._trackedDevices[0].device_id;
+    }
   }
 
   // ─── Zone Helpers ─────────────────────────────────────────
@@ -2207,6 +2216,83 @@ export class BLELivemapPanel extends LitElement {
         color: var(--text-secondary);
       }
 
+      .debug-device-selector {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+      }
+
+      .debug-device-selector label {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-secondary);
+        white-space: nowrap;
+      }
+
+      .debug-device-selector select {
+        flex: 1;
+        font-size: 11px;
+        padding: 4px 8px;
+        border-radius: 4px;
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.2));
+        background: var(--card-bg, #1e1e1e);
+        color: var(--text-primary, #fff);
+      }
+
+      /* Debug map overlay elements */
+      .debug-proxy-ring {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: 2px solid var(--ring-color, #4CAF50);
+        opacity: var(--ring-opacity, 0.8);
+        pointer-events: none;
+        z-index: 20;
+        animation: debug-ring-pulse 2s ease-in-out infinite;
+      }
+
+      @keyframes debug-ring-pulse {
+        0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: var(--ring-opacity, 0.8); }
+        50% { transform: translate(-50%, -50%) scale(1.15); opacity: calc(var(--ring-opacity, 0.8) * 0.6); }
+      }
+
+      .debug-line-svg {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 19;
+      }
+
+      .debug-distance-label {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        font-size: 9px;
+        font-weight: 600;
+        color: #fff;
+        background: rgba(0, 0, 0, 0.7);
+        padding: 2px 5px;
+        border-radius: 3px;
+        pointer-events: none;
+        z-index: 21;
+        text-align: center;
+        line-height: 1.3;
+        white-space: nowrap;
+      }
+
+      .debug-rssi {
+        font-size: 8px;
+        font-weight: 400;
+        opacity: 0.7;
+      }
+
       /* Door markers */
       .door-marker {
         position: absolute;
@@ -2910,6 +2996,7 @@ export class BLELivemapPanel extends LitElement {
                   ${this._renderDoorMarkers()}
                   ${this._renderProxyMarkers()}
                   ${this._renderLiveDeviceMarkers()}
+                  ${this._renderDebugOverlay()}
                   ${this._renderDrawingPoints()}
                   ${this._renderRectPreview()}
                   ${this._renderCalibrationOverlay()}
@@ -2918,37 +3005,67 @@ export class BLELivemapPanel extends LitElement {
             </div>
           </div>
           <!-- Debug toggle -->
-          ${this._liveDebugInfo.length > 0 ? html`
+          ${this._trackedDevices.length > 0 ? html`
             <button class="btn btn-small" style="margin-top:8px; font-size:11px;" @click=${() => { this._showDebugPanel = !this._showDebugPanel; }}>
               ${this._showDebugPanel ? '▲ Hide' : '▼ Show'} Sensor Debug
             </button>
           ` : nothing}
-          ${this._showDebugPanel && this._liveDebugInfo.length > 0 ? html`
+          ${this._showDebugPanel ? html`
             <div class="debug-panel">
-              <table class="debug-table">
-                <thead>
-                  <tr>
-                    <th>Proxy</th>
-                    <th>Distance</th>
-                    <th>Placed</th>
-                    <th>Used</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${this._liveDebugInfo.map((d) => html`
-                    <tr class="${d.distance !== null ? 'debug-active' : 'debug-inactive'}">
-                      <td title="${d.sensorId}">${d.proxyName}</td>
-                      <td>${d.distance !== null ? d.distance.toFixed(2) + 'm' : 'unknown'}</td>
-                      <td>${d.placed ? '✓' : '✗'}</td>
-                      <td>${d.distance !== null && d.placed ? '✅ YES' : d.distance !== null && !d.placed ? '⚠ NOT PLACED' : '❌'}</td>
-                    </tr>
+              <!-- Device selector -->
+              <div class="debug-device-selector">
+                <label>Follow device:</label>
+                <select
+                  .value=${this._debugFollowDevice}
+                  @change=${(e: Event) => {
+                    this._debugFollowDevice = (e.target as HTMLSelectElement).value;
+                    this._liveDebugInfo = this._trackingEngine?.getDebugInfo(this._debugFollowDevice) || [];
+                  }}
+                >
+                  ${this._trackedDevices.map((d) => html`
+                    <option value=${d.device_id} ?selected=${d.device_id === this._debugFollowDevice}>
+                      ${d.name || d.device_id}${d.area ? ` (${d.area})` : ''}
+                    </option>
                   `)}
-                </tbody>
-              </table>
-              <div class="debug-summary">
-                Active: ${this._liveDebugInfo.filter(d => d.distance !== null).length} / ${this._liveDebugInfo.length} |
-                Used for trilateration: ${this._liveDebugInfo.filter(d => d.distance !== null && d.placed).length}
+                </select>
               </div>
+              ${this._liveDebugInfo.length > 0 ? html`
+                <table class="debug-table">
+                  <thead>
+                    <tr>
+                      <th>Proxy</th>
+                      <th>Distance</th>
+                      <th>RSSI</th>
+                      <th>Placed</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${this._liveDebugInfo
+                      .slice()
+                      .sort((a, b) => {
+                        // Active proxies first, then by distance
+                        if (a.distance !== null && b.distance === null) return -1;
+                        if (a.distance === null && b.distance !== null) return 1;
+                        if (a.distance !== null && b.distance !== null) return a.distance - b.distance;
+                        return a.proxyName.localeCompare(b.proxyName);
+                      })
+                      .map((d) => html`
+                      <tr class="${d.distance !== null ? 'debug-active' : 'debug-inactive'}">
+                        <td title="${d.sensorId}">${d.proxyName}</td>
+                        <td>${d.distance !== null ? d.distance.toFixed(2) + 'm' : '—'}</td>
+                        <td>${d.rssi !== null ? d.rssi + ' dBm' : '—'}</td>
+                        <td>${d.placed ? '✓' : '✗'}</td>
+                        <td>${d.distance !== null && d.placed ? '✅ Active' : d.distance !== null && !d.placed ? '⚠ Not placed' : '❌ No signal'}</td>
+                      </tr>
+                    `)}
+                  </tbody>
+                </table>
+                <div class="debug-summary">
+                  Active: ${this._liveDebugInfo.filter(d => d.distance !== null).length} / ${this._liveDebugInfo.length} |
+                  Used for trilateration: ${this._liveDebugInfo.filter(d => d.distance !== null && d.placed).length}
+                </div>
+              ` : html`<div style="padding:8px;color:var(--text-secondary);font-size:12px;">No debug data available for this device</div>`}
             </div>
           ` : nothing}
         ` : html`
@@ -3432,6 +3549,72 @@ export class BLELivemapPanel extends LitElement {
         </div>
       `);
     }
+    return markers;
+  }
+
+  /**
+   * Render debug overlay: when debug panel is open, draw lines from
+   * the followed device to each proxy that sees it, with distance labels.
+   * Proxies that detect the device get a highlight ring.
+   */
+  private _renderDebugOverlay() {
+    if (!this._showDebugPanel || !this._debugFollowDevice) return nothing;
+
+    const floor = this._getActiveFloor();
+    const floorId = floor?.id || "default";
+
+    // Find the followed device's position
+    const device = this._trackedDevices.find(d => d.device_id === this._debugFollowDevice);
+    if (!device?.position) return nothing;
+    if (device.current_floor_id && device.current_floor_id !== floorId) return nothing;
+
+    const pos = device.position;
+    const markers: any[] = [];
+
+    for (const info of this._liveDebugInfo) {
+      // Only show proxies on the active floor
+      if (info.proxyFloorId && info.proxyFloorId !== floorId) continue;
+      if (!info.placed) continue;
+
+      const hasSignal = info.distance !== null;
+      const color = hasSignal ? '#4CAF50' : '#F44336';
+      const opacity = hasSignal ? 0.8 : 0.3;
+
+      // Highlight ring around proxy
+      markers.push(html`
+        <div
+          class="debug-proxy-ring"
+          style="left: ${info.proxyX}%; top: ${info.proxyY}%; --ring-color: ${color}; --ring-opacity: ${opacity};"
+        ></div>
+      `);
+
+      // Draw line from device to proxy (SVG)
+      if (hasSignal) {
+        markers.push(html`
+          <svg class="debug-line-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
+            <line
+              x1="${pos.x}" y1="${pos.y}"
+              x2="${info.proxyX}" y2="${info.proxyY}"
+              stroke="${color}"
+              stroke-width="0.3"
+              stroke-dasharray="1,0.5"
+              stroke-opacity="0.6"
+            />
+          </svg>
+        `);
+
+        // Distance label at midpoint
+        const midX = (pos.x + info.proxyX) / 2;
+        const midY = (pos.y + info.proxyY) / 2;
+        markers.push(html`
+          <div class="debug-distance-label" style="left: ${midX}%; top: ${midY}%;">
+            ${info.distance!.toFixed(1)}m
+            ${info.rssi !== null ? html`<br><span class="debug-rssi">${info.rssi}dBm</span>` : nothing}
+          </div>
+        `);
+      }
+    }
+
     return markers;
   }
 
