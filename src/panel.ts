@@ -108,6 +108,7 @@ export class BLELivemapPanel extends LitElement {
   @state() private _showDebugPanel: boolean = false;
   private _liveTrackingTimer: number | null = null;
   private _previousPositions: Map<string, TrilaterationResult> = new Map();
+  private _dragStarted = false;
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -983,6 +984,12 @@ export class BLELivemapPanel extends LitElement {
   }
 
   private _handleMapClick(e: MouseEvent): void {
+    // If we just finished a drag, don't handle as click
+    if (this._dragStarted) {
+      this._dragStarted = false;
+      return;
+    }
+
     const coords = this._getMapCoords(e);
     if (!coords) return;
     const { x, y } = coords;
@@ -1085,15 +1092,42 @@ export class BLELivemapPanel extends LitElement {
       return;
     }
 
-    // Check if clicking on an existing proxy to start drag
+  }
+
+  /**
+   * Mousedown on map-inner: detect if we're starting a proxy or door drag.
+   * All drag detection happens here (not on individual markers).
+   */
+  private _handleMapMouseDown(e: MouseEvent): void {
+    const coords = this._getMapCoords(e);
+    if (!coords) return;
+    const { x, y } = coords;
+
+    // Check proxies
     const proxies = this._config.proxies || [];
     for (let i = 0; i < proxies.length; i++) {
-      const px = proxies[i].x;
-      const py = proxies[i].y;
-      if (Math.abs(x - px) < 3 && Math.abs(y - py) < 3) {
+      if (Math.abs(x - proxies[i].x) < 3 && Math.abs(y - proxies[i].y) < 3) {
         this._draggingProxy = i;
-        this._addGlobalDragListeners();
+        this._dragStarted = false;
+        e.preventDefault();
         return;
+      }
+    }
+
+    // Check doors (only in doors tab)
+    if (this._activeTab === "doors") {
+      const doors = this._config.doors || [];
+      for (let i = 0; i < doors.length; i++) {
+        const dx = x - doors[i].x;
+        const dy = y - doors[i].y;
+        if (Math.sqrt(dx * dx + dy * dy) < 4) {
+          this._draggingDoor = i;
+          this._editingDoorIdx = i;
+          this._dragStarted = false;
+          e.preventDefault();
+          this.requestUpdate();
+          return;
+        }
       }
     }
   }
@@ -1110,31 +1144,35 @@ export class BLELivemapPanel extends LitElement {
     // Proxy dragging
     if (this._draggingProxy !== null) {
       e.preventDefault();
+      this._dragStarted = true;
       const coords = this._getMapCoords(e);
       if (coords) {
         const proxies = [...(this._config.proxies || [])];
         if (proxies[this._draggingProxy]) {
-          proxies[this._draggingProxy] = { ...proxies[this._draggingProxy], x: coords.x, y: coords.y };
+          proxies[this._draggingProxy] = { ...proxies[this._draggingProxy], x: Math.max(0, Math.min(100, coords.x)), y: Math.max(0, Math.min(100, coords.y)) };
           this._config = { ...this._config, proxies };
           this._saveConfigLocal();
           this.requestUpdate();
         }
       }
+      return;
     }
 
     // Door dragging
     if (this._draggingDoor !== null) {
       e.preventDefault();
+      this._dragStarted = true;
       const coords = this._getMapCoords(e);
       if (coords) {
         const doors = [...(this._config.doors || [])];
         if (doors[this._draggingDoor]) {
-          doors[this._draggingDoor] = { ...doors[this._draggingDoor], x: coords.x, y: coords.y };
+          doors[this._draggingDoor] = { ...doors[this._draggingDoor], x: Math.max(0, Math.min(100, coords.x)), y: Math.max(0, Math.min(100, coords.y)) };
           this._config = { ...this._config, doors };
           this._saveConfigLocal();
           this.requestUpdate();
         }
       }
+      return;
     }
   }
 
@@ -2118,7 +2156,7 @@ export class BLELivemapPanel extends LitElement {
       }
 
       .zone-polygon.clickable {
-        pointer-events: all;
+        pointer-events: none;
         cursor: pointer;
       }
 
@@ -2153,7 +2191,7 @@ export class BLELivemapPanel extends LitElement {
         font-size: 12px;
         font-weight: 700;
         cursor: grab;
-        pointer-events: all;
+        pointer-events: none;
         box-shadow: 0 2px 8px rgba(0,0,0,0.35);
         transition: transform 0.1s;
         z-index: 10;
@@ -2301,7 +2339,7 @@ export class BLELivemapPanel extends LitElement {
         display: flex;
         align-items: center;
         justify-content: center;
-        pointer-events: all;
+        pointer-events: none;
         box-shadow: 0 2px 8px rgba(0,0,0,0.35);
         transition: transform 0.15s, box-shadow 0.15s;
         z-index: 9;
@@ -2936,6 +2974,7 @@ export class BLELivemapPanel extends LitElement {
         ${hasImage ? html`
           <div class="map-wrapper">
             <div class="map-inner ${(this._draggingProxy !== null || this._draggingDoor !== null) ? 'dragging' : ''}"
+              @mousedown=${this._handleMapMouseDown}
               @click=${this._handleMapClick}
               @mousemove=${this._handleMapMouseMove}
               @mouseup=${this._handleMapMouseUp}
@@ -3366,7 +3405,7 @@ export class BLELivemapPanel extends LitElement {
           class="door-marker ${isEditing ? 'editing' : ''} ${isDoorTab ? 'clickable' : ''}"
           style="left: ${door.x}%; top: ${door.y}%; --door-color: ${color}; cursor: ${isDoorTab ? 'grab' : 'pointer'};"
           title="${door.name || `Door ${idx + 1}`}\n${door.type}"
-          @mousedown=${isDoorTab ? (e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingDoor = idx; this._editingDoorIdx = idx; this._addGlobalDragListeners(); this.requestUpdate(); } : undefined}
+
         >
           <span class="door-icon">${icon}</span>
         </div>
@@ -3392,7 +3431,7 @@ export class BLELivemapPanel extends LitElement {
         <div
           class="proxy-marker"
           style="left: ${proxy.x}%; top: ${proxy.y}%;"
-          @mousedown=${(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); this._draggingProxy = idx; this._addGlobalDragListeners(); }}
+
           title="${proxy.name || proxy.entity_id}\n${proxy.entity_id}\nPosition: ${proxy.x.toFixed(1)}%, ${proxy.y.toFixed(1)}%"
         >${idx + 1}</div>
         <div class="proxy-label" style="left: ${proxy.x}%; top: ${proxy.y + 2}%;">
@@ -3434,7 +3473,7 @@ export class BLELivemapPanel extends LitElement {
       // Only show zones on the active floor
       if (floor && zone.floor_id && zone.floor_id !== floor.id) return nothing;
 
-      const pointsStr = zone.points.map((p) => `${p.x}%,${p.y}%`).join(" ");
+      const pointsStr = zone.points.map((p) => `${p.x},${p.y}`).join(" ");
       const cx = zone.points.reduce((s, p) => s + p.x, 0) / zone.points.length;
       const cy = zone.points.reduce((s, p) => s + p.y, 0) / zone.points.length;
       const isEditing = this._editingZoneIdx === idx;
@@ -3446,8 +3485,7 @@ export class BLELivemapPanel extends LitElement {
       const borderColor = isEditing ? "#ffffff" : (zone.border_color || zoneColor);
 
       return html`
-        <svg class="zone-polygon clickable" viewBox="0 0 100 100" preserveAspectRatio="none"
-          @click=${(e: Event) => { e.stopPropagation(); this._editingZoneIdx = idx; this._activeTab = 'zones'; this.requestUpdate(); }}>
+        <svg class="zone-polygon" viewBox="0 0 100 100" preserveAspectRatio="none">
           <polygon
             points=${pointsStr}
             fill="${zoneColor}"
@@ -3460,9 +3498,8 @@ export class BLELivemapPanel extends LitElement {
         </svg>
         ${zone.show_label !== false && zone.name ? html`
           <div class="zone-label-overlay"
-            style="left: ${cx}%; top: ${cy}%; pointer-events: all; cursor: pointer; border: ${isEditing ? '2px solid var(--accent, #2196F3)' : 'none'};"
-            @click=${(e: Event) => { e.stopPropagation(); this._editingZoneIdx = idx; this._activeTab = 'zones'; this.requestUpdate(); }}
-            title="Click to edit zone"
+            style="left: ${cx}%; top: ${cy}%; border: ${isEditing ? '2px solid var(--accent, #2196F3)' : 'none'};"
+            title="${zone.name}"
           >
             ${zone.name}
           </div>
@@ -3477,7 +3514,7 @@ export class BLELivemapPanel extends LitElement {
     const nextColor = ZONE_COLORS[zones.length % ZONE_COLORS.length];
     // Show filled preview polygon when 3+ points
     const showFill = this._drawingPoints.length >= 3;
-    const pointsStr = this._drawingPoints.map((p) => `${p.x}%,${p.y}%`).join(" ");
+    const pointsStr = this._drawingPoints.map((p) => `${p.x},${p.y}`).join(" ");
     return html`
       ${this._drawingPoints.map((p, i) => html`
         <div class="draw-point ${i === 0 ? 'draw-point-first' : ''}" style="left: ${p.x}%; top: ${p.y}%;"></div>
