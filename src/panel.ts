@@ -2003,6 +2003,7 @@ export class BLELivemapPanel extends LitElement {
 
       .map-wrapper {
         flex: 1;
+        min-height: 0; /* Allow flex item to shrink below content size */
         position: relative;
         overflow: auto;
         background: var(--divider-color, rgba(0,0,0,0.03));
@@ -2016,15 +2017,15 @@ export class BLELivemapPanel extends LitElement {
         position: relative;
         display: inline-block;
         max-width: 100%;
-        max-height: 100%;
         user-select: none;
         -webkit-user-select: none;
+        line-height: 0; /* Remove any inline spacing below image */
       }
 
       .map-image {
         display: block;
         max-width: 100%;
-        max-height: calc(100vh - 260px);
+        max-height: 100%;
         cursor: crosshair;
       }
 
