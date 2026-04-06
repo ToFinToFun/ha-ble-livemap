@@ -31,6 +31,7 @@ import {
   CalibrationHealthLevel,
   WizardPoint,
   WizardState,
+  TrackedDeviceConfig,
   DOOR_TYPES,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
@@ -154,6 +155,26 @@ export class BLELivemapPanel extends LitElement {
   @state() private _quickCalibProxyIdx: number | null = null;
   @state() private _quickCalibMode = false;
   @state() private _quickCalibRssi: number | null = null;
+
+  // ─── New Device Detection ─────────────────────────────────
+  @state() private _newDeviceAlerts: Array<{
+    entityId: string;
+    name: string;
+    area: string;
+    dismissed: boolean;
+  }> = [];
+  private _lastKnownDeviceIds: Set<string> = new Set();
+  /** BLE scan results from bermuda.dump_devices */
+  @state() private _bleScanResults: Array<{
+    name: string;
+    address: string;
+    rssi: number;
+    area: string;
+    tracked: boolean;
+    type: 'phone' | 'watch' | 'beacon' | 'tag' | 'sensor' | 'unknown';
+  }> = [];
+  @state() private _bleScanActive = false;
+  @state() private _showDeviceOnboarding = false;
 
   private _liveTrackingTimer: number | null = null;
   private _dragStarted = false;
@@ -1330,6 +1351,9 @@ export class BLELivemapPanel extends LitElement {
     // ── New Proxy Detection ──
     this._detectNewProxies();
 
+    // ── New Device Detection ──
+    this._detectNewDevices();
+
     // ── Quick-calibrate RSSI update ──
     if (this._quickCalibMode && this._quickCalibProxyIdx !== null) {
       this._updateQuickCalibRssi();
@@ -2179,6 +2203,322 @@ export class BLELivemapPanel extends LitElement {
     this._quickCalibMode = false;
     this._quickCalibProxyIdx = null;
     this._quickCalibRssi = null;
+  }
+
+  // ─── New Device Detection & Onboarding ────────────────────
+
+  /**
+   * Detect new Bermuda device_tracker entities that weren't there before.
+   * Shows a notification banner so the user can add them with one click.
+   */
+  private _detectNewDevices(): void {
+    if (!this.hass?.states) return;
+
+    const currentDeviceIds = new Set<string>();
+    for (const entityId of Object.keys(this.hass.states)) {
+      if (entityId.toLowerCase().startsWith("device_tracker.bermuda_")) {
+        currentDeviceIds.add(entityId);
+      }
+    }
+
+    // First run — seed the known set
+    if (this._lastKnownDeviceIds.size === 0) {
+      this._lastKnownDeviceIds = currentDeviceIds;
+      return;
+    }
+
+    const configuredDevices = new Set(
+      (this._config.tracked_devices || []).map((d: any) => d.entity_prefix)
+    );
+
+    for (const entityId of currentDeviceIds) {
+      if (
+        !this._lastKnownDeviceIds.has(entityId) &&
+        !configuredDevices.has(entityId) &&
+        !this._newDeviceAlerts.some((a) => a.entityId === entityId)
+      ) {
+        const stateObj = this.hass.states[entityId] as any;
+        const name = stateObj?.attributes?.friendly_name || entityId;
+        const area = stateObj?.state || "";
+        this._newDeviceAlerts = [
+          ...this._newDeviceAlerts,
+          { entityId, name, area, dismissed: false },
+        ];
+      }
+    }
+
+    this._lastKnownDeviceIds = currentDeviceIds;
+  }
+
+  /**
+   * Quick-add a device from the new-device alert banner.
+   */
+  private _quickAddDevice(entityId: string): void {
+    const stateObj = this.hass?.states?.[entityId] as any;
+    const name = stateObj?.attributes?.friendly_name
+      ?.replace(/ Bermuda.*$/i, "")
+      ?.replace(/ Tracker$/i, "")
+      || entityId;
+
+    const existing = this._config.tracked_devices || [];
+    if (existing.some((d: any) => d.entity_prefix === entityId)) {
+      // Already added
+      this._newDeviceAlerts = this._newDeviceAlerts.map((a) =>
+        a.entityId === entityId ? { ...a, dismissed: true } : a
+      );
+      return;
+    }
+
+    const updated: TrackedDeviceConfig[] = [
+      ...existing,
+      {
+        entity_prefix: entityId,
+        name: name,
+        icon: this._guessDeviceIcon(name),
+        color: this._getNextDeviceColor(existing.length),
+      },
+    ];
+
+    this._config = { ...this._config, tracked_devices: updated };
+    this._saveConfigLocal();
+
+    // Dismiss the alert
+    this._newDeviceAlerts = this._newDeviceAlerts.map((a) =>
+      a.entityId === entityId ? { ...a, dismissed: true } : a
+    );
+  }
+
+  /**
+   * Dismiss a new-device alert without adding it.
+   */
+  private _dismissDeviceAlert(entityId: string): void {
+    this._newDeviceAlerts = this._newDeviceAlerts.map((a) =>
+      a.entityId === entityId ? { ...a, dismissed: true } : a
+    );
+  }
+
+  /**
+   * Guess a device icon based on its name.
+   */
+  private _guessDeviceIcon(name: string): string {
+    const n = name.toLowerCase();
+    if (n.includes("iphone") || n.includes("phone") || n.includes("pixel") || n.includes("galaxy") || n.includes("samsung")) return "📱";
+    if (n.includes("watch") || n.includes("iwatch") || n.includes("band")) return "⌚";
+    if (n.includes("ipad") || n.includes("tablet")) return "📱";
+    if (n.includes("beacon") || n.includes("ibeacon")) return "📡";
+    if (n.includes("tag") || n.includes("tile") || n.includes("tracker")) return "🏷️";
+    if (n.includes("sensor") || n.includes("thermo") || n.includes("temp") || n.includes("humi")) return "🌡️";
+    if (n.includes("dog") || n.includes("cat") || n.includes("pet")) return "🐾";
+    if (n.includes("car") || n.includes("obd") || n.includes("tesla")) return "🚗";
+    if (n.includes("key")) return "🔑";
+    return "📍";
+  }
+
+  /**
+   * Get a color for a new device based on its index.
+   */
+  private _getNextDeviceColor(index: number): string {
+    const colors = [
+      "#4FC3F7", "#FF8A65", "#81C784", "#BA68C8",
+      "#FFD54F", "#F06292", "#4DB6AC", "#FF7043",
+      "#7986CB", "#AED581", "#E57373", "#64B5F6",
+    ];
+    return colors[index % colors.length];
+  }
+
+  /**
+   * Scan for ALL visible BLE devices via Bermuda's service.
+   * Shows tracked + untracked devices so user can onboard them.
+   */
+  private async _scanForBLEDevices(): Promise<void> {
+    if (!this.hass) return;
+    this._bleScanActive = true;
+    this._bleScanResults = [];
+
+    try {
+      // Try calling bermuda.dump_devices service
+      const result = await this.hass.callWS({
+        type: "bermuda/get_devices",
+      }).catch(() => null);
+
+      if (result && typeof result === "object") {
+        this._parseBermudaDump(result);
+      } else {
+        // Fallback: scan hass.states for all bermuda-related entities
+        this._scanFromStates();
+      }
+    } catch {
+      // Fallback to state-based scanning
+      this._scanFromStates();
+    }
+
+    this._bleScanActive = false;
+  }
+
+  /**
+   * Parse bermuda dump_devices response into scan results.
+   */
+  private _parseBermudaDump(data: any): void {
+    const results: typeof this._bleScanResults = [];
+    const devices = data?.devices || data;
+
+    if (Array.isArray(devices)) {
+      for (const dev of devices) {
+        results.push({
+          name: dev.name || dev.friendly_name || dev.address || "Unknown",
+          address: dev.address || dev.mac || "",
+          rssi: dev.rssi || dev.best_rssi || -100,
+          area: dev.area || dev.closest_area || "",
+          tracked: !!dev.tracked || !!dev.has_sensors,
+          type: this._classifyBLEDevice(dev),
+        });
+      }
+    } else if (typeof devices === "object") {
+      for (const [addr, dev] of Object.entries(devices as Record<string, any>)) {
+        results.push({
+          name: dev.name || dev.friendly_name || addr,
+          address: addr,
+          rssi: dev.rssi || dev.best_rssi || -100,
+          area: dev.area || dev.closest_area || "",
+          tracked: !!dev.tracked || !!dev.has_sensors,
+          type: this._classifyBLEDevice(dev),
+        });
+      }
+    }
+
+    // Sort: tracked first, then by signal strength
+    results.sort((a, b) => {
+      if (a.tracked !== b.tracked) return a.tracked ? -1 : 1;
+      return b.rssi - a.rssi;
+    });
+
+    this._bleScanResults = results;
+  }
+
+  /**
+   * Fallback: scan hass.states for Bermuda device_tracker entities.
+   */
+  private _scanFromStates(): void {
+    if (!this.hass?.states) return;
+
+    const configuredDevices = new Set(
+      (this._config.tracked_devices || []).map((d: any) => d.entity_prefix)
+    );
+
+    const results: typeof this._bleScanResults = [];
+
+    for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
+      const eid = entityId.toLowerCase();
+      if (!eid.startsWith("device_tracker.bermuda_")) continue;
+
+      const s = stateObj as any;
+      const name = s?.attributes?.friendly_name || entityId;
+      const area = s?.state || "";
+
+      results.push({
+        name: name.replace(/ Bermuda.*$/i, "").replace(/ Tracker$/i, ""),
+        address: entityId,
+        rssi: -50, // Unknown, but it's tracked
+        area,
+        tracked: true,
+        type: this._classifyBLEDeviceByName(name),
+      });
+    }
+
+    // Also look for BLE-related entities that might indicate untracked devices
+    for (const [entityId, stateObj] of Object.entries(this.hass.states)) {
+      const eid = entityId.toLowerCase();
+      if (
+        eid.startsWith("sensor.ble_") ||
+        (eid.includes("bluetooth") && eid.includes("rssi")) ||
+        eid.startsWith("sensor.ibeacon_")
+      ) {
+        const s = stateObj as any;
+        const name = s?.attributes?.friendly_name || entityId;
+        // Skip if already in results
+        if (results.some((r) => r.name === name)) continue;
+
+        results.push({
+          name,
+          address: entityId,
+          rssi: parseFloat(s?.state) || -100,
+          area: s?.attributes?.area || "",
+          tracked: false,
+          type: this._classifyBLEDeviceByName(name),
+        });
+      }
+    }
+
+    results.sort((a, b) => {
+      if (a.tracked !== b.tracked) return a.tracked ? -1 : 1;
+      return b.rssi - a.rssi;
+    });
+
+    this._bleScanResults = results;
+  }
+
+  /**
+   * Classify a BLE device from Bermuda dump data.
+   */
+  private _classifyBLEDevice(dev: any): 'phone' | 'watch' | 'beacon' | 'tag' | 'sensor' | 'unknown' {
+    const name = (dev.name || dev.friendly_name || "").toLowerCase();
+    return this._classifyBLEDeviceByName(name);
+  }
+
+  /**
+   * Classify a BLE device by its name string.
+   */
+  private _classifyBLEDeviceByName(name: string): 'phone' | 'watch' | 'beacon' | 'tag' | 'sensor' | 'unknown' {
+    const n = name.toLowerCase();
+    if (n.includes("iphone") || n.includes("phone") || n.includes("pixel") || n.includes("galaxy") || n.includes("android") || n.includes("samsung")) return "phone";
+    if (n.includes("watch") || n.includes("band") || n.includes("fitbit")) return "watch";
+    if (n.includes("beacon") || n.includes("ibeacon")) return "beacon";
+    if (n.includes("tag") || n.includes("tile") || n.includes("tracker") || n.includes("airtag")) return "tag";
+    if (n.includes("sensor") || n.includes("thermo") || n.includes("temp") || n.includes("humi") || n.includes("bthome")) return "sensor";
+    return "unknown";
+  }
+
+  /**
+   * Get the icon for a device type.
+   */
+  private _getDeviceTypeIcon(type: string): string {
+    switch (type) {
+      case "phone": return "📱";
+      case "watch": return "⌚";
+      case "beacon": return "📡";
+      case "tag": return "🏷️";
+      case "sensor": return "🌡️";
+      default: return "📍";
+    }
+  }
+
+  /**
+   * Get signal strength bars (1-4) from RSSI value.
+   */
+  private _getSignalBars(rssi: number): string {
+    if (rssi >= -50) return "▂▄▆█";
+    if (rssi >= -65) return "▂▄▆░";
+    if (rssi >= -80) return "▂▄░░";
+    if (rssi >= -90) return "▂░░░";
+    return "░░░░";
+  }
+
+  /**
+   * Open Bermuda configuration page to add a device.
+   */
+  private _openBermudaConfig(): void {
+    // Navigate to Bermuda integration config page
+    window.open("/config/integrations/integration/bermuda", "_blank");
+  }
+
+  /**
+   * Toggle the device onboarding panel.
+   */
+  private _toggleDeviceOnboarding(): void {
+    this._showDeviceOnboarding = !this._showDeviceOnboarding;
+    if (this._showDeviceOnboarding && this._bleScanResults.length === 0) {
+      this._scanForBLEDevices();
+    }
   }
 
   // ─── Guided Calibration Wizard Methods ─────────────────────
@@ -3598,6 +3938,162 @@ export class BLELivemapPanel extends LitElement {
         margin-left: 4px;
       }
 
+      /* New device banner */
+      .new-device-banner {
+        background: linear-gradient(135deg, rgba(33, 150, 243, 0.1), rgba(100, 181, 246, 0.1));
+        border: 1px solid #2196F3;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 12px;
+        color: var(--text-primary, #fff);
+        animation: new-device-pulse 2s ease-in-out infinite;
+      }
+      @keyframes new-device-pulse {
+        0%, 100% { border-color: #2196F3; }
+        50% { border-color: #64B5F6; box-shadow: 0 0 8px rgba(33, 150, 243, 0.3); }
+      }
+      .new-device-icon { font-size: 18px; flex-shrink: 0; }
+      .new-device-text { flex: 1; line-height: 1.4; }
+      .new-device-area { color: var(--text-secondary, #aaa); font-size: 11px; margin-left: 4px; }
+
+      /* Entity type icon (replaces badge) */
+      .entity-type-icon {
+        font-size: 20px;
+        flex-shrink: 0;
+        width: 28px;
+        text-align: center;
+      }
+      .entity-add-hint {
+        font-size: 11px;
+        color: #4FC3F7;
+        font-weight: 600;
+        flex-shrink: 0;
+        padding: 2px 8px;
+        border: 1px solid #4FC3F7;
+        border-radius: 4px;
+      }
+
+      /* Device onboarding section */
+      .device-onboarding-section {
+        padding: 8px 12px;
+        border-top: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+      }
+      .btn-block {
+        display: block;
+        width: 100%;
+        padding: 8px 12px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .btn-onboarding {
+        background: linear-gradient(135deg, rgba(33, 150, 243, 0.15), rgba(100, 181, 246, 0.15));
+        color: #64B5F6;
+        border: 1px solid rgba(33, 150, 243, 0.3);
+      }
+      .btn-onboarding:hover { background: rgba(33, 150, 243, 0.25); }
+      .btn-scan {
+        background: linear-gradient(135deg, rgba(76, 175, 80, 0.15), rgba(129, 199, 132, 0.15));
+        color: #81C784;
+        border: 1px solid rgba(76, 175, 80, 0.3);
+        margin: 8px 0;
+      }
+      .btn-scan:hover { background: rgba(76, 175, 80, 0.25); }
+      .btn-bermuda {
+        background: linear-gradient(135deg, rgba(156, 39, 176, 0.15), rgba(186, 104, 200, 0.15));
+        color: #BA68C8;
+        border: 1px solid rgba(156, 39, 176, 0.3);
+      }
+      .btn-bermuda:hover { background: rgba(156, 39, 176, 0.25); }
+      .btn-tiny {
+        padding: 3px 8px;
+        font-size: 10px;
+        border-radius: 4px;
+        border: none;
+        cursor: pointer;
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+
+      .onboarding-panel {
+        margin-top: 8px;
+      }
+      .onboarding-desc {
+        font-size: 12px;
+        color: var(--text-secondary, #aaa);
+        margin: 0 0 10px;
+        line-height: 1.5;
+      }
+      .onboarding-types {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-bottom: 10px;
+      }
+      .device-type-card {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+      .device-type-card:hover {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: #4FC3F7;
+      }
+      .dt-icon { font-size: 20px; flex-shrink: 0; }
+      .dt-label { font-size: 12px; font-weight: 600; color: var(--text-primary, #fff); flex: 1; }
+      .dt-hint { font-size: 10px; color: var(--text-secondary, #aaa); }
+
+      .scan-results {
+        max-height: 300px;
+        overflow-y: auto;
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 8px;
+        margin: 8px 0;
+      }
+      .scan-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 6px 10px;
+        background: rgba(255, 255, 255, 0.05);
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        font-size: 11px;
+        color: var(--text-secondary, #aaa);
+      }
+      .scan-legend { display: flex; gap: 8px; }
+      .legend-tracked { color: #81C784; }
+      .legend-untracked { color: #aaa; }
+      .scan-device {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.05));
+        font-size: 12px;
+      }
+      .scan-device:last-child { border-bottom: none; }
+      .scan-device.tracked { background: rgba(76, 175, 80, 0.05); }
+      .scan-device.on-map { opacity: 0.6; }
+      .sd-icon { font-size: 16px; flex-shrink: 0; }
+      .sd-info { flex: 1; min-width: 0; }
+      .sd-name { font-weight: 500; color: var(--text-primary, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .sd-meta { display: flex; gap: 8px; font-size: 10px; color: var(--text-secondary, #aaa); margin-top: 2px; }
+      .sd-signal { font-family: monospace; }
+      .sd-status.on-map { font-size: 11px; color: #81C784; flex-shrink: 0; }
+      .onboarding-help { margin-top: 8px; }
+
       /* Zone edit panel */
       .zone-edit-panel {
         background: var(--card-bg);
@@ -4292,25 +4788,114 @@ export class BLELivemapPanel extends LitElement {
             ? html`<div style="padding:20px;text-align:center;color:var(--text-secondary);font-size:13px;">${this._t("panel.no_entities")}</div>`
             : entities.map((entity) => this._renderEntityItem(entity))}
         </div>
+
+        <!-- Device onboarding section (shown in devices category) -->
+        ${this._sidebarCategory === "devices" ? html`
+          <div class="device-onboarding-section">
+            <button class="btn btn-block btn-onboarding" @click=${() => this._toggleDeviceOnboarding()}>
+              ${this._showDeviceOnboarding ? '▲ Hide Device Setup' : '🔍 Find & Add Devices'}
+            </button>
+
+            ${this._showDeviceOnboarding ? html`
+              <div class="onboarding-panel">
+                <div class="onboarding-info">
+                  <p class="onboarding-desc">Devices must first be set up in <strong>Bermuda</strong> before they can be tracked on the map.</p>
+                </div>
+
+                <div class="onboarding-types">
+                  <div class="device-type-card" @click=${() => this._openBermudaConfig()}>
+                    <span class="dt-icon">📱</span>
+                    <span class="dt-label">Phone / Watch</span>
+                    <span class="dt-hint">Requires Private BLE Device + IRK</span>
+                  </div>
+                  <div class="device-type-card" @click=${() => this._openBermudaConfig()}>
+                    <span class="dt-icon">🏷️</span>
+                    <span class="dt-label">BLE Tag / Beacon</span>
+                    <span class="dt-hint">Auto-discovered by Bermuda</span>
+                  </div>
+                  <div class="device-type-card" @click=${() => this._openBermudaConfig()}>
+                    <span class="dt-icon">🌡️</span>
+                    <span class="dt-label">BTHome Sensor</span>
+                    <span class="dt-hint">Static MAC — select in Bermuda</span>
+                  </div>
+                </div>
+
+                <button class="btn btn-block btn-scan" @click=${() => this._scanForBLEDevices()}>
+                  ${this._bleScanActive ? '⏳ Scanning...' : '📡 Scan Visible BLE Devices'}
+                </button>
+
+                ${this._bleScanResults.length > 0 ? html`
+                  <div class="scan-results">
+                    <div class="scan-header">
+                      <span class="scan-count">${this._bleScanResults.length} devices found</span>
+                      <span class="scan-legend">
+                        <span class="legend-tracked">● Tracked</span>
+                        <span class="legend-untracked">○ Untracked</span>
+                      </span>
+                    </div>
+                    ${this._bleScanResults.map(dev => {
+                      const configuredDevices = new Set(
+                        (this._config.tracked_devices || []).map((d: any) => d.entity_prefix)
+                      );
+                      const onMap = configuredDevices.has(dev.address);
+                      return html`
+                        <div class="scan-device ${dev.tracked ? 'tracked' : 'untracked'} ${onMap ? 'on-map' : ''}">
+                          <span class="sd-icon">${this._getDeviceTypeIcon(dev.type)}</span>
+                          <div class="sd-info">
+                            <div class="sd-name">${dev.name}</div>
+                            <div class="sd-meta">
+                              ${dev.area ? html`<span class="sd-area">${dev.area}</span>` : nothing}
+                              ${dev.rssi > -100 ? html`<span class="sd-signal">${this._getSignalBars(dev.rssi)} ${dev.rssi}dBm</span>` : nothing}
+                            </div>
+                          </div>
+                          ${onMap
+                            ? html`<span class="sd-status on-map">✅ On map</span>`
+                            : dev.tracked
+                              ? html`<button class="btn btn-tiny btn-primary" @click=${() => this._quickAddDevice(dev.address)}>+ Map</button>`
+                              : html`<button class="btn btn-tiny btn-secondary" @click=${() => this._openBermudaConfig()}>Setup</button>`
+                          }
+                        </div>
+                      `;
+                    })}
+                  </div>
+                ` : nothing}
+
+                <div class="onboarding-help">
+                  <button class="btn btn-block btn-bermuda" @click=${() => this._openBermudaConfig()}>
+                    ⚙️ Open Bermuda Settings
+                  </button>
+                </div>
+              </div>
+            ` : nothing}
+          </div>
+        ` : nothing}
       </div>
     `;
   }
 
   private _renderEntityItem(entity: DiscoveredEntity) {
+    const typeIcon = entity.type === "device"
+      ? this._guessDeviceIcon(entity.friendly_name)
+      : entity.type === "proxy" ? "📡" : "❓";
+    const cleanName = entity.friendly_name
+      .replace(/ Bermuda.*$/i, "")
+      .replace(/ Tracker$/i, "")
+      .replace(/ BLE Proxy$/i, "");
+
     return html`
       <button
         class="entity-item ${entity.added ? "added" : ""} ${this._placingEntity?.entity_id === entity.entity_id ? "placing" : ""}"
         @click=${() => this._handleEntityClick(entity)}
       >
-        <span class="entity-type-badge badge-${entity.type}">${entity.type === "proxy" ? "P" : entity.type === "device" ? "D" : "?"}</span>
+        <span class="entity-type-icon">${typeIcon}</span>
         <div class="entity-info">
-          <div class="entity-name">${entity.friendly_name}</div>
+          <div class="entity-name">${cleanName}</div>
           <div class="entity-id">${entity.proxy_id || entity.entity_id}</div>
-          ${entity.area ? html`<div class="entity-area">${entity.area}</div>` : nothing}
+          ${entity.area ? html`<div class="entity-area">📍 ${entity.area}</div>` : nothing}
         </div>
         ${entity.added
-          ? html`<span class="entity-check">\u2713</span>`
-          : html`<span class="entity-status">${entity.state}</span>`}
+          ? html`<span class="entity-check">✅</span>`
+          : html`<span class="entity-add-hint">+ Add</span>`}
       </button>
     `;
   }
@@ -4375,6 +4960,18 @@ export class BLELivemapPanel extends LitElement {
             >\u2705 Calibrate</button>
             <button class="btn btn-small btn-secondary" @click=${() => this._cancelQuickCalibrate()}>\u2716 Skip</button>
           </div>
+        ` : nothing}
+
+        <!-- New device detection banner -->
+        ${this._newDeviceAlerts.filter(a => !a.dismissed).length > 0 ? html`
+          ${this._newDeviceAlerts.filter(a => !a.dismissed).map(alert => html`
+            <div class="new-device-banner">
+              <span class="new-device-icon">${this._guessDeviceIcon(alert.name)}</span>
+              <span class="new-device-text">New device: <strong>${alert.name.replace(/ Bermuda.*$/i, '').replace(/ Tracker$/i, '')}</strong>${alert.area ? html` <span class="new-device-area">(${alert.area})</span>` : nothing}</span>
+              <button class="btn btn-small btn-primary" @click=${() => this._quickAddDevice(alert.entityId)}>+ Add to Map</button>
+              <button class="btn btn-small btn-secondary" @click=${() => this._dismissDeviceAlert(alert.entityId)}>✖</button>
+            </div>
+          `)}
         ` : nothing}
 
         <!-- Map toolbar -->
