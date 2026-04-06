@@ -171,10 +171,15 @@ export class BLELivemapPanel extends LitElement {
     rssi: number;
     area: string;
     tracked: boolean;
-    type: 'phone' | 'watch' | 'beacon' | 'tag' | 'sensor' | 'unknown';
+    type: string;
   }> = [];
   @state() private _bleScanActive = false;
   @state() private _showDeviceOnboarding = false;
+
+  // ─── Device Setup Wizard ──────────────────────────────────
+  @state() private _setupWizardOpen = false;
+  @state() private _setupWizardStep: 'choose-type' | 'irk-method' | 'irk-esphome' | 'irk-macbook' | 'irk-companion' | 'simple-device' | 'done' = 'choose-type';
+  @state() private _setupWizardDeviceType: string = '';
 
   private _liveTrackingTimer: number | null = null;
   private _dragStarted = false;
@@ -2302,15 +2307,25 @@ export class BLELivemapPanel extends LitElement {
    */
   private _guessDeviceIcon(name: string): string {
     const n = name.toLowerCase();
-    if (n.includes("iphone") || n.includes("phone") || n.includes("pixel") || n.includes("galaxy") || n.includes("samsung")) return "📱";
-    if (n.includes("watch") || n.includes("iwatch") || n.includes("band")) return "⌚";
+    if (n.includes("toothbrush") || n.includes("tandborste") || n.includes("oral-b") || n.includes("sonicare") || n.includes("philips hx") || n.includes("io series")) return "🪥";
+    if (n.includes("iphone") || n.includes("phone") || n.includes("pixel") || n.includes("galaxy") || n.includes("samsung") || n.includes("android")) return "📱";
+    if (n.includes("watch") || n.includes("iwatch") || n.includes("band") || n.includes("fitbit")) return "⌚";
     if (n.includes("ipad") || n.includes("tablet")) return "📱";
+    if (n.includes("headphone") || n.includes("airpod") || n.includes("earbud") || n.includes("hörlur")) return "🎧";
+    if (n.includes("speaker") || n.includes("sonos") || n.includes("högtalare")) return "🔊";
     if (n.includes("beacon") || n.includes("ibeacon")) return "📡";
-    if (n.includes("tag") || n.includes("tile") || n.includes("tracker")) return "🏷️";
-    if (n.includes("sensor") || n.includes("thermo") || n.includes("temp") || n.includes("humi")) return "🌡️";
-    if (n.includes("dog") || n.includes("cat") || n.includes("pet")) return "🐾";
-    if (n.includes("car") || n.includes("obd") || n.includes("tesla")) return "🚗";
-    if (n.includes("key")) return "🔑";
+    if (n.includes("tag") || n.includes("tile") || n.includes("tracker") || n.includes("airtag")) return "🏷️";
+    if (n.includes("sensor") || n.includes("thermo") || n.includes("temp") || n.includes("humi") || n.includes("bthome")) return "🌡️";
+    if (n.includes("scale") || n.includes("våg") || n.includes("weight")) return "⚖️";
+    if (n.includes("dog") || n.includes("cat") || n.includes("pet") || n.includes("hund") || n.includes("katt")) return "🐾";
+    if (n.includes("car") || n.includes("obd") || n.includes("tesla") || n.includes("bil")) return "🚗";
+    if (n.includes("bike") || n.includes("cykel")) return "🚲";
+    if (n.includes("key") || n.includes("nyckel") || n.includes("lock") || n.includes("lås")) return "🔑";
+    if (n.includes("door") || n.includes("dörr")) return "🚪";
+    if (n.includes("light") || n.includes("lamp") || n.includes("bulb")) return "💡";
+    if (n.includes("remote") || n.includes("fjärr")) return "📟";
+    if (n.includes("wallet") || n.includes("plånbok")) return "👛";
+    if (n.includes("backpack") || n.includes("bag") || n.includes("väska") || n.includes("ryggsäck")) return "🎒";
     return "📍";
   }
 
@@ -2460,7 +2475,7 @@ export class BLELivemapPanel extends LitElement {
   /**
    * Classify a BLE device from Bermuda dump data.
    */
-  private _classifyBLEDevice(dev: any): 'phone' | 'watch' | 'beacon' | 'tag' | 'sensor' | 'unknown' {
+  private _classifyBLEDevice(dev: any): string {
     const name = (dev.name || dev.friendly_name || "").toLowerCase();
     return this._classifyBLEDeviceByName(name);
   }
@@ -2468,13 +2483,16 @@ export class BLELivemapPanel extends LitElement {
   /**
    * Classify a BLE device by its name string.
    */
-  private _classifyBLEDeviceByName(name: string): 'phone' | 'watch' | 'beacon' | 'tag' | 'sensor' | 'unknown' {
+  private _classifyBLEDeviceByName(name: string): string {
     const n = name.toLowerCase();
+    if (n.includes("toothbrush") || n.includes("tandborste") || n.includes("oral-b") || n.includes("sonicare") || n.includes("philips hx") || n.includes("io series")) return "toothbrush";
     if (n.includes("iphone") || n.includes("phone") || n.includes("pixel") || n.includes("galaxy") || n.includes("android") || n.includes("samsung")) return "phone";
     if (n.includes("watch") || n.includes("band") || n.includes("fitbit")) return "watch";
+    if (n.includes("headphone") || n.includes("airpod") || n.includes("earbud")) return "headphones";
     if (n.includes("beacon") || n.includes("ibeacon")) return "beacon";
     if (n.includes("tag") || n.includes("tile") || n.includes("tracker") || n.includes("airtag")) return "tag";
     if (n.includes("sensor") || n.includes("thermo") || n.includes("temp") || n.includes("humi") || n.includes("bthome")) return "sensor";
+    if (n.includes("scale") || n.includes("weight")) return "scale";
     return "unknown";
   }
 
@@ -2483,11 +2501,14 @@ export class BLELivemapPanel extends LitElement {
    */
   private _getDeviceTypeIcon(type: string): string {
     switch (type) {
+      case "toothbrush": return "🪥";
       case "phone": return "📱";
       case "watch": return "⌚";
+      case "headphones": return "🎧";
       case "beacon": return "📡";
       case "tag": return "🏷️";
       case "sensor": return "🌡️";
+      case "scale": return "⚖️";
       default: return "📍";
     }
   }
@@ -4094,6 +4115,179 @@ export class BLELivemapPanel extends LitElement {
       .sd-status.on-map { font-size: 11px; color: #81C784; flex-shrink: 0; }
       .onboarding-help { margin-top: 8px; }
 
+      /* Setup Wizard */
+      .setup-wizard {
+        animation: fadeIn 0.2s ease;
+      }
+      .wizard-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 12px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+      }
+      .wizard-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-primary, #fff);
+      }
+      .wizard-content {
+        animation: fadeIn 0.2s ease;
+      }
+      .wizard-explain {
+        background: rgba(79, 195, 247, 0.08);
+        border: 1px solid rgba(79, 195, 247, 0.2);
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-bottom: 12px;
+      }
+      .wizard-explain p {
+        margin: 0 0 6px;
+        font-size: 12px;
+        color: var(--text-secondary, #ccc);
+        line-height: 1.5;
+      }
+      .wizard-explain p:last-child { margin-bottom: 0; }
+      .wizard-explain strong { color: var(--text-primary, #fff); }
+      .wizard-subtitle {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-primary, #fff);
+        margin: 0 0 8px;
+      }
+
+      /* Method cards (IRK method selection) */
+      .method-cards {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .method-card {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.2s;
+        position: relative;
+      }
+      .method-card:hover {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: #4FC3F7;
+      }
+      .method-card.recommended {
+        border-color: rgba(76, 175, 80, 0.4);
+        background: rgba(76, 175, 80, 0.05);
+      }
+      .method-card.recommended:hover {
+        border-color: #81C784;
+        background: rgba(76, 175, 80, 0.1);
+      }
+      .method-badge {
+        position: absolute;
+        top: -8px;
+        right: 10px;
+        background: #4CAF50;
+        color: #fff;
+        font-size: 9px;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 10px;
+        text-transform: uppercase;
+      }
+      .method-icon { font-size: 20px; }
+      .method-name { font-size: 13px; font-weight: 600; color: var(--text-primary, #fff); }
+      .method-desc { font-size: 11px; color: var(--text-secondary, #aaa); line-height: 1.4; }
+      .method-needs { font-size: 10px; color: var(--text-secondary, #888); font-style: italic; margin-top: 2px; }
+
+      /* Step-by-step cards */
+      .wizard-steps {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .step-card {
+        display: flex;
+        gap: 10px;
+        padding: 8px 0;
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.05));
+      }
+      .step-card:last-child { border-bottom: none; }
+      .step-num {
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        background: rgba(79, 195, 247, 0.2);
+        color: #4FC3F7;
+        font-size: 12px;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        margin-top: 2px;
+      }
+      .step-card.step-final .step-num {
+        background: rgba(76, 175, 80, 0.2);
+        color: #81C784;
+      }
+      .step-body { flex: 1; min-width: 0; }
+      .step-title {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-primary, #fff);
+        margin-bottom: 3px;
+      }
+      .step-detail {
+        font-size: 11px;
+        color: var(--text-secondary, #aaa);
+        line-height: 1.5;
+      }
+      .step-detail a {
+        color: #4FC3F7;
+        text-decoration: none;
+      }
+      .step-detail a:hover { text-decoration: underline; }
+      .step-detail strong { color: var(--text-primary, #ddd); }
+
+      .wizard-links {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 12px;
+      }
+      .wizard-links a {
+        text-decoration: none;
+        text-align: center;
+      }
+      .wizard-note {
+        background: rgba(255, 193, 7, 0.08);
+        border: 1px solid rgba(255, 193, 7, 0.2);
+        border-radius: 8px;
+        padding: 8px 12px;
+        margin-top: 12px;
+        font-size: 11px;
+        color: var(--text-secondary, #aaa);
+        line-height: 1.5;
+      }
+      .wizard-note strong { color: #FFC107; }
+
+      .wizard-done {
+        text-align: center;
+        padding: 20px 0;
+      }
+      .done-icon { font-size: 48px; display: block; margin-bottom: 12px; }
+      .done-text { font-size: 14px; color: var(--text-primary, #fff); margin-bottom: 16px; }
+
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+
       /* Zone edit panel */
       .zone-edit-panel {
         background: var(--card-bg);
@@ -4798,25 +4992,42 @@ export class BLELivemapPanel extends LitElement {
 
             ${this._showDeviceOnboarding ? html`
               <div class="onboarding-panel">
+                ${!this._setupWizardOpen ? html`
+                <!-- Main onboarding view -->
                 <div class="onboarding-info">
-                  <p class="onboarding-desc">Devices must first be set up in <strong>Bermuda</strong> before they can be tracked on the map.</p>
+                  <p class="onboarding-desc">Add devices to track on your map. Choose a device type below for step-by-step setup instructions.</p>
                 </div>
 
                 <div class="onboarding-types">
-                  <div class="device-type-card" @click=${() => this._openBermudaConfig()}>
+                  <div class="device-type-card" @click=${() => { this._setupWizardDeviceType = 'phone'; this._setupWizardStep = 'irk-method'; this._setupWizardOpen = true; }}>
                     <span class="dt-icon">📱</span>
-                    <span class="dt-label">Phone / Watch</span>
-                    <span class="dt-hint">Requires Private BLE Device + IRK</span>
+                    <span class="dt-label">Phone</span>
+                    <span class="dt-hint">iPhone, Android, Pixel, Galaxy</span>
                   </div>
-                  <div class="device-type-card" @click=${() => this._openBermudaConfig()}>
+                  <div class="device-type-card" @click=${() => { this._setupWizardDeviceType = 'watch'; this._setupWizardStep = 'irk-method'; this._setupWizardOpen = true; }}>
+                    <span class="dt-icon">⌚</span>
+                    <span class="dt-label">Watch</span>
+                    <span class="dt-hint">Apple Watch, Samsung, Fitbit</span>
+                  </div>
+                  <div class="device-type-card" @click=${() => { this._setupWizardDeviceType = 'toothbrush'; this._setupWizardStep = 'simple-device'; this._setupWizardOpen = true; }}>
+                    <span class="dt-icon">🪥</span>
+                    <span class="dt-label">Toothbrush</span>
+                    <span class="dt-hint">Oral-B, Sonicare — auto-discovered</span>
+                  </div>
+                  <div class="device-type-card" @click=${() => { this._setupWizardDeviceType = 'tag'; this._setupWizardStep = 'simple-device'; this._setupWizardOpen = true; }}>
                     <span class="dt-icon">🏷️</span>
-                    <span class="dt-label">BLE Tag / Beacon</span>
-                    <span class="dt-hint">Auto-discovered by Bermuda</span>
+                    <span class="dt-label">BLE Tag</span>
+                    <span class="dt-hint">Tile, beacon — auto-discovered</span>
                   </div>
-                  <div class="device-type-card" @click=${() => this._openBermudaConfig()}>
+                  <div class="device-type-card" @click=${() => { this._setupWizardDeviceType = 'sensor'; this._setupWizardStep = 'simple-device'; this._setupWizardOpen = true; }}>
                     <span class="dt-icon">🌡️</span>
-                    <span class="dt-label">BTHome Sensor</span>
-                    <span class="dt-hint">Static MAC — select in Bermuda</span>
+                    <span class="dt-label">Sensor</span>
+                    <span class="dt-hint">BTHome, thermometer, scale</span>
+                  </div>
+                  <div class="device-type-card" @click=${() => { this._setupWizardDeviceType = 'headphones'; this._setupWizardStep = 'simple-device'; this._setupWizardOpen = true; }}>
+                    <span class="dt-icon">🎧</span>
+                    <span class="dt-label">Headphones</span>
+                    <span class="dt-hint">AirPods, earbuds — auto-discovered</span>
                   </div>
                 </div>
 
@@ -4865,6 +5076,385 @@ export class BLELivemapPanel extends LitElement {
                     ⚙️ Open Bermuda Settings
                   </button>
                 </div>
+
+                ` : html`
+                <!-- Setup Wizard -->
+                <div class="setup-wizard">
+                  <div class="wizard-header">
+                    <button class="btn btn-tiny" @click=${() => {
+                      if (this._setupWizardStep === 'choose-type' || this._setupWizardStep === 'irk-method' || this._setupWizardStep === 'simple-device') {
+                        this._setupWizardOpen = false;
+                        this._setupWizardStep = 'choose-type';
+                      } else if (this._setupWizardStep.startsWith('irk-')) {
+                        this._setupWizardStep = 'irk-method';
+                      } else {
+                        this._setupWizardOpen = false;
+                        this._setupWizardStep = 'choose-type';
+                      }
+                    }}>← Back</button>
+                    <span class="wizard-title">
+                      ${this._setupWizardDeviceType === 'phone' ? '📱 Add Phone' :
+                        this._setupWizardDeviceType === 'watch' ? '⌚ Add Watch' :
+                        this._setupWizardDeviceType === 'toothbrush' ? '🪥 Add Toothbrush' :
+                        this._setupWizardDeviceType === 'tag' ? '🏷️ Add BLE Tag' :
+                        this._setupWizardDeviceType === 'sensor' ? '🌡️ Add Sensor' :
+                        this._setupWizardDeviceType === 'headphones' ? '🎧 Add Headphones' :
+                        '📍 Add Device'}
+                    </span>
+                  </div>
+
+                  ${this._setupWizardStep === 'irk-method' ? html`
+                  <!-- IRK Method Selection -->
+                  <div class="wizard-content">
+                    <div class="wizard-explain">
+                      <p><strong>Why is this needed?</strong></p>
+                      <p>${this._setupWizardDeviceType === 'phone' ? 'Phones' : 'Watches'} rotate their Bluetooth address for privacy. To track them reliably, we need their <strong>IRK</strong> (Identity Resolving Key) — a secret key that lets us recognize the device despite address changes.</p>
+                    </div>
+
+                    <p class="wizard-subtitle">Choose how to get the IRK:</p>
+
+                    <div class="method-cards">
+                      <div class="method-card recommended" @click=${() => { this._setupWizardStep = 'irk-esphome'; }}>
+                        <div class="method-badge">⭐ Recommended</div>
+                        <span class="method-icon">🔧</span>
+                        <span class="method-name">ESPHome IRK Capture</span>
+                        <span class="method-desc">Flash an ESP32, pair your device, done. Works with all phones & watches.</span>
+                        <span class="method-needs">Needs: Any ESP32 device</span>
+                      </div>
+
+                      ${this._setupWizardDeviceType === 'phone' ? html`
+                      <div class="method-card" @click=${() => { this._setupWizardStep = 'irk-companion'; }}>
+                        <span class="method-icon">📲</span>
+                        <span class="method-name">HA Companion App</span>
+                        <span class="method-desc">Android only — enable BLE Transmitter in the Companion App. No IRK needed!</span>
+                        <span class="method-needs">Needs: Android + HA Companion App</span>
+                      </div>
+                      ` : nothing}
+
+                      <div class="method-card" @click=${() => { this._setupWizardStep = 'irk-macbook'; }}>
+                        <span class="method-icon">💻</span>
+                        <span class="method-name">macOS Keychain</span>
+                        <span class="method-desc">Extract IRK from a paired Mac. Easy if you have a MacBook.</span>
+                        <span class="method-needs">Needs: macOS computer</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  ` : this._setupWizardStep === 'irk-esphome' ? html`
+                  <!-- ESPHome IRK Capture Guide -->
+                  <div class="wizard-content">
+                    <div class="wizard-steps">
+                      <div class="step-card">
+                        <div class="step-num">1</div>
+                        <div class="step-body">
+                          <div class="step-title">Install ESPHome Device Builder</div>
+                          <div class="step-detail">
+                            In Home Assistant: <strong>Settings → Add-ons → Add-on Store</strong> → search for "ESPHome Device Builder" → Install
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">2</div>
+                        <div class="step-body">
+                          <div class="step-title">Create a new ESPHome device</div>
+                          <div class="step-detail">
+                            Open ESPHome → <strong>New Device</strong> → name it "IRK Capture" → select your ESP32 board type → click <strong>Skip</strong> on the config screen
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">3</div>
+                        <div class="step-body">
+                          <div class="step-title">Flash the IRK Capture firmware</div>
+                          <div class="step-detail">
+                            Click <strong>Edit</strong> on the device → save the API & OTA keys → delete all content → paste the YAML from
+                            <a href="https://github.com/DerekSeaman/irk-capture" target="_blank" rel="noopener">github.com/DerekSeaman/irk-capture</a>
+                            → add your saved keys → <strong>Install</strong> via USB
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">4</div>
+                        <div class="step-body">
+                          <div class="step-title">Select BLE emulation mode</div>
+                          <div class="step-detail">
+                            In the ESPHome device page, choose:
+                            <br>• <strong>Heart Rate Monitor</strong> — for Apple devices (iPhone, iPad, Apple Watch)
+                            <br>• <strong>Keyboard</strong> — for Android phones (Samsung, Pixel)
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">5</div>
+                        <div class="step-body">
+                          <div class="step-title">Pair your ${this._setupWizardDeviceType === 'watch' ? 'watch' : 'phone'}</div>
+                          <div class="step-detail">
+                            On your ${this._setupWizardDeviceType === 'watch' ? 'watch' : 'phone'}: open <strong>Bluetooth Settings</strong> → find the ESP32 device ("IRK Capture") → <strong>Pair</strong>.
+                            The IRK will appear on the ESPHome device page in Home Assistant.
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">6</div>
+                        <div class="step-body">
+                          <div class="step-title">Add IRK to Private BLE Device</div>
+                          <div class="step-detail">
+                            In HA: <strong>Settings → Devices & Services → Add Integration</strong> → search "Private BLE Device" → paste the IRK from the ESPHome page. Done!
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">7</div>
+                        <div class="step-body">
+                          <div class="step-title">Unpair & re-flash (optional)</div>
+                          <div class="step-detail">
+                            Unpair the ESP32 from your ${this._setupWizardDeviceType === 'watch' ? 'watch' : 'phone'}. You can now re-flash the ESP32 as a normal BLE proxy, or keep it for capturing more IRKs later.
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card step-final">
+                        <div class="step-num">✓</div>
+                        <div class="step-body">
+                          <div class="step-title">Device will appear automatically!</div>
+                          <div class="step-detail">
+                            Bermuda will detect the device within seconds. A notification will appear here and you can add it to the map with one click.
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="wizard-links">
+                      <a href="https://github.com/DerekSeaman/irk-capture" target="_blank" rel="noopener" class="btn btn-block btn-secondary">📖 Full IRK Capture Guide (GitHub)</a>
+                      <a href="https://www.derekseaman.com/2026/01/how-to-using-my-bluetooth-irk-capture-package.html" target="_blank" rel="noopener" class="btn btn-block btn-secondary">📝 Detailed Blog Post with Screenshots</a>
+                    </div>
+                  </div>
+
+                  ` : this._setupWizardStep === 'irk-companion' ? html`
+                  <!-- HA Companion App Guide (Android only) -->
+                  <div class="wizard-content">
+                    <div class="wizard-explain">
+                      <p><strong>Android shortcut — no IRK needed!</strong></p>
+                      <p>The Home Assistant Companion App can broadcast a BLE signal that Bermuda tracks directly. This is the easiest method for Android phones.</p>
+                    </div>
+
+                    <div class="wizard-steps">
+                      <div class="step-card">
+                        <div class="step-num">1</div>
+                        <div class="step-body">
+                          <div class="step-title">Open HA Companion App</div>
+                          <div class="step-detail">On your Android phone, open the Home Assistant app.</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">2</div>
+                        <div class="step-body">
+                          <div class="step-title">Go to App Settings</div>
+                          <div class="step-detail"><strong>Settings → Companion App</strong> (scroll to the bottom of the HA settings page)</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">3</div>
+                        <div class="step-body">
+                          <div class="step-title">Enable BLE Transmitter</div>
+                          <div class="step-detail">Go to <strong>Manage Sensors</strong> → find <strong>BLE Transmitter</strong> → enable it. The phone will now broadcast a BLE iBeacon signal.</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">4</div>
+                        <div class="step-body">
+                          <div class="step-title">Enable in Bermuda</div>
+                          <div class="step-detail">In Bermuda settings, make sure iBeacon tracking is enabled. The phone should appear as a trackable device.</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card step-final">
+                        <div class="step-num">✓</div>
+                        <div class="step-body">
+                          <div class="step-title">Device will appear automatically!</div>
+                          <div class="step-detail">Bermuda will detect the phone within seconds. A notification will appear here to add it to the map.</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="wizard-note">
+                      <strong>Note:</strong> BLE Transmitter uses some battery. You can adjust the transmit power and interval in the Companion App sensor settings to balance accuracy vs battery life.
+                    </div>
+                  </div>
+
+                  ` : this._setupWizardStep === 'irk-macbook' ? html`
+                  <!-- macOS Keychain Guide -->
+                  <div class="wizard-content">
+                    <div class="wizard-explain">
+                      <p><strong>Extract IRK from macOS Keychain</strong></p>
+                      <p>If your device is paired with a Mac, you can extract the IRK from the macOS Keychain. Works for iPhone, iPad, Apple Watch, and possibly Android devices paired with the Mac.</p>
+                    </div>
+
+                    <div class="wizard-steps">
+                      <div class="step-card">
+                        <div class="step-num">1</div>
+                        <div class="step-body">
+                          <div class="step-title">Pair device with your Mac</div>
+                          <div class="step-detail">Make sure your ${this._setupWizardDeviceType === 'watch' ? 'watch' : 'phone'} is paired via Bluetooth with your Mac. Check <strong>System Settings → Bluetooth</strong>.</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">2</div>
+                        <div class="step-body">
+                          <div class="step-title">Open Keychain Access</div>
+                          <div class="step-detail">Open <strong>Keychain Access</strong> (search in Spotlight). Select the <strong>System</strong> keychain from the sidebar.</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">3</div>
+                        <div class="step-body">
+                          <div class="step-title">Find the Bluetooth keys</div>
+                          <div class="step-detail">Search for <strong>"Bluetooth"</strong> or your device name. Look for entries with "IRK" in the name or data. The key is a 32-character hex string.</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">4</div>
+                        <div class="step-body">
+                          <div class="step-title">Add to Private BLE Device</div>
+                          <div class="step-detail">In HA: <strong>Settings → Devices & Services → Add Integration</strong> → "Private BLE Device" → paste the IRK hex string.</div>
+                        </div>
+                      </div>
+
+                      <div class="step-card step-final">
+                        <div class="step-num">✓</div>
+                        <div class="step-body">
+                          <div class="step-title">Device will appear automatically!</div>
+                          <div class="step-detail">Bermuda will detect the device within seconds. A notification will appear here to add it to the map.</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="wizard-links">
+                      <a href="https://www.home-assistant.io/integrations/private_ble_device/" target="_blank" rel="noopener" class="btn btn-block btn-secondary">📖 Private BLE Device Docs</a>
+                    </div>
+                  </div>
+
+                  ` : this._setupWizardStep === 'simple-device' ? html`
+                  <!-- Simple Device Guide (tags, sensors, toothbrushes) -->
+                  <div class="wizard-content">
+                    <div class="wizard-explain">
+                      <p><strong>Good news — this is easy!</strong></p>
+                      <p>${this._setupWizardDeviceType === 'toothbrush'
+                        ? 'Electric toothbrushes (Oral-B, Sonicare) broadcast BLE signals while in use and often in standby. Bermuda can detect them automatically.'
+                        : this._setupWizardDeviceType === 'headphones'
+                        ? 'Bluetooth headphones and earbuds broadcast BLE signals when powered on. Bermuda can detect them automatically.'
+                        : this._setupWizardDeviceType === 'tag'
+                        ? 'BLE tags and beacons have a fixed MAC address and broadcast continuously. Bermuda detects them automatically.'
+                        : 'BTHome sensors and similar devices have a fixed MAC address. Bermuda detects them automatically.'}
+                      </p>
+                      <p>No IRK extraction needed — these devices use a <strong>static Bluetooth address</strong>.</p>
+                    </div>
+
+                    <div class="wizard-steps">
+                      <div class="step-card">
+                        <div class="step-num">1</div>
+                        <div class="step-body">
+                          <div class="step-title">Make sure the device is on</div>
+                          <div class="step-detail">
+                            ${this._setupWizardDeviceType === 'toothbrush'
+                              ? 'Turn on the toothbrush or make sure it\'s on its charger (many toothbrushes broadcast in standby).'
+                              : this._setupWizardDeviceType === 'headphones'
+                              ? 'Power on the headphones/earbuds. They should be broadcasting BLE signals.'
+                              : 'Make sure the device has battery and is within range of your BLE proxies.'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">2</div>
+                        <div class="step-body">
+                          <div class="step-title">Check Bermuda</div>
+                          <div class="step-detail">
+                            Open <strong>Bermuda Settings</strong> and look for the device in the device list. It should appear with its name or MAC address. Enable tracking for it.
+                          </div>
+                          <button class="btn btn-tiny btn-secondary" style="margin-top: 6px;" @click=${() => this._openBermudaConfig()}>⚙️ Open Bermuda</button>
+                        </div>
+                      </div>
+
+                      <div class="step-card">
+                        <div class="step-num">3</div>
+                        <div class="step-body">
+                          <div class="step-title">Or scan from here</div>
+                          <div class="step-detail">
+                            Use the "Scan Visible BLE Devices" button below to find the device. If it shows as "Tracked", you can add it to the map directly.
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="step-card step-final">
+                        <div class="step-num">✓</div>
+                        <div class="step-body">
+                          <div class="step-title">Add to map with one click!</div>
+                          <div class="step-detail">Once Bermuda is tracking the device, a notification will appear here or you can find it in the scan results below.</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <button class="btn btn-block btn-scan" style="margin-top: 12px;" @click=${() => this._scanForBLEDevices()}>
+                      ${this._bleScanActive ? '⏳ Scanning...' : '📡 Scan Visible BLE Devices'}
+                    </button>
+
+                    ${this._bleScanResults.length > 0 ? html`
+                      <div class="scan-results">
+                        <div class="scan-header">
+                          <span class="scan-count">${this._bleScanResults.length} devices found</span>
+                        </div>
+                        ${this._bleScanResults.map(dev => {
+                          const configuredDevices = new Set(
+                            (this._config.tracked_devices || []).map((d: any) => d.entity_prefix)
+                          );
+                          const onMap = configuredDevices.has(dev.address);
+                          return html`
+                            <div class="scan-device ${dev.tracked ? 'tracked' : 'untracked'} ${onMap ? 'on-map' : ''}">
+                              <span class="sd-icon">${this._getDeviceTypeIcon(dev.type)}</span>
+                              <div class="sd-info">
+                                <div class="sd-name">${dev.name}</div>
+                                <div class="sd-meta">
+                                  ${dev.area ? html`<span class="sd-area">${dev.area}</span>` : nothing}
+                                  ${dev.rssi > -100 ? html`<span class="sd-signal">${this._getSignalBars(dev.rssi)} ${dev.rssi}dBm</span>` : nothing}
+                                </div>
+                              </div>
+                              ${onMap
+                                ? html`<span class="sd-status on-map">✅ On map</span>`
+                                : dev.tracked
+                                  ? html`<button class="btn btn-tiny btn-primary" @click=${() => this._quickAddDevice(dev.address)}>+ Map</button>`
+                                  : html`<button class="btn btn-tiny btn-secondary" @click=${() => this._openBermudaConfig()}>Setup</button>`
+                              }
+                            </div>
+                          `;
+                        })}
+                      </div>
+                    ` : nothing}
+                  </div>
+
+                  ` : this._setupWizardStep === 'done' ? html`
+                  <div class="wizard-content">
+                    <div class="wizard-done">
+                      <span class="done-icon">✅</span>
+                      <p class="done-text">Device setup complete! It should appear in the device list shortly.</p>
+                      <button class="btn btn-block btn-primary" @click=${() => { this._setupWizardOpen = false; this._setupWizardStep = 'choose-type'; this._showDeviceOnboarding = false; }}>Close</button>
+                    </div>
+                  </div>
+                  ` : nothing}
+                </div>
+                `}
               </div>
             ` : nothing}
           </div>
