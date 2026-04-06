@@ -49,7 +49,7 @@ export class BLELivemapCardEditor extends LitElement {
 
   private _lang = "en";
   private _dragStarted = false;
-  private _areaRegistry: Map<string, string> = new Map(); // area_id → area_name
+  @state() private _areaRegistry: Map<string, string> = new Map(); // area_id → area_name
   private _areaRegistryLoaded = false;
 
   setConfig(config: BLELivemapConfig): void {
@@ -101,6 +101,7 @@ export class BLELivemapCardEditor extends LitElement {
         this._areaRegistry.set(area.area_id, area.name);
       }
       this._areaRegistryLoaded = true;
+      this._syncZoneNamesFromAreas();
       this._refreshZoneAreaMap();
     } catch (e) {
       console.warn("[BLE LiveMap Editor] Failed to load area registry:", e);
@@ -114,6 +115,86 @@ export class BLELivemapCardEditor extends LitElement {
       zones, proxies, this.hass,
       this._areaRegistry.size > 0 ? this._areaRegistry : undefined
     );
+  }
+
+  /**
+   * Sync zone names from HA Area Registry.
+   * If a zone has ha_area_id set, update its name to match the HA Area name.
+   * This ensures HA Areas are the single source of truth for room names.
+   */
+  private _syncZoneNamesFromAreas(): void {
+    if (this._areaRegistry.size === 0) return;
+    const zones = this._config.zones || [];
+    let changed = false;
+    const updatedZones = zones.map((zone) => {
+      if (zone.ha_area_id && this._areaRegistry.has(zone.ha_area_id)) {
+        const areaName = this._areaRegistry.get(zone.ha_area_id)!;
+        if (zone.name !== areaName) {
+          changed = true;
+          return { ...zone, name: areaName };
+        }
+      }
+      return zone;
+    });
+    if (changed) {
+      this._updateConfig("zones", updatedZones);
+    }
+  }
+
+  /**
+   * Create a new HA Area from a zone name, then link the zone to it.
+   */
+  private async _createHaAreaFromZone(zoneIdx: number): Promise<void> {
+    const zone = (this._config.zones || [])[zoneIdx];
+    if (!zone || !zone.name || !this.hass) return;
+
+    try {
+      const result = await this.hass.callWS({
+        type: "config/area_registry/create",
+        name: zone.name,
+      }) as any;
+
+      if (result?.area_id) {
+        // Update the area registry cache
+        this._areaRegistry = new Map(this._areaRegistry);
+        this._areaRegistry.set(result.area_id, result.name);
+
+        // Link the zone to the new area
+        this._updateZone(zoneIdx, "ha_area_id", result.area_id);
+        this._updateZone(zoneIdx, "name", result.name);
+        this._refreshZoneAreaMap();
+        this.requestUpdate();
+      }
+    } catch (e: any) {
+      console.warn("[BLE LiveMap] Failed to create HA Area:", e);
+      // If it already exists, try to find and link it
+      if (e?.message?.includes("already exists") || e?.code === "invalid_info") {
+        const existing = Array.from(this._areaRegistry.entries()).find(
+          ([, name]) => name.toLowerCase().trim() === zone.name.toLowerCase().trim()
+        );
+        if (existing) {
+          this._updateZone(zoneIdx, "ha_area_id", existing[0]);
+          this._refreshZoneAreaMap();
+        }
+      }
+    }
+  }
+
+  /**
+   * Link a zone to an existing HA Area, updating the zone name to match.
+   */
+  private _linkZoneToArea(zoneIdx: number, areaId: string): void {
+    if (!areaId) {
+      // Unlink: clear ha_area_id but keep the name
+      this._updateZone(zoneIdx, "ha_area_id", undefined);
+    } else {
+      const areaName = this._areaRegistry.get(areaId);
+      if (areaName) {
+        this._updateZone(zoneIdx, "ha_area_id", areaId);
+        this._updateZone(zoneIdx, "name", areaName);
+      }
+    }
+    setTimeout(() => this._refreshZoneAreaMap(), 50);
   }
 
   protected updated(changedProps: Map<string, unknown>): void {
@@ -567,9 +648,45 @@ export class BLELivemapCardEditor extends LitElement {
               <div class="item-card">
                 <div class="color-dot" style="background: ${zone.color || ZONE_COLORS[idx % ZONE_COLORS.length]}"></div>
                 <div class="item-body">
+                  <!-- Primary: HA Area selector -->
+                  <div class="inline-group">
+                    <select class="area-select" @change=${(e: Event) => {
+                      this._linkZoneToArea(idx, (e.target as HTMLSelectElement).value);
+                    }}>
+                      <option value="">${this._t("editor.zone_area_custom")}</option>
+                      ${Array.from(this._areaRegistry.entries())
+                        .sort(([, a], [, b]) => a.localeCompare(b))
+                        .map(
+                          ([areaId, areaName]) => html`
+                            <option value=${areaId} ?selected=${zone.ha_area_id === areaId}>${areaName}</option>
+                          `
+                        )}
+                    </select>
+                    ${(() => {
+                      const mapping = this._zoneAreaMap.get(zone.id);
+                      if (!mapping) {
+                        // No area linked — show "Create in HA" button if zone has a name
+                        return zone.name
+                          ? html`<button class="btn btn-create-area" @click=${() => this._createHaAreaFromZone(idx)}
+                              title="${this._t("editor.zone_create_area_tip")}">
+                              + ${this._t("editor.zone_create_area")}
+                            </button>`
+                          : html`<span class="area-badge area-none">${this._t("editor.zone_area_none")}</span>`;
+                      }
+                      const icon = mapping.source === "explicit" ? "✓" : mapping.source === "proxy" ? "◉" : "≡";
+                      const tip = mapping.source === "explicit"
+                        ? this._t("editor.zone_area_explicit")
+                        : mapping.source === "proxy"
+                          ? this._t("editor.zone_area_proxy")
+                          : this._t("editor.zone_area_name");
+                      return html`<span class="area-badge area-${mapping.source}" title=${tip}>${icon} ${mapping.areaName}</span>`;
+                    })()}
+                  </div>
+                  <!-- Zone name: read-only when linked to HA Area, editable when custom -->
                   <input type="text" .value=${zone.name}
+                    ?disabled=${!!zone.ha_area_id}
                     @input=${(e: Event) => this._updateZone(idx, "name", (e.target as HTMLInputElement).value)}
-                    placeholder="${this._t("editor.zone_name")}" />
+                    placeholder="${zone.ha_area_id ? this._t("editor.zone_name_from_area") : this._t("editor.zone_name")}" />
                   <div class="inline-group">
                     <input type="color" .value=${zone.color || ZONE_COLORS[idx % ZONE_COLORS.length]}
                       @input=${(e: Event) => this._updateZone(idx, "color", (e.target as HTMLInputElement).value)}
@@ -593,32 +710,6 @@ export class BLELivemapCardEditor extends LitElement {
                       @click=${() => this._startDrawingZone(idx)}>
                       ${this._t("editor.zone_redraw")}
                     </button>
-                  </div>
-                  <div class="inline-group">
-                    <span class="label-sm">${this._t("editor.zone_ha_area")}</span>
-                    <select @change=${(e: Event) => {
-                      const val = (e.target as HTMLSelectElement).value;
-                      this._updateZone(idx, "ha_area_id", val || undefined);
-                      setTimeout(() => this._refreshZoneAreaMap(), 50);
-                    }}>
-                      <option value="">${this._t("editor.zone_area_auto")}</option>
-                      ${Array.from(this._areaRegistry.entries()).map(
-                        ([areaId, areaName]) => html`
-                          <option value=${areaId} ?selected=${zone.ha_area_id === areaId}>${areaName}</option>
-                        `
-                      )}
-                    </select>
-                    ${(() => {
-                      const mapping = this._zoneAreaMap.get(zone.id);
-                      if (!mapping) return html`<span class="area-badge area-none">${this._t("editor.zone_area_none")}</span>`;
-                      const icon = mapping.source === "explicit" ? "✓" : mapping.source === "proxy" ? "◉" : "≡";
-                      const tip = mapping.source === "explicit"
-                        ? this._t("editor.zone_area_explicit")
-                        : mapping.source === "proxy"
-                          ? this._t("editor.zone_area_proxy")
-                          : this._t("editor.zone_area_name");
-                      return html`<span class="area-badge area-${mapping.source}" title=${tip}>${icon} ${mapping.areaName}</span>`;
-                    })()}
                   </div>
                 </div>
                 <button class="btn-icon btn-remove" @click=${() => this._removeZone(idx)}>✕</button>
@@ -1279,6 +1370,26 @@ export class BLELivemapCardEditor extends LitElement {
       .area-badge.area-proxy { background: rgba(102,187,106,0.2); color: #66BB6A; }
       .area-badge.area-name { background: rgba(255,167,38,0.2); color: #FFA726; }
       .area-badge.area-none { background: rgba(158,158,158,0.15); color: var(--ed-text2); }
+
+      .area-select {
+        flex: 1; min-width: 120px;
+        padding: 5px 8px; border: 1px solid var(--ed-border); border-radius: 6px;
+        font-size: 12px; color: var(--ed-text); background: transparent;
+        outline: none;
+      }
+      .area-select:focus { border-color: var(--ed-accent); }
+
+      .btn-create-area {
+        padding: 3px 10px; border: 1px dashed rgba(76, 175, 80, 0.5); border-radius: 12px;
+        background: transparent; color: var(--ed-success); font-size: 10px;
+        cursor: pointer; transition: all 0.2s; white-space: nowrap;
+      }
+      .btn-create-area:hover { background: rgba(76, 175, 80, 0.1); border-style: solid; }
+
+      .item-body input[type="text"]:disabled {
+        opacity: 0.6; cursor: not-allowed;
+        background: rgba(158,158,158,0.08);
+      }
 
       .toggles { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 

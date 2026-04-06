@@ -122,6 +122,8 @@ export class BLELivemapCard extends LitElement {
   // Auto-resolved zone ↔ HA Area mapping (refreshed periodically)
   private _zoneAreaMap: Map<string, ZoneAreaMapping> = new Map();
   private _zoneAreaMapStamp = 0;
+  private _areaRegistry: Map<string, string> = new Map(); // area_id → area_name
+  private _areaRegistryLoaded = false;
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -548,11 +550,26 @@ export class BLELivemapCard extends LitElement {
     const hasMultipleFloors = floors.length > 1;
     const hasZoneAreaMapping = zones.length > 0;
 
+    // Load area registry once for zone name sync
+    const now = Date.now();
+    if (!this._areaRegistryLoaded && this.hass) {
+      this._areaRegistryLoaded = true;
+      this.hass.callWS({ type: "config/area_registry/list" }).then((areas: any) => {
+        for (const area of areas as any[]) {
+          this._areaRegistry.set(area.area_id, area.name);
+        }
+        // Force a zone area map refresh with the registry
+        this._zoneAreaMapStamp = 0;
+      }).catch(() => { /* non-critical */ });
+    }
+
     // Refresh the zone ↔ HA Area mapping every 30 seconds
     // This uses the three-tier strategy: explicit > proxy-position > name-match
-    const now = Date.now();
     if (hasZoneAreaMapping && (now - this._zoneAreaMapStamp > 30_000)) {
-      this._zoneAreaMap = resolveZoneAreaMap(zones, proxies, this.hass);
+      this._zoneAreaMap = resolveZoneAreaMap(
+        zones, proxies, this.hass,
+        this._areaRegistry.size > 0 ? this._areaRegistry : undefined
+      );
       this._zoneAreaMapStamp = now;
     }
 
