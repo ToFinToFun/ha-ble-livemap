@@ -91,6 +91,19 @@ export interface CalibrationHealth {
   message: string;
 }
 
+/** Guided calibration wizard point */
+export interface WizardPoint {
+  x: number; // % on map
+  y: number; // % on map
+  floor_id: string;
+  label: string; // e.g. "Near Vardagsrum proxy" or "Between Kitchen and Hall"
+  status: 'pending' | 'active' | 'measuring' | 'done' | 'skipped';
+  nearProxy?: string; // proxy entity_id this point is near
+}
+
+/** Wizard state machine states */
+export type WizardState = 'idle' | 'suggesting' | 'waiting' | 'measuring' | 'stable' | 'complete';
+
 export interface ProxyConfig {
   entity_id: string;
   name?: string;

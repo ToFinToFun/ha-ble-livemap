@@ -29,6 +29,8 @@ import {
   CalibrationSample,
   CalibrationHealth,
   CalibrationHealthLevel,
+  WizardPoint,
+  WizardState,
   DOOR_TYPES,
 } from "./types";
 import { CARD_VERSION, CARD_NAME } from "./const";
@@ -122,6 +124,23 @@ export class BLELivemapPanel extends LitElement {
   @state() private _calibrationToast: string = "";
   /** Per-proxy calibration health computed after auto-calibrate */
   @state() private _calibrationHealthMap: Map<string, CalibrationHealth> = new Map();
+
+  // ─── Guided Calibration Wizard ─────────────────────────────
+  @state() private _wizardActive = false;
+  @state() private _wizardStep = 0;
+  @state() private _wizardPoints: WizardPoint[] = [];
+  @state() private _wizardState: WizardState = 'idle';
+  @state() private _wizardStableProxies = 0;
+  @state() private _wizardTotalProxies = 0;
+  @state() private _wizardMeasureProgress = 0; // 0-100
+  private _wizardMeasureTimer: number | null = null;
+  private _wizardRssiBuffer: Map<string, number[]> = new Map(); // proxy → rolling RSSI window
+  private _wizardMeasureStart = 0;
+  private static readonly WIZARD_MEASURE_MIN_MS = 3000; // min 3s measuring
+  private static readonly WIZARD_MEASURE_MAX_MS = 12000; // max 12s before auto-accept
+  private static readonly WIZARD_STABILITY_THRESHOLD = 3.5; // dBm std dev
+  private static readonly WIZARD_WINDOW_SIZE = 6; // rolling window size
+
   private _liveTrackingTimer: number | null = null;
   private _dragStarted = false;
 
@@ -1926,6 +1945,356 @@ export class BLELivemapPanel extends LitElement {
     this._updateConfig("proxies", proxies);
   }
 
+  // ─── Guided Calibration Wizard Methods ─────────────────────
+
+  /**
+   * Start the guided calibration wizard.
+   * Generates suggested measurement points and begins the flow.
+   */
+  private _wizardStart(): void {
+    if (!this._debugFollowDevice) {
+      this._calibrationToast = "Select a device to follow first";
+      setTimeout(() => { this._calibrationToast = ""; }, 3000);
+      return;
+    }
+
+    // Enable continuous learning and Bermuda sync automatically
+    if (!this._config.continuous_learning) {
+      this._updateConfig("continuous_learning", true);
+    }
+    if (!this._config.bermuda_sync_enabled) {
+      this._updateConfig("bermuda_sync_enabled", true);
+    }
+
+    const points = this._wizardGeneratePoints();
+    if (points.length === 0) {
+      this._calibrationToast = "No proxies placed on the map. Place proxies first.";
+      setTimeout(() => { this._calibrationToast = ""; }, 3000);
+      return;
+    }
+
+    this._wizardActive = true;
+    this._wizardPoints = points;
+    this._wizardStep = 0;
+    this._wizardState = 'suggesting';
+    this._calibrationMode = false; // disable manual mode
+
+    // Mark first point as active
+    this._wizardPoints = this._wizardPoints.map((p, i) => ({
+      ...p,
+      status: i === 0 ? 'active' as const : 'pending' as const,
+    }));
+  }
+
+  /**
+   * Stop the wizard.
+   */
+  private _wizardStop(): void {
+    if (this._wizardMeasureTimer) {
+      clearInterval(this._wizardMeasureTimer);
+      this._wizardMeasureTimer = null;
+    }
+    this._wizardActive = false;
+    this._wizardState = 'idle';
+    this._wizardPoints = [];
+    this._wizardStep = 0;
+    this._wizardRssiBuffer.clear();
+  }
+
+  /**
+   * User confirms they are at the suggested point.
+   * Starts the auto-measurement phase.
+   */
+  private _wizardConfirmPosition(): void {
+    if (this._wizardState !== 'suggesting') return;
+
+    this._wizardState = 'measuring';
+    this._wizardRssiBuffer.clear();
+    this._wizardMeasureStart = Date.now();
+    this._wizardStableProxies = 0;
+    this._wizardTotalProxies = 0;
+    this._wizardMeasureProgress = 0;
+
+    // Update point status
+    this._wizardPoints = this._wizardPoints.map((p, i) => ({
+      ...p,
+      status: i === this._wizardStep ? 'measuring' as const : p.status,
+    }));
+
+    // Start measurement timer (every 500ms)
+    this._wizardMeasureTimer = window.setInterval(() => {
+      this._wizardMeasureTick();
+    }, 500);
+  }
+
+  /**
+   * Called every 500ms during measurement.
+   * Collects RSSI, checks stability, auto-accepts when stable.
+   */
+  private _wizardMeasureTick(): void {
+    const elapsed = Date.now() - this._wizardMeasureStart;
+    const maxMs = (this.constructor as typeof BLELivemapPanel).WIZARD_MEASURE_MAX_MS;
+    const minMs = (this.constructor as typeof BLELivemapPanel).WIZARD_MEASURE_MIN_MS;
+    const windowSize = (this.constructor as typeof BLELivemapPanel).WIZARD_WINDOW_SIZE;
+    const threshold = (this.constructor as typeof BLELivemapPanel).WIZARD_STABILITY_THRESHOLD;
+
+    // Collect current RSSI from debug info
+    let activeCount = 0;
+    let stableCount = 0;
+
+    for (const info of this._liveDebugInfo) {
+      if (info.rssi === null) continue;
+      activeCount++;
+
+      const key = info.proxyId;
+      const buf = this._wizardRssiBuffer.get(key) || [];
+      buf.push(info.rssi);
+      // Keep only last N readings
+      if (buf.length > windowSize) buf.shift();
+      this._wizardRssiBuffer.set(key, buf);
+
+      // Check stability: need at least windowSize/2 readings
+      if (buf.length >= Math.ceil(windowSize / 2)) {
+        const mean = buf.reduce((a, b) => a + b, 0) / buf.length;
+        const variance = buf.reduce((a, b) => a + (b - mean) ** 2, 0) / buf.length;
+        const stdDev = Math.sqrt(variance);
+        if (stdDev < threshold) stableCount++;
+      }
+    }
+
+    this._wizardStableProxies = stableCount;
+    this._wizardTotalProxies = activeCount;
+    this._wizardMeasureProgress = Math.min(100, Math.round((elapsed / minMs) * 100));
+
+    // Check if stable enough or timed out
+    const allStable = activeCount > 0 && stableCount >= activeCount;
+    const minTimePassed = elapsed >= minMs;
+    const timedOut = elapsed >= maxMs;
+
+    if ((allStable && minTimePassed) || timedOut) {
+      this._wizardAcceptMeasurement();
+    }
+  }
+
+  /**
+   * Accept the current measurement: record sample, auto-calibrate, advance.
+   */
+  private _wizardAcceptMeasurement(): void {
+    // Stop measurement timer
+    if (this._wizardMeasureTimer) {
+      clearInterval(this._wizardMeasureTimer);
+      this._wizardMeasureTimer = null;
+    }
+
+    // Record the calibration sample at the current wizard point
+    const point = this._wizardPoints[this._wizardStep];
+    if (point) {
+      this._recordCalibrationSample(point.x, point.y);
+      // _recordCalibrationSample triggers auto-calibrate if continuous_learning is on
+      // which in turn triggers Bermuda sync if bermuda_sync_enabled is on
+
+      // Auto-remove outliers after calibration (wizard handles cleanup automatically)
+      setTimeout(() => {
+        const outliers = (this._config.calibration_samples || []).filter(s => s.is_outlier);
+        if (outliers.length > 0) {
+          this._removeOutlierSamples();
+        }
+      }, 800);
+    }
+
+    this._wizardState = 'stable';
+
+    // Mark point as done
+    this._wizardPoints = this._wizardPoints.map((p, i) => ({
+      ...p,
+      status: i === this._wizardStep ? 'done' as const : p.status,
+    }));
+
+    // Auto-advance to next point after a short delay
+    setTimeout(() => {
+      this._wizardAdvance();
+    }, 1500);
+  }
+
+  /**
+   * Advance to the next wizard point, or complete.
+   */
+  private _wizardAdvance(): void {
+    const nextIdx = this._wizardStep + 1;
+
+    if (nextIdx >= this._wizardPoints.length) {
+      // All points done!
+      this._wizardState = 'complete';
+      this._calibrationToast = `\u2705 Guided calibration complete! ${this._wizardPoints.filter(p => p.status === 'done').length} points measured.`;
+      setTimeout(() => { this._calibrationToast = ""; }, 5000);
+      return;
+    }
+
+    this._wizardStep = nextIdx;
+    this._wizardState = 'suggesting';
+    this._wizardRssiBuffer.clear();
+
+    // Mark next point as active
+    this._wizardPoints = this._wizardPoints.map((p, i) => ({
+      ...p,
+      status: i === nextIdx ? 'active' as const : p.status,
+    }));
+  }
+
+  /**
+   * Skip the current wizard point.
+   */
+  private _wizardSkipPoint(): void {
+    if (this._wizardMeasureTimer) {
+      clearInterval(this._wizardMeasureTimer);
+      this._wizardMeasureTimer = null;
+    }
+
+    this._wizardPoints = this._wizardPoints.map((p, i) => ({
+      ...p,
+      status: i === this._wizardStep ? 'skipped' as const : p.status,
+    }));
+
+    this._wizardAdvance();
+  }
+
+  /**
+   * Generate optimal calibration points based on proxy positions.
+   * Strategy:
+   *   1. Near each proxy (~1.5m offset) for ref_rssi calibration
+   *   2. Midpoints between proxy pairs for attenuation calibration
+   *   3. Coverage gaps in zones
+   */
+  private _wizardGeneratePoints(): WizardPoint[] {
+    const proxies = (this._config.proxies || []).filter(p => p.x || p.y);
+    const floor = this._getActiveFloor();
+    const floorId = floor?.id || "default";
+    const imageWidth = floor?.image_width || 20;
+    const imageHeight = floor?.image_height || 15;
+    const zones = (this._config.zones || []).filter(z => !z.floor_id || z.floor_id === floorId);
+    const existingSamples = (this._config.calibration_samples || []).filter(s => s.floor_id === floorId);
+
+    const points: WizardPoint[] = [];
+
+    // Helper: check if a point is inside any zone (if zones exist)
+    const isInsideAnyZone = (px: number, py: number): boolean => {
+      if (zones.length === 0) return true; // no zones = allow everywhere
+      return zones.some(z => z.points && isPointInPolygon(px, py, z.points));
+    };
+
+    // Helper: check if there's already a sample near this point (within ~2m)
+    const hasNearbySample = (px: number, py: number, radiusM: number): boolean => {
+      for (const s of existingSamples) {
+        const dx = ((s.x - px) / 100) * imageWidth;
+        const dy = ((s.y - py) / 100) * imageHeight;
+        if (Math.sqrt(dx * dx + dy * dy) < radiusM) return true;
+      }
+      return false;
+    };
+
+    // Helper: offset a point slightly (in % coords) to avoid being right on top of proxy
+    const offsetPoint = (px: number, py: number, offsetM: number): { x: number; y: number } => {
+      // Offset toward center of map
+      const cx = 50, cy = 50;
+      const dx = cx - px, dy = cy - py;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const offsetPctX = (offsetM / imageWidth) * 100;
+      const offsetPctY = (offsetM / imageHeight) * 100;
+      return {
+        x: Math.max(2, Math.min(98, px + (dx / dist) * offsetPctX)),
+        y: Math.max(2, Math.min(98, py + (dy / dist) * offsetPctY)),
+      };
+    };
+
+    // Phase 1: Near each proxy (for ref_rssi at ~1.5m)
+    for (const proxy of proxies) {
+      if (proxy.floor_id && proxy.floor_id !== floorId) continue;
+      const offset = offsetPoint(proxy.x, proxy.y, 1.5);
+      if (!hasNearbySample(offset.x, offset.y, 2.0) && isInsideAnyZone(offset.x, offset.y)) {
+        points.push({
+          x: offset.x,
+          y: offset.y,
+          floor_id: floorId,
+          label: `Near ${proxy.name || proxy.entity_id.split('.').pop()}`,
+          status: 'pending',
+          nearProxy: proxy.entity_id,
+        });
+      }
+    }
+
+    // Phase 2: Midpoints between proxy pairs (for attenuation)
+    for (let i = 0; i < proxies.length; i++) {
+      for (let j = i + 1; j < proxies.length; j++) {
+        const pA = proxies[i];
+        const pB = proxies[j];
+        if (pA.floor_id && pA.floor_id !== floorId) continue;
+        if (pB.floor_id && pB.floor_id !== floorId) continue;
+
+        // Check if proxies are within reasonable distance (< 15m)
+        const dx = ((pA.x - pB.x) / 100) * imageWidth;
+        const dy = ((pA.y - pB.y) / 100) * imageHeight;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > 15) continue;
+
+        const mx = (pA.x + pB.x) / 2;
+        const my = (pA.y + pB.y) / 2;
+
+        if (!hasNearbySample(mx, my, 2.5) && isInsideAnyZone(mx, my)) {
+          const nameA = pA.name || pA.entity_id.split('.').pop();
+          const nameB = pB.name || pB.entity_id.split('.').pop();
+          points.push({
+            x: mx,
+            y: my,
+            floor_id: floorId,
+            label: `Between ${nameA} and ${nameB}`,
+            status: 'pending',
+          });
+        }
+      }
+    }
+
+    // Phase 3: Coverage grid (fill gaps)
+    if (proxies.length >= 3) {
+      const gridSpacingM = 3;
+      const gridStepX = (gridSpacingM / imageWidth) * 100;
+      const gridStepY = (gridSpacingM / imageHeight) * 100;
+
+      for (let gx = gridStepX; gx < 100 - gridStepX; gx += gridStepX) {
+        for (let gy = gridStepY; gy < 100 - gridStepY; gy += gridStepY) {
+          // Skip if already have a point or sample nearby
+          const alreadyHasPoint = points.some(p => {
+            const pdx = ((p.x - gx) / 100) * imageWidth;
+            const pdy = ((p.y - gy) / 100) * imageHeight;
+            return Math.sqrt(pdx * pdx + pdy * pdy) < 2.5;
+          });
+          if (alreadyHasPoint) continue;
+          if (hasNearbySample(gx, gy, 2.5)) continue;
+          if (!isInsideAnyZone(gx, gy)) continue;
+
+          // Only add if at least 2 proxies are within 8m
+          let nearbyProxies = 0;
+          for (const p of proxies) {
+            const pdx = ((p.x - gx) / 100) * imageWidth;
+            const pdy = ((p.y - gy) / 100) * imageHeight;
+            if (Math.sqrt(pdx * pdx + pdy * pdy) < 8) nearbyProxies++;
+          }
+          if (nearbyProxies < 2) continue;
+
+          points.push({
+            x: gx,
+            y: gy,
+            floor_id: floorId,
+            label: `Coverage point`,
+            status: 'pending',
+          });
+        }
+      }
+    }
+
+    // Limit to reasonable number of points (max 15)
+    return points.slice(0, 15);
+  }
+
   // ─── Gateway Config Helpers ─────────────────────────────────
 
   private _toggleProxyGateway(proxyIdx: number): void {
@@ -3266,6 +3635,192 @@ export class BLELivemapPanel extends LitElement {
         margin: 8px 0;
       }
 
+      /* Guided Calibration Wizard Panel */
+      .wizard-panel {
+        background: var(--card-bg, #1e1e1e);
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 8px;
+        padding: 10px;
+        margin: 4px 0;
+      }
+      .wizard-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+      }
+      .wizard-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary, #fff);
+      }
+      .wizard-progress-bar {
+        height: 6px;
+        background: var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 3px;
+        overflow: hidden;
+        margin-bottom: 4px;
+      }
+      .wizard-progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #2196F3, #4CAF50);
+        border-radius: 3px;
+        transition: width 0.5s ease;
+      }
+      .wizard-progress-text {
+        font-size: 10px;
+        color: var(--text-secondary, #aaa);
+        margin-bottom: 8px;
+      }
+      .wizard-instruction {
+        padding: 6px 0;
+      }
+      .wizard-status {
+        font-size: 12px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        margin-bottom: 6px;
+      }
+      .wizard-suggesting {
+        background: rgba(33, 150, 243, 0.1);
+        color: #64B5F6;
+      }
+      .wizard-measuring {
+        background: rgba(255, 152, 0, 0.1);
+        color: #FFB74D;
+      }
+      .wizard-stable {
+        background: rgba(76, 175, 80, 0.1);
+        color: #81C784;
+      }
+      .wizard-complete {
+        background: rgba(76, 175, 80, 0.15);
+        color: #4CAF50;
+        font-weight: 500;
+        padding: 12px;
+        text-align: center;
+      }
+      .wizard-label {
+        font-size: 11px;
+        color: var(--text-secondary, #aaa);
+        font-style: italic;
+        margin-bottom: 8px;
+      }
+      .wizard-actions {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 4px;
+      }
+      .wizard-measure-bar {
+        height: 4px;
+        background: var(--divider-color, rgba(255,255,255,0.1));
+        border-radius: 2px;
+        overflow: hidden;
+        margin: 4px 0;
+      }
+      .wizard-measure-fill {
+        height: 100%;
+        background: #FF9800;
+        border-radius: 2px;
+        transition: width 0.3s ease;
+      }
+      .wizard-measure-detail {
+        font-size: 10px;
+        color: var(--text-secondary, #aaa);
+      }
+      .wizard-points {
+        max-height: 120px;
+        overflow-y: auto;
+        border-top: 1px solid var(--divider-color, rgba(255,255,255,0.05));
+        margin-top: 8px;
+        padding-top: 4px;
+      }
+      .wizard-point-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 2px 4px;
+        font-size: 10px;
+        color: var(--text-secondary, #aaa);
+        border-radius: 3px;
+      }
+      .wizard-point-active {
+        background: rgba(33, 150, 243, 0.1);
+        color: var(--text-primary, #fff);
+        font-weight: 500;
+      }
+      .wizard-point-icon {
+        font-size: 12px;
+        min-width: 16px;
+        text-align: center;
+      }
+      .wizard-point-label {
+        flex: 1;
+      }
+
+      /* Wizard map markers */
+      .wizard-map-point {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        pointer-events: none;
+        z-index: 25;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        font-weight: bold;
+        color: #fff;
+      }
+      .wizard-point-pending {
+        background: rgba(158, 158, 158, 0.3);
+        border: 2px solid rgba(158, 158, 158, 0.5);
+      }
+      .wizard-point-active-marker {
+        background: rgba(33, 150, 243, 0.3);
+        border: 2px solid #2196F3;
+        animation: wizard-pulse 1.5s ease-in-out infinite;
+      }
+      .wizard-point-measuring-marker {
+        background: rgba(255, 152, 0, 0.3);
+        border: 2px solid #FF9800;
+        animation: wizard-spin 1s linear infinite;
+      }
+      .wizard-point-done-marker {
+        background: rgba(76, 175, 80, 0.5);
+        border: 2px solid #4CAF50;
+      }
+      .wizard-point-skipped-marker {
+        background: rgba(158, 158, 158, 0.2);
+        border: 2px dashed rgba(158, 158, 158, 0.4);
+      }
+      @keyframes wizard-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(33, 150, 243, 0.4); transform: translate(-50%, -50%) scale(1); }
+        50% { box-shadow: 0 0 0 12px rgba(33, 150, 243, 0); transform: translate(-50%, -50%) scale(1.1); }
+      }
+      @keyframes wizard-spin {
+        0% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.4); }
+        50% { box-shadow: 0 0 0 8px rgba(255, 152, 0, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.4); }
+      }
+      .wizard-point-number {
+        position: absolute;
+        top: -8px;
+        right: -8px;
+        background: var(--card-bg, #1e1e1e);
+        color: var(--text-primary, #fff);
+        font-size: 8px;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.2));
+      }
+
       /* Responsive */
       @media (max-width: 900px) {
         .main-content {
@@ -3553,60 +4108,143 @@ export class BLELivemapPanel extends LitElement {
                 </select>
               </div>
 
-              <!-- Calibration toolbar -->
-              <div class="calib-toolbar">
-                <button
-                  class="btn btn-small ${this._calibrationMode ? 'btn-danger' : 'btn-secondary'}"
-                  @click=${() => { this._calibrationMode = !this._calibrationMode; }}
-                  title="Click on the map to record RSSI fingerprint at that position"
-                >
-                  ${this._calibrationMode ? '\u2716 Cancel' : '\ud83d\udccd I Am Here'}
-                </button>
-                <button
-                  class="btn btn-small btn-primary"
-                  @click=${() => this._autoCalibrate()}
-                  title="Fit path-loss model from collected samples"
-                  ?disabled=${(this._config.calibration_samples || []).length < 2}
-                >
-                  \ud83e\uddee Auto-Calibrate (${(this._config.calibration_samples || []).length} samples)
-                </button>
-                ${(this._config.calibration_samples || []).length > 0 ? html`
-                  <button
-                    class="btn btn-small btn-danger"
-                    @click=${() => this._clearCalibrationSamples()}
-                    title="Remove all calibration samples"
-                  >\ud83d\uddd1 Clear</button>
-                ` : nothing}
-                ${(this._config.calibration_samples || []).some(s => s.is_outlier) ? html`
-                  <button
-                    class="btn btn-small" style="background:#FF9800;color:#000;"
-                    @click=${() => this._removeOutlierSamples()}
-                    title="Remove samples flagged as outliers"
-                  >\u26a0 Remove Outliers (${(this._config.calibration_samples || []).filter(s => s.is_outlier).length})</button>
-                ` : nothing}
-              </div>
+              <!-- Wizard or Manual Calibration -->
+              ${this._wizardActive ? html`
+                <!-- Guided Calibration Wizard Panel -->
+                <div class="wizard-panel">
+                  <div class="wizard-header">
+                    <span class="wizard-title">\ud83e\uddd9 Guided Calibration</span>
+                    <button class="btn btn-small btn-danger" @click=${() => this._wizardStop()}>\u2716 Stop</button>
+                  </div>
 
-              <!-- Toggle options -->
-              <div class="calib-toggles">
-                <label class="calib-toggle">
-                  <input type="checkbox"
-                    .checked=${this._config.continuous_learning || false}
-                    @change=${(e: Event) => {
-                      this._updateConfig("continuous_learning", (e.target as HTMLInputElement).checked);
-                    }}
-                  />
-                  Auto-learn on new samples
-                </label>
-                <label class="calib-toggle">
-                  <input type="checkbox"
-                    .checked=${this._config.bermuda_sync_enabled || false}
-                    @change=${(e: Event) => {
-                      this._updateConfig("bermuda_sync_enabled", (e.target as HTMLInputElement).checked);
-                    }}
-                  />
-                  Sync to Bermuda
-                </label>
-              </div>
+                  <!-- Progress bar -->
+                  <div class="wizard-progress-bar">
+                    <div class="wizard-progress-fill" style="width: ${Math.round((this._wizardPoints.filter(p => p.status === 'done').length / Math.max(1, this._wizardPoints.length)) * 100)}%"></div>
+                  </div>
+                  <div class="wizard-progress-text">
+                    Step ${this._wizardStep + 1}/${this._wizardPoints.length} \u2014
+                    ${this._wizardPoints.filter(p => p.status === 'done').length} completed,
+                    ${this._wizardPoints.filter(p => p.status === 'skipped').length} skipped
+                  </div>
+
+                  ${this._wizardState === 'complete' ? html`
+                    <div class="wizard-status wizard-complete">
+                      \u2705 Calibration complete! All points measured and synced.
+                    </div>
+                  ` : html`
+                    <!-- Current step instruction -->
+                    <div class="wizard-instruction">
+                      ${this._wizardState === 'suggesting' ? html`
+                        <div class="wizard-status wizard-suggesting">
+                          \ud83d\udeb6 Walk to the <strong>pulsing blue point</strong> on the map
+                        </div>
+                        <div class="wizard-label">${this._wizardPoints[this._wizardStep]?.label || ''}</div>
+                        <div class="wizard-actions">
+                          <button class="btn btn-primary" @click=${() => this._wizardConfirmPosition()}>\ud83d\udccd I'm Here</button>
+                          <button class="btn btn-small btn-secondary" @click=${() => this._wizardSkipPoint()}>\u23ed Skip</button>
+                        </div>
+                      ` : nothing}
+
+                      ${this._wizardState === 'measuring' ? html`
+                        <div class="wizard-status wizard-measuring">
+                          \ud83d\udce1 Measuring... stand still
+                        </div>
+                        <div class="wizard-measure-bar">
+                          <div class="wizard-measure-fill" style="width: ${this._wizardMeasureProgress}%"></div>
+                        </div>
+                        <div class="wizard-measure-detail">
+                          ${this._wizardStableProxies}/${this._wizardTotalProxies} proxies stable
+                        </div>
+                      ` : nothing}
+
+                      ${this._wizardState === 'stable' ? html`
+                        <div class="wizard-status wizard-stable">
+                          \u2705 Stable! Sample recorded. Moving to next point...
+                        </div>
+                      ` : nothing}
+                    </div>
+                  `}
+
+                  <!-- Point list -->
+                  <div class="wizard-points">
+                    ${this._wizardPoints.map((p, i) => {
+                      const icon = p.status === 'done' ? '\u2705'
+                        : p.status === 'measuring' ? '\ud83d\udfe0'
+                        : p.status === 'active' ? '\ud83d\udd35'
+                        : p.status === 'skipped' ? '\u23ed'
+                        : '\u26aa';
+                      return html`
+                        <div class="wizard-point-item ${p.status === 'active' || p.status === 'measuring' ? 'wizard-point-active' : ''}">
+                          <span class="wizard-point-icon">${icon}</span>
+                          <span class="wizard-point-label">${p.label}</span>
+                        </div>
+                      `;
+                    })}
+                  </div>
+                </div>
+              ` : html`
+                <!-- Manual Calibration Toolbar -->
+                <div class="calib-toolbar">
+                  <button
+                    class="btn btn-small btn-primary"
+                    @click=${() => this._wizardStart()}
+                    title="Start guided calibration - walks you through optimal measurement points"
+                  >
+                    \ud83e\uddd9 Guided Calibration
+                  </button>
+                  <button
+                    class="btn btn-small ${this._calibrationMode ? 'btn-danger' : 'btn-secondary'}"
+                    @click=${() => { this._calibrationMode = !this._calibrationMode; }}
+                    title="Manual: click on the map to record RSSI fingerprint"
+                  >
+                    ${this._calibrationMode ? '\u2716 Cancel' : '\ud83d\udccd I Am Here'}
+                  </button>
+                  <button
+                    class="btn btn-small btn-secondary"
+                    @click=${() => this._autoCalibrate()}
+                    title="Fit path-loss model from collected samples"
+                    ?disabled=${(this._config.calibration_samples || []).length < 2}
+                  >
+                    \ud83e\uddee Calibrate (${(this._config.calibration_samples || []).length})
+                  </button>
+                  ${(this._config.calibration_samples || []).length > 0 ? html`
+                    <button
+                      class="btn btn-small btn-danger"
+                      @click=${() => this._clearCalibrationSamples()}
+                      title="Remove all calibration samples"
+                    >\ud83d\uddd1</button>
+                  ` : nothing}
+                  ${(this._config.calibration_samples || []).some(s => s.is_outlier) ? html`
+                    <button
+                      class="btn btn-small" style="background:#FF9800;color:#000;"
+                      @click=${() => this._removeOutlierSamples()}
+                      title="Remove outlier samples"
+                    >\u26a0 ${(this._config.calibration_samples || []).filter(s => s.is_outlier).length}</button>
+                  ` : nothing}
+                </div>
+
+                <!-- Toggle options -->
+                <div class="calib-toggles">
+                  <label class="calib-toggle">
+                    <input type="checkbox"
+                      .checked=${this._config.continuous_learning || false}
+                      @change=${(e: Event) => {
+                        this._updateConfig("continuous_learning", (e.target as HTMLInputElement).checked);
+                      }}
+                    />
+                    Auto-learn
+                  </label>
+                  <label class="calib-toggle">
+                    <input type="checkbox"
+                      .checked=${this._config.bermuda_sync_enabled || false}
+                      @change=${(e: Event) => {
+                        this._updateConfig("bermuda_sync_enabled", (e.target as HTMLInputElement).checked);
+                      }}
+                    />
+                    Bermuda sync
+                  </label>
+                </div>
+              `}
 
               ${this._calibrationMode ? html`
                 <div class="calib-hint">\ud83d\udc46 Click on the map where the device is RIGHT NOW to record a fingerprint</div>
@@ -4266,9 +4904,38 @@ export class BLELivemapPanel extends LitElement {
         <div
           class="calib-sample-marker"
           style="left: ${sample.x}%; top: ${sample.y}%;"
-          title="Sample #${samples.indexOf(sample) + 1} — ${Object.keys(sample.readings).length} proxies — ${new Date(sample.timestamp).toLocaleTimeString()}"
+          title="Sample #${samples.indexOf(sample) + 1} \u2014 ${Object.keys(sample.readings).length} proxies \u2014 ${new Date(sample.timestamp).toLocaleTimeString()}"
         ></div>
       `);
+    }
+
+    // Show wizard points on the map
+    if (this._wizardActive && this._wizardPoints.length > 0) {
+      for (let i = 0; i < this._wizardPoints.length; i++) {
+        const wp = this._wizardPoints[i];
+        if (wp.floor_id && wp.floor_id !== floorId) continue;
+
+        const markerClass = wp.status === 'done' ? 'wizard-point-done-marker'
+          : wp.status === 'measuring' ? 'wizard-point-measuring-marker'
+          : (wp.status === 'active') ? 'wizard-point-active-marker'
+          : wp.status === 'skipped' ? 'wizard-point-skipped-marker'
+          : 'wizard-point-pending';
+
+        const label = wp.status === 'done' ? '\u2713'
+          : wp.status === 'measuring' ? '\u2026'
+          : String(i + 1);
+
+        markers.push(html`
+          <div
+            class="wizard-map-point ${markerClass}"
+            style="left: ${wp.x}%; top: ${wp.y}%;"
+            title="${wp.label} (${wp.status})"
+          >
+            ${label}
+            <span class="wizard-point-number">${i + 1}</span>
+          </div>
+        `);
+      }
     }
 
     return markers;
