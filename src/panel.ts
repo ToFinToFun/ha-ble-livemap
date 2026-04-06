@@ -141,6 +141,20 @@ export class BLELivemapPanel extends LitElement {
   private static readonly WIZARD_STABILITY_THRESHOLD = 3.5; // dBm std dev
   private static readonly WIZARD_WINDOW_SIZE = 6; // rolling window size
 
+  // ─── New Proxy Detection ────────────────────────────────
+  @state() private _newProxyAlerts: Array<{
+    slug: string;
+    name: string;
+    area: string;
+    entity_id: string;
+    dismissed: boolean;
+  }> = [];
+  private _lastKnownProxySlugs: Set<string> = new Set();
+  /** Quick-calibrate mode for a newly placed proxy */
+  @state() private _quickCalibProxyIdx: number | null = null;
+  @state() private _quickCalibMode = false;
+  @state() private _quickCalibRssi: number | null = null;
+
   private _liveTrackingTimer: number | null = null;
   private _dragStarted = false;
 
@@ -1130,6 +1144,8 @@ export class BLELivemapPanel extends LitElement {
       if (idx >= 0) {
         proxies[idx] = { ...proxies[idx], x, y };
         this._updateConfig("proxies", proxies);
+        // Trigger quick calibration for newly placed proxy
+        setTimeout(() => this._tryQuickCalibrateAfterPlace(idx), 500);
       }
       this._placingEntity = null;
       this._placingMode = null;
@@ -1309,6 +1325,14 @@ export class BLELivemapPanel extends LitElement {
     // Auto-select first device if none selected and devices exist
     if (!this._debugFollowDevice && this._trackedDevices.length > 0) {
       this._debugFollowDevice = this._trackedDevices[0].device_id;
+    }
+
+    // ── New Proxy Detection ──
+    this._detectNewProxies();
+
+    // ── Quick-calibrate RSSI update ──
+    if (this._quickCalibMode && this._quickCalibProxyIdx !== null) {
+      this._updateQuickCalibRssi();
     }
   }
 
@@ -1943,6 +1967,218 @@ export class BLELivemapPanel extends LitElement {
       },
     };
     this._updateConfig("proxies", proxies);
+  }
+
+  // ─── New Proxy Detection & Quick Calibration ──────────────
+
+  /**
+   * Detect newly discovered proxies that are not yet in config.
+   * Called every 2s from _updateLiveDevices.
+   */
+  private _detectNewProxies(): void {
+    if (!this.hass) return;
+
+    const discovered = discoverProxySlugs(this.hass);
+    const configuredSlugs = new Set(
+      (this._config.proxies || []).map(p => extractProxySlug(p.entity_id))
+    );
+
+    const currentSlugs = new Set(discovered.keys());
+    const dismissedSlugs = new Set(
+      this._newProxyAlerts.filter(a => a.dismissed).map(a => a.slug)
+    );
+
+    const newAlerts: typeof this._newProxyAlerts = [];
+
+    for (const [slug, info] of discovered) {
+      if (!configuredSlugs.has(slug) && !dismissedSlugs.has(slug)) {
+        // Check if we already have an alert for this slug
+        const existing = this._newProxyAlerts.find(a => a.slug === slug);
+        if (existing) {
+          newAlerts.push(existing);
+        } else if (!this._lastKnownProxySlugs.has(slug) || this._newProxyAlerts.length === 0) {
+          // Truly new proxy or first detection cycle
+          newAlerts.push({
+            slug,
+            name: info.friendlyName,
+            area: "",
+            entity_id: `ble_proxy_${slug}`,
+            dismissed: false,
+          });
+        }
+      }
+    }
+
+    // Keep dismissed alerts so they stay dismissed
+    const kept = this._newProxyAlerts.filter(a => a.dismissed);
+    const merged = [...kept, ...newAlerts];
+
+    // Only update state if changed
+    if (merged.length !== this._newProxyAlerts.length ||
+        newAlerts.some(a => !this._newProxyAlerts.find(e => e.slug === a.slug))) {
+      this._newProxyAlerts = merged;
+    }
+
+    this._lastKnownProxySlugs = currentSlugs;
+  }
+
+  /**
+   * Dismiss a new proxy alert.
+   */
+  private _dismissNewProxy(slug: string): void {
+    this._newProxyAlerts = this._newProxyAlerts.map(a =>
+      a.slug === slug ? { ...a, dismissed: true } : a
+    );
+  }
+
+  /**
+   * Quick-place a newly detected proxy: add to config and enter placement mode.
+   */
+  private _quickPlaceProxy(alert: typeof this._newProxyAlerts[0]): void {
+    const entity: DiscoveredEntity = {
+      entity_id: alert.entity_id,
+      friendly_name: alert.name,
+      area: alert.area,
+      state: "New",
+      type: "proxy",
+      added: false,
+      proxy_id: alert.slug,
+    };
+
+    this._addEntityAsProxy(entity);
+    // Dismiss the alert
+    this._dismissNewProxy(alert.slug);
+  }
+
+  /**
+   * After a proxy is placed on the map, try quick calibration.
+   * Called from _handleMapClick when placing a proxy.
+   */
+  private _tryQuickCalibrateAfterPlace(proxyIdx: number): void {
+    const proxy = (this._config.proxies || [])[proxyIdx];
+    if (!proxy) return;
+
+    const proxySlug = extractProxySlug(proxy.entity_id);
+    const samples = this._config.calibration_samples || [];
+    const floor = this._getActiveFloor();
+    const imageWidth = floor?.image_width || 20;
+    const imageHeight = floor?.image_height || 15;
+
+    // Check existing samples for this proxy's RSSI
+    const matchingSamples = samples.filter(s => s.readings[proxySlug] !== undefined);
+
+    if (matchingSamples.length >= 2) {
+      // Option A: Full retroactive calibration from existing samples
+      // _autoCalibrate will now include this proxy since it's in config
+      setTimeout(() => {
+        this._autoCalibrate();
+        this._calibrationToast = `\u2705 New proxy auto-calibrated from ${matchingSamples.length} existing samples!`;
+        setTimeout(() => { this._calibrationToast = ""; }, 5000);
+      }, 300);
+      return;
+    }
+
+    if (matchingSamples.length === 1) {
+      // Option A (partial): Baseline from 1 existing sample
+      const sample = matchingSamples[0];
+      const rssi = sample.readings[proxySlug];
+      const dx = ((sample.x - proxy.x) / 100) * imageWidth;
+      const dy = ((sample.y - proxy.y) / 100) * imageHeight;
+      const dist = Math.max(0.3, Math.sqrt(dx * dx + dy * dy));
+
+      // Estimate ref_rssi at 1m using default n=2.5
+      const refRssi = Math.round(rssi + 10 * 2.5 * Math.log10(dist));
+      const clampedRefRssi = Math.max(-95, Math.min(-20, refRssi));
+
+      const proxies = [...(this._config.proxies || [])];
+      proxies[proxyIdx] = {
+        ...proxies[proxyIdx],
+        calibration: {
+          ...(proxies[proxyIdx].calibration || {} as ProxyCalibration),
+          ref_rssi: clampedRefRssi,
+          ref_distance: 1.0,
+          attenuation: 2.5,
+          calibrated_at: Date.now(),
+          sample_count: 1,
+        },
+      };
+      this._updateConfig("proxies", proxies);
+      this._calibrationToast = `\ud83d\udcca Baseline calibration from 1 existing sample (ref=${clampedRefRssi}dBm)`;
+      setTimeout(() => { this._calibrationToast = ""; }, 5000);
+      return;
+    }
+
+    // Option B: No existing data — enter quick-calibrate mode
+    this._quickCalibProxyIdx = proxyIdx;
+    this._quickCalibMode = true;
+    this._quickCalibRssi = null;
+    this._calibrationToast = "\ud83d\udce1 Stand ~1m from the new proxy for quick calibration";
+    setTimeout(() => { this._calibrationToast = ""; }, 8000);
+  }
+
+  /**
+   * Update the live RSSI reading for quick-calibrate mode.
+   */
+  private _updateQuickCalibRssi(): void {
+    if (this._quickCalibProxyIdx === null) return;
+    const proxy = (this._config.proxies || [])[this._quickCalibProxyIdx];
+    if (!proxy) { this._quickCalibMode = false; return; }
+
+    const proxySlug = extractProxySlug(proxy.entity_id);
+
+    // Find RSSI from any tracked device's debug info
+    for (const info of this._liveDebugInfo) {
+      if (info.proxyId === proxySlug && info.rssi !== null) {
+        this._quickCalibRssi = info.rssi;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Execute quick 1-point calibration at ~1m distance.
+   */
+  private _executeQuickCalibrate(): void {
+    if (this._quickCalibProxyIdx === null || this._quickCalibRssi === null) return;
+
+    const proxies = [...(this._config.proxies || [])];
+    const idx = this._quickCalibProxyIdx;
+    if (!proxies[idx]) return;
+
+    // Use current RSSI as ref_rssi at 1m with default attenuation
+    const refRssi = this._quickCalibRssi;
+    proxies[idx] = {
+      ...proxies[idx],
+      calibration: {
+        ...(proxies[idx].calibration || {} as ProxyCalibration),
+        ref_rssi: refRssi,
+        ref_distance: 1.0,
+        attenuation: 2.5,
+        calibrated_at: Date.now(),
+        sample_count: 1,
+      },
+    };
+
+    this._updateConfig("proxies", proxies);
+    this._quickCalibMode = false;
+    this._quickCalibProxyIdx = null;
+    this._quickCalibRssi = null;
+    this._calibrationToast = `\u2705 Quick calibration done! (ref=${refRssi}dBm at 1m, n=2.5)`;
+    setTimeout(() => { this._calibrationToast = ""; }, 5000);
+
+    // Sync to Bermuda if enabled
+    if (this._config.bermuda_sync_enabled) {
+      this._syncToBermuda(proxies);
+    }
+  }
+
+  /**
+   * Cancel quick-calibrate mode.
+   */
+  private _cancelQuickCalibrate(): void {
+    this._quickCalibMode = false;
+    this._quickCalibProxyIdx = null;
+    this._quickCalibRssi = null;
   }
 
   // ─── Guided Calibration Wizard Methods ─────────────────────
@@ -3293,6 +3529,75 @@ export class BLELivemapPanel extends LitElement {
         color: var(--text-primary);
       }
 
+      /* New proxy detection banner */
+      .new-proxy-banner {
+        background: linear-gradient(135deg, rgba(76, 175, 80, 0.1), rgba(33, 150, 243, 0.1));
+        border: 1px solid #4CAF50;
+        border-radius: 8px;
+        padding: 8px 12px;
+        margin-bottom: 8px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--text-primary, #fff);
+        animation: new-proxy-slide-in 0.3s ease-out;
+      }
+      @keyframes new-proxy-slide-in {
+        from { opacity: 0; transform: translateY(-10px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .new-proxy-icon {
+        font-size: 16px;
+        flex-shrink: 0;
+      }
+      .new-proxy-text {
+        flex: 1;
+      }
+
+      /* Quick calibrate banner */
+      .quick-calib-banner {
+        background: linear-gradient(135deg, rgba(255, 152, 0, 0.1), rgba(255, 193, 7, 0.1));
+        border: 1px solid #FF9800;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 12px;
+        color: var(--text-primary, #fff);
+        animation: quick-calib-pulse 2s ease-in-out infinite;
+      }
+      @keyframes quick-calib-pulse {
+        0%, 100% { border-color: #FF9800; }
+        50% { border-color: #FFC107; box-shadow: 0 0 8px rgba(255, 152, 0, 0.3); }
+      }
+      .quick-calib-icon {
+        font-size: 18px;
+        flex-shrink: 0;
+      }
+      .quick-calib-text {
+        flex: 1;
+        line-height: 1.4;
+      }
+      .quick-calib-rssi {
+        display: inline-block;
+        background: rgba(76, 175, 80, 0.2);
+        color: #81C784;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 11px;
+        margin-left: 4px;
+      }
+      .quick-calib-waiting {
+        color: var(--text-secondary, #aaa);
+        font-style: italic;
+        font-size: 11px;
+        margin-left: 4px;
+      }
+
       /* Zone edit panel */
       .zone-edit-panel {
         background: var(--card-bg);
@@ -4036,6 +4341,39 @@ export class BLELivemapPanel extends LitElement {
             <button class="btn btn-small btn-secondary" @click=${() => { this._placingEntity = null; this._placingMode = null; }}>
               ${this._t("panel.cancel_placement")}
             </button>
+          </div>
+        ` : nothing}
+
+        <!-- New proxy detection banner -->
+        ${this._newProxyAlerts.filter(a => !a.dismissed).length > 0 ? html`
+          ${this._newProxyAlerts.filter(a => !a.dismissed).map(alert => html`
+            <div class="new-proxy-banner">
+              <span class="new-proxy-icon">\ud83c\udd95</span>
+              <span class="new-proxy-text">New proxy detected: <strong>${alert.name}</strong></span>
+              <button class="btn btn-small btn-primary" @click=${() => this._quickPlaceProxy(alert)}>\ud83d\udccd Place on Map</button>
+              <button class="btn btn-small btn-secondary" @click=${() => this._dismissNewProxy(alert.slug)}>\u2716</button>
+            </div>
+          `)}
+        ` : nothing}
+
+        <!-- Quick calibrate overlay -->
+        ${this._quickCalibMode && this._quickCalibProxyIdx !== null ? html`
+          <div class="quick-calib-banner">
+            <span class="quick-calib-icon">\ud83d\udce1</span>
+            <span class="quick-calib-text">
+              Stand ~1m from <strong>${(this._config.proxies || [])[this._quickCalibProxyIdx]?.name || 'proxy'}</strong>
+              ${this._quickCalibRssi !== null ? html`
+                <span class="quick-calib-rssi">${this._quickCalibRssi} dBm</span>
+              ` : html`
+                <span class="quick-calib-waiting">waiting for signal...</span>
+              `}
+            </span>
+            <button
+              class="btn btn-small btn-primary"
+              @click=${() => this._executeQuickCalibrate()}
+              ?disabled=${this._quickCalibRssi === null}
+            >\u2705 Calibrate</button>
+            <button class="btn btn-small btn-secondary" @click=${() => this._cancelQuickCalibrate()}>\u2716 Skip</button>
           </div>
         ` : nothing}
 
